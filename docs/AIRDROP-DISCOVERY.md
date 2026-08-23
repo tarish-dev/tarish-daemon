@@ -3,6 +3,15 @@
 Captured off the wire between a MacBook Pro and this phone over AWDL, 2026-08-23.
 Raw capture: [apple-airdrop-discovery-capture.txt](apple-airdrop-discovery-capture.txt).
 
+> **CORRECTION, same day.** The conclusion below — that `_airdrop._tcp.local` is
+> not the discovery service — is **wrong**, and was drawn from watching only a
+> Mac. Capturing Google's own Mosey on the same link settled it: Mosey
+> advertises `_airdrop._tcp.local`, and it interoperates. See
+> [What a working Android peer advertises](#what-a-working-android-peer-advertises)
+> below, which is the section to build from. What remains true is that the Mac
+> also runs two *pairing* services, and that Barq's TXT was wrong — just not for
+> the reason first concluded.
+
 ## The finding
 
 **`_airdrop._tcp.local` is not how modern macOS finds peers.** Advertising it and
@@ -86,3 +95,62 @@ mDNSResponder with the P2P flag sees AWDL traffic. Sending is not gated.
 So the phone is the only usable vantage point: `tools/mdnsdump.c` runs there and
 sees everything. Two earlier conclusions drawn from a Mac-side listener were
 wrong because of this, and the listener had not been self-tested.
+
+
+## What a working Android peer advertises
+
+Captured from Google's Mosey on this phone, with a Mac as peer, 2026-08-23.
+Raw: [mosey-airdrop-advertisement.txt](mosey-airdrop-advertisement.txt).
+
+**This is the template to build against**, because Mosey is an Android
+implementation on the same radio and interface as Barq, and it demonstrably
+interoperates with Apple devices.
+
+```
+PTR   _services._dns-sd._udp.local -> _airdrop._tcp.local
+PTR   _airdrop._tcp.local          -> 8ed4b330f476._airdrop._tcp.local
+SRV   8ed4b330f476._airdrop._tcp.local -> Android_MHMQSTGX.local:40985
+TXT   8ed4b330f476._airdrop._tcp.local -> flags=489
+AAAA  Android_MHMQSTGX.local -> fe80::d88a:15ff:fec8:f2a0
+NSEC  8ed4b330f476._airdrop._tcp.local
+NSEC  Android_MHMQSTGX.local
+PTR   0.A.2.F...ip6.arpa -> Android_MHMQSTGX.local     (reverse)
+```
+
+### The TXT is `flags=489`
+
+One key, one value. **Not** the `sn`/`at`/`sid`/`dnm` set — those belong to the
+Mac's `_appsvcprepair` and `_applicationservicepairing` services, and Barq
+briefly copied them onto `_airdrop._tcp`, which is a service they never appear
+on. 489 = `0x1E9`; the bit meanings are not yet known.
+
+### What Barq was missing
+
+| | Mosey | Barq (before) |
+|---|---|---|
+| `_services._dns-sd._udp` PTR | yes | **no** |
+| TXT | `flags=489` | `dnm=`/`sid=`/`_dc=` — wrong service's fields |
+| NSEC for instance and host | yes | **no** |
+| reverse `ip6.arpa` PTR | yes | **no** |
+| host name | `Android_XXXXXXXX.local` | `<12hex>.local` |
+| instance | `<12hex>._airdrop._tcp.local` | same — this part was right |
+
+NSEC matters more than it looks. It is how a responder says "this name exists
+and has *these* record types and no others". When the Mac asked our host for an
+**A** record and we had only AAAA, the correct answer was an NSEC asserting that
+— silence reads as "no such host".
+
+Mosey also runs three instances at once, each with its own hostname and port,
+and ports are high and arbitrary (40985, 38005, 39763) rather than fixed.
+
+### One more thing Mosey does
+
+Its own state dump shows:
+
+```
+Synthetic SR TLVs:  [_airdrop._tcp.local]
+```
+
+It injects the service name into AWDL's own synchronisation TLVs, so the service
+is announced at the AWDL layer as well as over mDNS. Whether a peer requires
+that is not yet known, and `libmosey` does it for us if we ever drive it.
