@@ -117,6 +117,7 @@ Android.bp               cc_binary, system_ext
 sepolicy/barqd.te        SELinux domain
 sepolicy/file_contexts   labels /system_ext/bin/barqd
 docs/MOSEY-FFI.md        the vendor ABI barqd calls, and how it was recovered
+docs/INTEGRATING.md      what a platform must provide, and the traps
 ```
 
 ## Building
@@ -139,10 +140,18 @@ instead. That failure looks correct from every angle except the one that matters
 
 ## Requirements
 
-- A device whose vendor image ships `wonder.ko` and `libmosey_daemon_ffi.so`.
-  On Pixel 10 that is every model except the 10a, whose Wi-Fi driver
-  (`bcmdhd4383`) has no `wondertap` support at all.
-- `userdebug` or a build you can add SELinux policy to.
+- `libmosey_daemon_ffi.so` present and loadable. barqd tries the plain soname
+  first, then the usual paths, and honours `BARQ_MOSEY_LIB` as an override.
+  **Shipping and pinning that library is the integrator's job** — barqd is
+  distribution-agnostic and only requires that one is there.
+- `wonder.ko` bound to the Wi-Fi driver. On Pixel 10 that is every model except
+  the 10a (`bcmdhd4383` has no `wondertap` support).
+- A build you can add SELinux policy to.
+
+Integration details, and the failures worth knowing about in advance, are in
+**[docs/INTEGRATING.md](docs/INTEGRATING.md)** — including why
+`sepolicy/file_contexts` must be installed alongside the `.te`, and why trimming
+the policy costs a build cycle each time.
 
 ## Name
 

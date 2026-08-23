@@ -37,9 +37,25 @@
 #include <linux/rtnetlink.h>
 #include <android/log.h>
 
-#define TAG  "barqd"
-#define LIB  "/system_ext/lib64/libmosey_daemon_ffi.so"
+#define TAG   "barqd"
 #define IFACE "mosey0"
+
+// barqd does not own the AWDL library and does not care where it lives. It needs
+// one to be present; shipping and pinning it is the integrator's job -- on
+// GrapheneOS that is a vendored copy, on another build it might be wherever that
+// vendor image puts it. Hardcoding one absolute path would tie this daemon to a
+// single distribution, which is exactly what it should not be.
+//
+// Order: an explicit override, then the plain soname so the dynamic linker's own
+// search applies, then the paths seen in practice.
+#define LIB_ENV "BARQ_MOSEY_LIB"
+static const char *LIB_CANDIDATES[] = {
+    "libmosey_daemon_ffi.so",                          // let the linker find it
+    "/system_ext/lib64/libmosey_daemon_ffi.so",
+    "/vendor/lib64/libmosey_daemon_ffi.so",
+    "/system/lib64/libmosey_daemon_ffi.so",
+    NULL
+};
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  TAG, __VA_ARGS__)
@@ -143,8 +159,29 @@ int main(void) {
 
     LOGI("starting");
 
-    void *h = dlopen(LIB, RTLD_NOW);
-    if (!h) { LOGE("dlopen %s: %s", LIB, dlerror()); return 1; }
+    const char *override = getenv(LIB_ENV);
+    void *h = NULL;
+    const char *loaded = NULL;
+
+    if (override && *override) {
+        h = dlopen(override, RTLD_NOW);
+        if (!h) { LOGE("%s=%s: %s", LIB_ENV, override, dlerror()); return 1; }
+        loaded = override;
+    } else {
+        for (int i = 0; LIB_CANDIDATES[i]; i++) {
+            dlerror();
+            h = dlopen(LIB_CANDIDATES[i], RTLD_NOW);
+            if (h) { loaded = LIB_CANDIDATES[i]; break; }
+        }
+    }
+    if (!h) {
+        LOGE("no AWDL library found. Tried %s and the usual paths; set %s to override.",
+             LIB_CANDIDATES[0], LIB_ENV);
+        LOGE("barqd needs libmosey_daemon_ffi.so present on the device -- shipping "
+             "it is the integrator's job, not this daemon's.");
+        return 1;
+    }
+    LOGI("loaded %s", loaded);
 
     start5_fn start5 = (start5_fn)dlsym(h, "mosey_start_5");
     stop_fn   stop   = (stop_fn)  dlsym(h, "mosey_stop");
