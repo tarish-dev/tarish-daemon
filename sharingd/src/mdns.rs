@@ -392,33 +392,6 @@ fn short(instance: &str) -> &str {
     instance.split('.').next().unwrap_or(instance)
 }
 
-/// A human-visible name for this device, for the TXT `dnm` field. Uses whatever
-/// the platform already knows rather than inventing one.
-fn device_name() -> String {
-    for prop in ["persist.barq.name", "ro.product.model", "ro.product.device"] {
-        if let Some(v) = read_prop(prop) {
-            let v = v.trim().to_string();
-            if !v.is_empty() {
-                return v;
-            }
-        }
-    }
-    "Barq".to_string()
-}
-
-fn read_prop(name: &str) -> Option<String> {
-    let cname = std::ffi::CString::new(name).ok()?;
-    let mut buf = [0u8; 128];
-    // SAFETY: cname is NUL-terminated and buf exceeds PROP_VALUE_MAX.
-    let n = unsafe {
-        libc::__system_property_get(cname.as_ptr(), buf.as_mut_ptr() as *mut libc::c_char)
-    };
-    if n <= 0 {
-        return None;
-    }
-    std::str::from_utf8(&buf[..n as usize]).ok().map(|s| s.to_string())
-}
-
 /// A 12-hex-character instance name derived from the interface MAC, matching the
 /// shape Apple uses.
 ///
