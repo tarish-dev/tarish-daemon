@@ -11,6 +11,7 @@ rust_binary {
     rustlibs: [
         "libandroid_logger",
         "libbinder_rs",
+        "liblibc",
         "liblog_rust",
         "dev.barq-rust",
     ],

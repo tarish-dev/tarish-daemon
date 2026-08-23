@@ -17,7 +17,12 @@
 //!
 //! Skeleton: publishes IBarqService and answers, but implements no protocol yet.
 
+mod dns;
+mod mdns;
+
 use binder::{BinderFeatures, Interface, Result as BinderResult, Status, StatusCode, Strong};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use dev_barq::aidl::dev::barq::{
     BarqPeer::BarqPeer,
     BarqStatus::BarqStatus,
@@ -31,18 +36,25 @@ const SERVICE_NAME: &str = "dev.barq.IBarqService/default";
 /// how this process knows the transport is alive, without talking to barqd.
 const IFACE: &str = "mosey0";
 
+/// Peers found by the discovery thread. Shared rather than owned by the service
+/// so discovery keeps running whether or not a client is bound — a device must
+/// stay discoverable with the app closed.
+type PeerTable = Arc<Mutex<Vec<mdns::Peer>>>;
+
 struct BarqService {
     // Callbacks are held weakly in spirit: a client that is not running is the
     // normal case, so nothing here may assume one exists.
     callbacks: std::sync::Mutex<Vec<Strong<dyn IBarqCallback>>>,
     discoverable: std::sync::atomic::AtomicBool,
+    peers: PeerTable,
 }
 
 impl BarqService {
-    fn new() -> Self {
+    fn new(peers: PeerTable) -> Self {
         Self {
             callbacks: std::sync::Mutex::new(Vec::new()),
             discoverable: std::sync::atomic::AtomicBool::new(false),
+            peers,
         }
     }
 
@@ -64,7 +76,7 @@ impl IBarqService for BarqService {
             discoverable: self.discoverable.load(std::sync::atomic::Ordering::SeqCst),
             channel: 0,
             country: String::new(),
-            peerCount: 0,
+            peerCount: self.peers.lock().map(|p| p.len() as i32).unwrap_or(0),
         })
     }
 
@@ -79,8 +91,19 @@ impl IBarqService for BarqService {
     }
 
     fn getPeers(&self) -> BinderResult<Vec<BarqPeer>> {
-        // No discovery yet.
-        Ok(Vec::new())
+        let peers = self.peers.lock().map_err(|_| Status::from(StatusCode::UNKNOWN_ERROR))?;
+        Ok(peers
+            .iter()
+            .map(|p| BarqPeer {
+                id: p.instance.clone(),
+                // Apple advertises a 12-hex-character identifier, not a name. A
+                // friendly name needs the TXT record or a connection, so show the
+                // identifier rather than inventing something.
+                name: p.short_id().to_string(),
+                model: String::new(),
+                rssi: 0,
+            })
+            .collect())
     }
 
     fn sendFiles(
@@ -117,6 +140,47 @@ impl IBarqService for BarqService {
     }
 }
 
+/// Browse for AirDrop peers on the AWDL interface, forever.
+///
+/// Runs whether or not a client is bound, because discoverability is daemon
+/// state. Waits for the link rather than failing at start: barqd may still be
+/// bringing it up, and a restart loop over a missing interface helps nobody.
+fn start_discovery(peers: PeerTable) {
+    std::thread::spawn(move || {
+        let mut browser = loop {
+            match mdns::Browser::new(IFACE) {
+                Ok(b) => {
+                    log::info!("browsing {} on {IFACE}", mdns::AIRDROP_SERVICE);
+                    break b;
+                }
+                Err(e) => {
+                    log::info!("waiting for {IFACE} ({e})");
+                    std::thread::sleep(Duration::from_secs(5));
+                }
+            }
+        };
+
+        let mut since_query = Duration::from_secs(99);
+        loop {
+            // Re-query periodically; peers answer, and new ones announce anyway.
+            if since_query >= Duration::from_secs(10) {
+                if let Err(e) = browser.query() {
+                    log::warn!("query failed: {e}");
+                }
+                since_query = Duration::ZERO;
+            }
+            browser.poll();
+            browser.expire(Duration::from_secs(90));
+
+            if let Ok(mut shared) = peers.lock() {
+                *shared = browser.peers();
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            since_query += Duration::from_millis(500);
+        }
+    });
+}
+
 fn main() {
     android_logger::init_once(
         android_logger::Config::default()
@@ -125,7 +189,10 @@ fn main() {
     );
     log::info!("starting");
 
-    let service = BarqService::new();
+    let peers: PeerTable = Arc::new(Mutex::new(Vec::new()));
+    start_discovery(peers.clone());
+
+    let service = BarqService::new(peers);
     let binder = BnBarqService::new_binder(service, BinderFeatures::default());
 
     if let Err(e) = binder::add_service(SERVICE_NAME, binder.as_binder()) {
