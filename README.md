@@ -18,6 +18,11 @@ This is the same split Apple and Google both ship. Google's is `mosey_server`
 (native, `system`, `NET_ADMIN|NET_RAW`, invisible) plus a client app; Apple's is
 `sharingd`. Barq is the equivalent piece for a build that has neither.
 
+> **Architecture is changing.** Barq is moving to two processes split by
+> privilege, and to Rust. The rationale and the order of work are in
+> [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). What is described below is the
+> working C prototype of the privileged half.
+
 ## Status
 
 Working, and narrow. On a GrapheneOS build for Pixel 10 with **no Google
@@ -116,6 +121,7 @@ init/barq.rc             init service: user system, group system inet, NET_ADMIN
 Android.bp               cc_binary, system_ext
 sepolicy/barqd.te        SELinux domain
 sepolicy/file_contexts   labels /system_ext/bin/barqd
+docs/ARCHITECTURE.md     the two-process split and the Rust decision
 docs/MOSEY-FFI.md        the vendor ABI barqd calls, and how it was recovered
 docs/INTEGRATING.md      what a platform must provide, and the traps
 ```
