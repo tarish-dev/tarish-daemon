@@ -21,6 +21,7 @@ mod dns;
 mod mdns;
 
 use binder::{BinderFeatures, Interface, Result as BinderResult, Status, StatusCode, Strong};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use dev_barq::aidl::dev::barq::{
@@ -41,19 +42,38 @@ const IFACE: &str = "mosey0";
 /// stay discoverable with the app closed.
 type PeerTable = Arc<Mutex<Vec<mdns::Peer>>>;
 
+/// Whether this device is advertising itself. Shared with the discovery thread,
+/// which owns the socket. Daemon state on purpose: closing the client must not
+/// make the device vanish.
+type Discoverable = Arc<AtomicBool>;
+
+/// Read an Android system property.
+fn read_property(name: &str) -> Option<String> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    let mut buf = [0u8; 128];
+    // SAFETY: cname is NUL-terminated and buf exceeds PROP_VALUE_MAX.
+    let n = unsafe {
+        libc::__system_property_get(cname.as_ptr(), buf.as_mut_ptr() as *mut libc::c_char)
+    };
+    if n <= 0 {
+        return None;
+    }
+    std::str::from_utf8(&buf[..n as usize]).ok().map(|s| s.to_string())
+}
+
 struct BarqService {
     // Callbacks are held weakly in spirit: a client that is not running is the
     // normal case, so nothing here may assume one exists.
     callbacks: std::sync::Mutex<Vec<Strong<dyn IBarqCallback>>>,
-    discoverable: std::sync::atomic::AtomicBool,
+    discoverable: Discoverable,
     peers: PeerTable,
 }
 
 impl BarqService {
-    fn new(peers: PeerTable) -> Self {
+    fn new(peers: PeerTable, discoverable: Discoverable) -> Self {
         Self {
             callbacks: std::sync::Mutex::new(Vec::new()),
-            discoverable: std::sync::atomic::AtomicBool::new(false),
+            discoverable,
             peers,
         }
     }
@@ -73,7 +93,7 @@ impl IBarqService for BarqService {
     fn getStatus(&self) -> BinderResult<BarqStatus> {
         Ok(BarqStatus {
             linkUp: self.link_up(),
-            discoverable: self.discoverable.load(std::sync::atomic::Ordering::SeqCst),
+            discoverable: self.discoverable.load(Ordering::SeqCst),
             channel: 0,
             country: String::new(),
             peerCount: self.peers.lock().map(|p| p.len() as i32).unwrap_or(0),
@@ -84,9 +104,8 @@ impl IBarqService for BarqService {
         // Discoverability is DAEMON state on purpose: closing the client must not
         // stop the device being reachable, or we are back to an app that has to
         // stay resident.
-        self.discoverable
-            .store(discoverable, std::sync::atomic::Ordering::SeqCst);
-        log::info!("discoverable={discoverable} for {duration_seconds}s (not yet advertised)");
+        self.discoverable.store(discoverable, Ordering::SeqCst);
+        log::info!("discoverable={discoverable} (duration {duration_seconds}s not yet honoured)");
         Ok(())
     }
 
@@ -145,7 +164,7 @@ impl IBarqService for BarqService {
 /// Runs whether or not a client is bound, because discoverability is daemon
 /// state. Waits for the link rather than failing at start: barqd may still be
 /// bringing it up, and a restart loop over a missing interface helps nobody.
-fn start_discovery(peers: PeerTable) {
+fn start_discovery(peers: PeerTable, discoverable: Discoverable) {
     std::thread::spawn(move || {
         let mut browser = loop {
             match mdns::Browser::new(IFACE) {
@@ -161,7 +180,34 @@ fn start_discovery(peers: PeerTable) {
         };
 
         let mut since_query = Duration::from_secs(99);
+        let mut since_announce = Duration::ZERO;
+        let mut was_advertising = false;
         loop {
+            // Advertising follows the flag, so a client turning discoverability
+            // on or off takes effect without restarting anything.
+            let want = discoverable.load(Ordering::SeqCst);
+            if want && !was_advertising {
+                match browser.advertise() {
+                    Ok(()) => {
+                        log::info!("advertising as {}.{}", browser.instance(), mdns::AIRDROP_SERVICE);
+                        was_advertising = true;
+                        since_announce = Duration::ZERO;
+                    }
+                    Err(e) => log::warn!("cannot advertise: {e}"),
+                }
+            } else if !want && was_advertising {
+                browser.stop_advertising();
+                log::info!("no longer advertising");
+                was_advertising = false;
+            }
+
+            // Re-announce periodically: a peer that started browsing after us has
+            // no reason to query again, so silence means invisibility.
+            if was_advertising && since_announce >= Duration::from_secs(20) {
+                let _ = browser.announce();
+                since_announce = Duration::ZERO;
+            }
+
             // Re-query periodically; peers answer, and new ones announce anyway.
             if since_query >= Duration::from_secs(10) {
                 if let Err(e) = browser.query() {
@@ -177,6 +223,7 @@ fn start_discovery(peers: PeerTable) {
             }
             std::thread::sleep(Duration::from_millis(500));
             since_query += Duration::from_millis(500);
+            since_announce += Duration::from_millis(500);
         }
     });
 }
@@ -190,9 +237,22 @@ fn main() {
     log::info!("starting");
 
     let peers: PeerTable = Arc::new(Mutex::new(Vec::new()));
-    start_discovery(peers.clone());
 
-    let service = BarqService::new(peers);
+    // Off by default. A device that advertises itself the moment it boots is a
+    // privacy decision, not a default, and it belongs to the user through the
+    // client. persist.barq.discoverable exists so the transport can be tested
+    // before a client exists to turn it on.
+    let initial = read_property("persist.barq.discoverable")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if initial {
+        log::warn!("persist.barq.discoverable is set — advertising without a client asking");
+    }
+    let discoverable: Discoverable = Arc::new(AtomicBool::new(initial));
+
+    start_discovery(peers.clone(), discoverable.clone());
+
+    let service = BarqService::new(peers, discoverable);
     let binder = BnBarqService::new_binder(service, BinderFeatures::default());
 
     if let Err(e) = binder::add_service(SERVICE_NAME, binder.as_binder()) {

@@ -26,6 +26,12 @@ net_domain(barqsharingd)
 binder_use(barqsharingd)
 add_service(barqsharingd, barq_service)
 
+# /proc/net/if_inet6, to find our own link-local address for the AAAA record we
+# advertise. The alternative is getifaddrs(), which would mean ~30 lines of
+# unsafe pointer walking in the most exposed process in Barq -- a worse trade
+# than one read-only proc file for a domain that already has network access.
+allow barqsharingd proc_net:file r_file_perms;
+
 # Read interface state, which is how this daemon knows the AWDL link is up
 # without talking to barqd or holding any privilege.
 allow barqsharingd sysfs_net:dir search;

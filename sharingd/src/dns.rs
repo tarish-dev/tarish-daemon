@@ -109,6 +109,11 @@ impl<'a> Reader<'a> {
     }
 }
 
+pub struct Question {
+    pub name: String,
+    pub qtype: u16,
+}
+
 pub struct Record {
     pub name: String,
     pub rtype: u16,
@@ -118,9 +123,15 @@ pub struct Record {
     pub rdata_at: usize,
 }
 
-/// Parse a response, returning answer + additional records. Questions are
-/// skipped: barqsharingd browses, it does not yet answer.
-pub fn parse(buf: &[u8]) -> Option<Vec<Record>> {
+/// Everything we care about in one packet: what was asked, and what was told.
+pub struct Message {
+    pub questions: Vec<Question>,
+    pub records: Vec<Record>,
+}
+
+/// Parse a packet. mDNS makes no hard distinction between query and response --
+/// a packet can carry both -- so both halves are returned and the caller decides.
+pub fn parse(buf: &[u8]) -> Option<Message> {
     let mut r = Reader::new(buf);
     let _id = r.u16()?;
     let _flags = r.u16()?;
@@ -129,10 +140,16 @@ pub fn parse(buf: &[u8]) -> Option<Vec<Record>> {
     let ns = r.u16()?;
     let ar = r.u16()?;
 
+    // A question count that cannot fit is a packet we do not need to be polite to.
+    if qd > 64 {
+        return None;
+    }
+    let mut questions = Vec::with_capacity((qd as usize).min(8));
     for _ in 0..qd {
-        r.name()?;
-        r.u16()?; // qtype
-        r.u16()?; // qclass
+        let name = r.name()?;
+        let qtype = r.u16()?;
+        let _qclass = r.u16()?;
+        questions.push(Question { name, qtype });
     }
 
     let total = (an as usize) + (ns as usize) + (ar as usize);
@@ -153,7 +170,68 @@ pub fn parse(buf: &[u8]) -> Option<Vec<Record>> {
         let rdata = r.bytes(rdlen)?.to_vec();
         out.push(Record { name, rtype, rdata, rdata_at: at });
     }
-    Some(out)
+    Some(Message { questions, records: out })
+}
+
+/// Encode a domain name. No compression: our packets are small, and emitting
+/// pointers is where a responder gets subtly wrong in ways peers tolerate
+/// silently until one does not.
+pub fn encode_name(n: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(n.len() + 2);
+    for label in n.split('.') {
+        if label.is_empty() {
+            continue;
+        }
+        out.push(label.len() as u8);
+        out.extend_from_slice(label.as_bytes());
+    }
+    out.push(0);
+    out
+}
+
+/// One resource record, ready to append.
+pub fn record(name: &str, rtype: u16, ttl: u32, rdata: &[u8], flush: bool) -> Vec<u8> {
+    let mut out = encode_name(name);
+    out.extend_from_slice(&rtype.to_be_bytes());
+    // The top bit of the class is mDNS's cache-flush bit: "this is authoritative,
+    // drop anything else you have for this name".
+    let class: u16 = if flush { 0x8001 } else { 0x0001 };
+    out.extend_from_slice(&class.to_be_bytes());
+    out.extend_from_slice(&ttl.to_be_bytes());
+    out.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+    out.extend_from_slice(rdata);
+    out
+}
+
+/// Wrap answers in a response header.
+pub fn response(answers: &[Vec<u8>]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(256);
+    p.extend_from_slice(&0u16.to_be_bytes());        // id: 0 for mDNS
+    p.extend_from_slice(&0x8400u16.to_be_bytes());   // response, authoritative
+    p.extend_from_slice(&0u16.to_be_bytes());        // qdcount
+    p.extend_from_slice(&(answers.len() as u16).to_be_bytes());
+    p.extend_from_slice(&0u16.to_be_bytes());        // nscount
+    p.extend_from_slice(&0u16.to_be_bytes());        // arcount
+    for a in answers {
+        p.extend_from_slice(a);
+    }
+    p
+}
+
+/// Encode TXT rdata from key=value strings. Each entry is length-prefixed.
+pub fn txt_rdata(entries: &[&str]) -> Vec<u8> {
+    let mut out = Vec::new();
+    if entries.is_empty() {
+        out.push(0); // an empty TXT is a single zero-length string, not nothing
+        return out;
+    }
+    for e in entries {
+        let b = e.as_bytes();
+        let n = b.len().min(255);
+        out.push(n as u8);
+        out.extend_from_slice(&b[..n]);
+    }
+    out
 }
 
 /// Build a PTR query for a service type, e.g. `_airdrop._tcp.local`.
