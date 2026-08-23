@@ -1,0 +1,25 @@
+# barqd — Barq AWDL transport daemon.
+#
+# Modelled directly on Google's /system_ext/etc/init/mosey.rc, which is the
+# working reference for this exact job:
+#
+#     service mosey_server /system_ext/bin/mosey_server
+#         user system
+#         group system inet
+#         disabled
+#         capabilities NET_ADMIN NET_RAW
+#
+# NET_ADMIN and NET_RAW are what libmosey needs to drive wonder.ko over nl80211.
+# Running as `system` rather than root keeps it to those two capabilities.
+
+service barqd /system_ext/bin/barqd
+    class late_start
+    user system
+    group system inet net_raw
+    capabilities NET_ADMIN NET_RAW
+    disabled
+    oneshot false
+    restart_period 10
+
+on property:sys.boot_completed=1
+    start barqd

@@ -1,0 +1,16 @@
+// Barq — AWDL transport daemon.
+//
+// Built into the system image as a normal system binary, so it is signed,
+// labelled and hardened like everything else on the platform rather than staged
+// as a prebuilt.
+cc_binary {
+    name: "barqd",
+    srcs: ["src/barqd.c"],
+    shared_libs: ["liblog"],
+    // The AWDL library is dlopen'd at run time, never linked. It is a vendor
+    // blob whose presence barqd checks for and reports on, so a device without
+    // it fails loudly at start instead of failing somebody's build.
+    init_rc: ["init/barq.rc"],
+    system_ext_specific: true,
+    cflags: ["-Wall", "-Werror"],
+}

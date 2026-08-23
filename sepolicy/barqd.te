@@ -1,0 +1,71 @@
+# barqd — Barq AWDL transport daemon.
+#
+# Derived from Google's own mosey_server policy, read out of
+# vendor/google_devices/<device>/sepolicy/system_ext/private/sepolicy_ext.cil.
+# That is the right template because barqd does the same job through the same
+# library, so its access needs are the same set.
+#
+# What each rule is actually for, since "copied from Google" is not a reason:
+#
+#   net_admin/net_raw     libmosey drives wonder.ko and manages interfaces
+#   netlink_generic       nl80211 -- the vendor commands to wonder.ko
+#   netlink_route         adding the route and the peer's neighbour entry
+#   packet_socket         libmosey uses libpcap (it logs "libpcap version 1.9.1")
+#   tun_device/tun_socket mosey0 is a TUN interface libmosey creates
+#   sysfs_net             reading interface state
+#
+# NOT copied from Google: binder, service_manager, dumpstate. barqd publishes no
+# binder service yet, and granting access we do not use is how a domain quietly
+# becomes as privileged as the thing it replaced.
+
+type barqd, domain, coredomain;
+type barqd_exec, file_type, exec_type, system_file_type;
+
+init_daemon_domain(barqd)
+
+allow barqd self:capability { net_admin net_raw };
+
+# nl80211 to wonder.ko, and the route/neighbour work libmosey does itself.
+# These sets are Google's, verbatim from mosey_server's rules in the device's own
+# sepolicy_ext.cil. An earlier version of this file trimmed them to what looked
+# necessary and dropped `map` from packet_socket -- libpcap uses PACKET_MMAP for
+# its rx ring, so mosey_start_5 failed with
+#     PcapError("can't mmap rx ring: Permission denied")
+# and the AVC was  denied { map } ... tclass=packet_socket.
+#
+# Each omission costs a full build-and-flash cycle to discover, and the reference
+# implementation does the same work through the same library, so its set is the
+# evidence. Trimming is only worth doing with a denial log proving a rule unused.
+allow barqd self:netlink_generic_socket { ioctl read write create getattr setattr lock append map bind connect getopt setopt shutdown };
+allow barqd self:netlink_route_socket { read write create nlmsg_read nlmsg_write nlmsg_readpriv nlmsg_getneigh };
+allow barqd self:packet_socket { ioctl read write create getattr setattr lock append map bind connect listen accept getopt setopt shutdown };
+allow barqd self:netlink_netfilter_socket create;
+allow barqd self:udp_socket { create ioctl };
+allow barqd self:unix_dgram_socket { ioctl };
+allow barqd self:tun_socket create;
+allow barqd tun_device:chr_file { ioctl read write getattr lock append map open watch watch_reads };
+
+# IOCTL COMMAND WHITELISTING. Granting `ioctl` on a class is not enough on
+# Android: the specific command numbers must also be allowed with allowxperm, or
+# the call is denied with the command in the AVC (ioctlcmd=0x...). This was
+# missed entirely on the first pass -- the `allow` rules were transcribed from
+# mosey_server's policy and the `allowx` ones were not -- and it surfaced as
+#     avc: denied { ioctl } path="/dev/tun" ioctlcmd=0x54ca tclass=chr_file
+# with mosey_start_5 returning NULL, even though `allow ... ioctl` was present.
+#
+# 0x54ca is TUNSETIFF, i.e. creating mosey0 itself. The rest are the standard
+# interface ioctls: 0x8913 SIOCGIFFLAGS, 0x8914 SIOCSIFFLAGS, 0x8946 SIOCETHTOOL,
+# 0x8994 SIOCGIFNAME. Sets are Google's verbatim, for the same reason as above.
+allowxperm barqd tun_device:chr_file ioctl { 0x54ca 0x54d2 };
+allowxperm barqd self:packet_socket ioctl { 0x8913 0x8927 0x8933 };
+# 0x8910 is SIOCGIFNAME; seen denied on the first run that actually got this far.
+allowxperm barqd self:netlink_generic_socket ioctl { 0x8910 0x8946 };
+allowxperm barqd self:udp_socket ioctl { 0x8913-0x8914 0x8916 0x8922 0x8924 0x8936 0x8946 0x8994 0x89f1 };
+allowxperm barqd self:unix_dgram_socket ioctl { 0x8913-0x8914 0x8946 0x8994 };
+
+allow barqd sysfs_net:dir search;
+allow barqd sysfs_net:file r_file_perms;
+allow barqd sysfs_net:lnk_file r_file_perms;
+
+# No exec rule. The link-local route is added over netlink (RTM_NEWROUTE) rather
+# than by running `ip`, precisely so this domain never needs to execute anything.
