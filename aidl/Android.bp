@@ -1,0 +1,16 @@
+// The Barq client contract.
+//
+// Built with both a Rust backend (barqsharingd implements it) and a Java one
+// (the app consumes it). Marked unstable while the interface is still moving;
+// it should be frozen once the app ships against it.
+aidl_interface {
+    name: "dev.barq",
+    srcs: ["dev/barq/*.aidl"],
+    unstable: true,
+    backend: {
+        rust: { enabled: true },
+        java: { enabled: true, sdk_version: "system_current" },
+        cpp: { enabled: false },
+        ndk: { enabled: false },
+    },
+}

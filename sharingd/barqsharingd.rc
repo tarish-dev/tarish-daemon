@@ -1,0 +1,19 @@
+# barqsharingd — the unprivileged half of Barq.
+#
+# No capabilities at all. `inet` is a supplementary GROUP, not a capability:
+# Android gates socket creation on group membership, so this is the minimum
+# needed to talk to a peer and nothing more.
+#
+# Started after barqd, though it does not require it: with no link up it simply
+# reports linkUp=false rather than failing.
+
+service barqsharingd /system_ext/bin/barqsharingd
+    class late_start
+    user nobody
+    group nobody inet
+    disabled
+    oneshot false
+    restart_period 10
+
+on property:sys.boot_completed=1
+    start barqsharingd

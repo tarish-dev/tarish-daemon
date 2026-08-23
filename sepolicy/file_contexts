@@ -1,1 +1,2 @@
-/system_ext/bin/barqd    u:object_r:barqd_exec:s0
+/system_ext/bin/barqd            u:object_r:barqd_exec:s0
+/system_ext/bin/barqsharingd     u:object_r:barqsharingd_exec:s0

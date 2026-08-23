@@ -1,0 +1,39 @@
+# barqsharingd — the unprivileged half of Barq.
+#
+# This domain deliberately has NO capabilities. Everything that parses input
+# from another device runs here, so the rule of thumb is: if a permission is
+# only needed to reconfigure the network or touch the radio, it belongs to
+# barqd, not to this domain. Compare barqd.te — it holds NET_ADMIN and NET_RAW
+# and parses nothing.
+#
+# Network access comes from group membership (`inet`) plus net_domain(), not
+# from a capability. That is the whole point: this process can talk to a peer
+# and can do nothing else.
+
+type barqsharingd, domain, coredomain;
+type barqsharingd_exec, file_type, exec_type, system_file_type;
+
+# The binder service the client app binds.
+type barq_service, service_manager_type;
+
+init_daemon_domain(barqsharingd)
+
+# Ordinary sockets: TCP/UDP for the transfer, and the standard network access
+# an unprivileged networked daemon gets.
+net_domain(barqsharingd)
+
+# Publish IBarqService, and talk binder to the clients that bind it.
+binder_use(barqsharingd)
+add_service(barqsharingd, barq_service)
+
+# Read interface state, which is how this daemon knows the AWDL link is up
+# without talking to barqd or holding any privilege.
+allow barqsharingd sysfs_net:dir search;
+allow barqsharingd sysfs_net:file r_file_perms;
+
+# NOT granted, and each absence is deliberate:
+#   no capability of any kind
+#   no netlink_generic_socket   -- driving the radio is barqd's job
+#   no packet_socket            -- raw frames are barqd's job
+#   no tun_device               -- creating mosey0 is barqd's job
+#   no execute of anything

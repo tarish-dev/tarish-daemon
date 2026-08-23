@@ -1,0 +1,19 @@
+// barqsharingd — the unprivileged half.
+//
+// Runs as `nobody` with no capabilities, in its own SELinux domain. Everything
+// that parses remote input lives here so that code is never in the same process
+// as CAP_NET_ADMIN. See ../docs/ARCHITECTURE.md.
+rust_binary {
+    name: "barqsharingd",
+    crate_name: "barqsharingd",
+    srcs: ["src/main.rs"],
+    edition: "2021",
+    rustlibs: [
+        "libandroid_logger",
+        "libbinder_rs",
+        "liblog_rust",
+        "dev.barq-rust",
+    ],
+    init_rc: ["barqsharingd.rc"],
+    system_ext_specific: true,
+}
