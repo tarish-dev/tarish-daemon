@@ -39,7 +39,30 @@ a macOS peer is discovered, elected master and installed in the kernel neighbour
 table.
 
 **What Barq does not do yet:** mDNS (`_airdrop._tcp.local`), the AirDrop protocol
-itself, and any IPC for a client app. It is the transport and nothing above it.
+itself, and the IPC implementation. It is the transport and nothing above it.
+
+## Clients
+
+The daemon owns the client contract, in `aidl/dev/barq/`:
+
+```
+IBarqService.aidl    getStatus, setDiscoverable, getPeers, sendFiles,
+                     respondToOffer, cancelTransfer, register/unregisterCallback
+IBarqCallback.aidl   onPeerFound/Lost, onTransferOffered/Progress/Finished
+```
+
+It lives here rather than in the client because the daemon is the server: it
+defines the protocol and a client is written against it. [Barq
+app](../barq-app) consumes these files directly instead of keeping its own copy,
+so the two cannot drift apart silently.
+
+Two rules the contract encodes deliberately:
+
+- **Discoverability is daemon state, not app state.** Closing the client must not
+  stop the device being reachable.
+- **Every callback is `oneway`.** The daemon must never block on a UI process
+  that may be slow, frozen, or about to be killed. A client that is not running
+  is the normal case, not an error.
 
 ## What is actually Barq, and what is not
 
@@ -88,6 +111,7 @@ never needs permission to execute anything.
 
 ```
 src/barqd.c              the daemon
+aidl/dev/barq/           the client contract (AIDL)
 init/barq.rc             init service: user system, group system inet, NET_ADMIN NET_RAW
 Android.bp               cc_binary, system_ext
 sepolicy/barqd.te        SELinux domain
