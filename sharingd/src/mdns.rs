@@ -67,7 +67,10 @@ impl Browser {
     pub fn new(iface: &str) -> io::Result<Self> {
         let ifindex = ifindex_of(iface)?;
 
-        let sock = UdpSocket::bind(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, MDNS_PORT, 0, 0))
+        // Bind with SO_REUSEPORT so a capture tool can listen on :5353 alongside
+        // us. Without it, observing what this daemon receives means stopping it,
+        // which changes the thing being observed.
+        let sock = bind_reuse(MDNS_PORT)
             .or_else(|e| {
                 // Port 5353 may already be held by the platform's mdnsd. Falling
                 // back to an ephemeral port still receives multicast we joined,
@@ -229,9 +232,14 @@ impl Browser {
         if !mine {
             return;
         }
+        let asked: Vec<String> = questions
+            .iter()
+            .map(|q| format!("{}/{}", q.name, q.qtype))
+            .collect();
         let recs = self.our_records();
-        if let Err(e) = self.send_multicast(&dns::response(&recs)) {
-            log::warn!("could not answer query: {e}");
+        match self.send_multicast(&dns::response(&recs)) {
+            Ok(()) => log::info!("answered {} record(s) to {:?}", recs.len(), asked),
+            Err(e) => log::warn!("could not answer query {asked:?}: {e}"),
         }
     }
 
@@ -254,6 +262,13 @@ impl Browser {
                 Ok((len, _from)) => {
                     n += 1;
                     if let Some(msg) = dns::parse(&buf[..len]) {
+                        if !msg.questions.is_empty() {
+                            log::debug!(
+                                "rx {} question(s): {:?}",
+                                msg.questions.len(),
+                                msg.questions.iter().map(|q| format!("{}/{}", q.name, q.qtype)).collect::<Vec<_>>()
+                            );
+                        }
                         self.absorb(&buf[..len], &msg.records);
                         if self.advertising {
                             self.answer(&msg.questions);
@@ -415,6 +430,47 @@ fn link_local_of(iface: &str) -> Option<Ipv6Addr> {
         return Some(Ipv6Addr::from(o));
     }
     None
+}
+
+/// Bind UDP with SO_REUSEADDR|SO_REUSEPORT, which std does not expose.
+fn bind_reuse(port: u16) -> io::Result<UdpSocket> {
+    // SAFETY: plain socket(2) with constant arguments.
+    let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let on: libc::c_int = 1;
+    for opt in [libc::SO_REUSEADDR, libc::SO_REUSEPORT] {
+        // SAFETY: on is a live c_int of the stated size; fd is owned here.
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                &on as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+    let mut a: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+    a.sin6_family = libc::AF_INET6 as u16;
+    a.sin6_port = port.to_be();
+    // SAFETY: a is a correctly-sized sockaddr_in6.
+    let rc = unsafe {
+        libc::bind(
+            fd,
+            &a as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        let e = io::Error::last_os_error();
+        // SAFETY: fd is owned and closed once.
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    // SAFETY: fd is a valid owned socket being handed to UdpSocket.
+    Ok(unsafe { <UdpSocket as std::os::fd::FromRawFd>::from_raw_fd(fd) })
 }
 
 fn ifindex_of(iface: &str) -> io::Result<u32> {

@@ -232,7 +232,7 @@ fn main() {
     android_logger::init_once(
         android_logger::Config::default()
             .with_tag("barqsharingd")
-            .with_max_level(log::LevelFilter::Info),
+            .with_max_level(log::LevelFilter::Debug),
     );
     log::info!("starting");
 
