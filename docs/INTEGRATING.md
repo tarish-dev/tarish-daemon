@@ -88,6 +88,21 @@ barqd adds `fe80::/64` to the interface's own table at startup. If you see
 `ENETUNREACH` on a link that otherwise looks healthy, check the per-interface
 table rather than `main`.
 
+## The device needs a regulatory country
+
+barqd refuses to start without one, on purpose. A device that has never
+associated with Wi-Fi reports `00` — the world domain — and channel 149 is not
+permitted there. The vendor library **accepts** `00`, logs a bring-up that looks
+entirely healthy (`Starting radio`, `Switching channel to Ch149`, `GET_CAP` …)
+and then returns NULL. Nothing says "wrong country".
+
+Order: `persist.barq.country`, then `ro.boot.wificountrycode`, then
+`persist.vendor.wifi.country`. To set one explicitly:
+
+```bash
+setprop persist.barq.country QA
+```
+
 ## Things that look like failure and are not
 
 - **`wonder0` has no address.** The usable interface is **`mosey0`**. `wonder0`

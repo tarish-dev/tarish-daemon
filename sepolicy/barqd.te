@@ -63,6 +63,16 @@ allowxperm barqd self:netlink_generic_socket ioctl { 0x8910 0x8946 };
 allowxperm barqd self:udp_socket ioctl { 0x8913-0x8914 0x8916 0x8922 0x8924 0x8936 0x8946 0x8994 0x89f1 };
 allowxperm barqd self:unix_dgram_socket ioctl { 0x8913-0x8914 0x8946 0x8994 };
 
+# Reading the regulatory country from the platform's own properties.
+#
+# NOT cosmetic. Denied, barqd falls back to the world domain "00", which the
+# vendor library accepts and then fails to bring the radio up on -- channel 149
+# is not permitted there. The symptom is mosey_start_5 returning NULL after the
+# vendor commands have already been logged, which looks like a transport fault
+# rather than a missing property read.
+get_prop(barqd, wifi_config_prop)
+get_prop(barqd, vendor_default_prop)
+
 allow barqd sysfs_net:dir search;
 allow barqd sysfs_net:file r_file_perms;
 allow barqd sysfs_net:lnk_file r_file_perms;

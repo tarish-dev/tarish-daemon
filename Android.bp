@@ -1,16 +1,22 @@
-// Barq — AWDL transport daemon.
+// Barq — AWDL transport daemon (privileged half).
 //
-// Built into the system image as a normal system binary, so it is signed,
-// labelled and hardened like everything else on the platform rather than staged
-// as a prebuilt.
-cc_binary {
+// Rust rather than C: the sharing daemon it feeds parses untrusted remote input,
+// and this process holds CAP_NET_ADMIN and CAP_NET_RAW. See docs/ARCHITECTURE.md.
+//
+// Dependencies are deliberately few. This is the privileged half, so its
+// dependency surface is part of its threat model -- the netlink route is written
+// against libc rather than pulling in an async runtime for one message.
+rust_binary {
     name: "barqd",
-    srcs: ["src/barqd.c"],
-    shared_libs: ["liblog"],
-    // The AWDL library is dlopen'd at run time, never linked. It is a vendor
-    // blob whose presence barqd checks for and reports on, so a device without
-    // it fails loudly at start instead of failing somebody's build.
+    crate_name: "barqd",
+    srcs: ["src/main.rs"],
+    edition: "2021",
+    rustlibs: [
+        "libandroid_logger",
+        "liblibc",
+        "liblog_rust",
+
+    ],
     init_rc: ["init/barq.rc"],
     system_ext_specific: true,
-    cflags: ["-Wall", "-Werror"],
 }
