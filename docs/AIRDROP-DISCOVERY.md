@@ -152,5 +152,20 @@ Synthetic SR TLVs:  [_airdrop._tcp.local]
 ```
 
 It injects the service name into AWDL's own synchronisation TLVs, so the service
-is announced at the AWDL layer as well as over mDNS. Whether a peer requires
-that is not yet known, and `libmosey` does it for us if we ever drive it.
+is announced at the AWDL layer as well as over mDNS. Whether an Apple peer
+*requires* that, or merely benefits from it, is not known.
+
+**Hypothesis, untested: this is what `mosey_update` is for.** Barq calls only
+`mosey_start_5` and `mosey_stop`. Google's daemon also calls `mosey_update`,
+which MOSEY-ABI records as taking four arguments — `x0` the session handle, `x1`
+a pointer, `x2`=1, `x3`=0 — with the pointer's contents never identified. A
+service-registration call would fit: it is per-session, it takes a buffer, and
+something has to carry `_airdrop._tcp.local` from userspace into the SR TLVs.
+`mosey_start_5` also takes a `max_mdns` argument, so the library is mDNS-aware
+rather than purely a link layer.
+
+That is a guess from argument shapes, not evidence. The cheap test is the mDNS
+work first: if a peer lists us with the corrected records, the TLVs were not
+required and this stays a curiosity. If it does not, `mosey_update` is the next
+thing to trace — and `gos-ffi-trace.sh` already knows how to read its real
+arguments out of Google's daemon.
