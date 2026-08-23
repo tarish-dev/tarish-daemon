@@ -21,7 +21,13 @@ use std::time::{Duration, Instant};
 pub const AIRDROP_SERVICE: &str = "_airdrop._tcp.local";
 const MDNS_PORT: u16 = 5353;
 /// Port we claim in SRV. Nothing listens there yet; the protocol comes next.
+/// Mosey uses high arbitrary ports (40985, 38005, 39763), so this is not fixed
+/// by the protocol.
 const AIRDROP_PORT: u16 = 8770;
+/// DNS-SD service enumeration.
+const SERVICE_ENUM: &str = "_services._dns-sd._udp.local";
+/// The TXT a working Android peer sends. 489 = 0x1E9; bit meanings unknown.
+const AIRDROP_FLAGS: &str = "flags=489";
 /// Seconds. Short enough that a peer walking away disappears reasonably soon.
 const TTL: u32 = 120;
 /// ff02::fb — the IPv6 mDNS link-local multicast group.
@@ -129,7 +135,9 @@ impl Browser {
     }
 
     fn host(&self) -> String {
-        format!("{}.local", self.instance)
+        // Mosey uses Android_XXXXXXXX.local rather than the instance name, so a
+        // peer sees a host distinct from the rotating service identity.
+        format!("Android_{}.local", self.instance.get(..8).unwrap_or(&self.instance).to_uppercase())
     }
 
     fn full_instance(&self) -> String {
@@ -142,6 +150,12 @@ impl Browser {
         let host = self.host();
         let mut out = Vec::with_capacity(4);
 
+        // Service enumeration: "this host offers _airdrop._tcp". Mosey sends it
+        // and Barq did not; a browser that enumerates services rather than
+        // querying ours by name would never have seen us.
+        out.push(dns::record(SERVICE_ENUM, dns::TYPE_PTR, TTL,
+                             &dns::encode_name(AIRDROP_SERVICE), false));
+
         out.push(dns::record(AIRDROP_SERVICE, dns::TYPE_PTR, TTL,
                              &dns::encode_name(&inst), false));
 
@@ -152,24 +166,31 @@ impl Browser {
         srv.extend_from_slice(&dns::encode_name(&host));
         out.push(dns::record(&inst, dns::TYPE_SRV, TTL, &srv, true));
 
-        // TXT modelled on what a real Mac puts on the wire, captured on this
-        // link:
+        // One key. Captured from Google's Mosey, which interoperates:
         //
-        //   sn=com.apple.sharingd.AirDrop  at=004eb9b20bd5
-        //   sid=AA6F93C8-...               dnm=K-MBProM5   _dc=1
+        //   TXT 8ed4b330f476._airdrop._tcp.local -> flags=489
         //
-        // `dnm` is the device name a peer displays, which is the one field that
-        // matters to a human. The rest are Apple's own identifiers and are not
-        // ours to forge -- we send what we can honestly say about ourselves.
-        let dnm = format!("dnm={}", device_name());
-        let sid = format!("sid={}", self.instance.to_uppercase());
-        let txt: Vec<&str> = vec![&dnm, &sid, "_dc=1"];
+        // An earlier version sent sn/at/sid/dnm here. Those belong to the Mac's
+        // _appsvcprepair and _applicationservicepairing services and never
+        // appear on _airdrop._tcp -- copying them onto this service was wrong.
+        // 489 is 0x1E9; the bit meanings are not known.
         out.push(dns::record(&inst, dns::TYPE_TXT, TTL,
-                             &dns::txt_rdata(&txt), true));
+                             &dns::txt_rdata(&[AIRDROP_FLAGS]), true));
 
         if let Some(a) = self.our_addr() {
             out.push(dns::record(&host, dns::TYPE_AAAA, TTL, &a.octets(), true));
+            // Reverse lookup, as Mosey publishes.
+            out.push(dns::record(&reverse_name(&a), dns::TYPE_PTR, TTL,
+                                 &dns::encode_name(&host), true));
         }
+
+        // NSEC for both names we own. This is the correct reply to a query for a
+        // type we do not have -- notably A on our host, which is exactly what an
+        // Apple peer asked for and got silence.
+        out.push(dns::record(&inst, dns::TYPE_NSEC, TTL,
+                             &dns::nsec_rdata(&inst, &[dns::TYPE_TXT, dns::TYPE_SRV]), true));
+        out.push(dns::record(&host, dns::TYPE_NSEC, TTL,
+                             &dns::nsec_rdata(&host, &[dns::TYPE_AAAA]), true));
         out
     }
 
@@ -355,6 +376,16 @@ impl Browser {
     pub fn peers(&self) -> Vec<Peer> {
         self.peers.values().cloned().collect()
     }
+}
+
+/// `fe80::1` -> `1.0.0....8.E.F.ip6.arpa`, the reverse-lookup name.
+fn reverse_name(a: &Ipv6Addr) -> String {
+    let mut out = String::with_capacity(72);
+    for b in a.octets().iter().rev() {
+        out.push_str(&format!("{:X}.{:X}.", b & 0x0f, b >> 4));
+    }
+    out.push_str("ip6.arpa");
+    out
 }
 
 fn short(instance: &str) -> &str {

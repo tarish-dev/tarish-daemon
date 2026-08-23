@@ -17,6 +17,7 @@ pub const TYPE_A: u16 = 1;
 pub const TYPE_PTR: u16 = 12;
 #[allow(dead_code)]
 pub const TYPE_TXT: u16 = 16;
+pub const TYPE_NSEC: u16 = 47;
 pub const TYPE_AAAA: u16 = 28;
 pub const TYPE_SRV: u16 = 33;
 
@@ -216,6 +217,32 @@ pub fn response(answers: &[Vec<u8>]) -> Vec<u8> {
         p.extend_from_slice(a);
     }
     p
+}
+
+/// NSEC rdata: "this name exists, and has exactly these record types".
+///
+/// Not decoration. It is the correct answer to a query for a type we do not
+/// have — when a peer asks our host for an A record and we only publish AAAA,
+/// silence reads as "no such host" and the peer drops us, while an NSEC says
+/// "that host is mine, it has AAAA and nothing else". Mosey sends these for
+/// both its instance and its host; Barq did not, and that is a good candidate
+/// for why an Apple peer resolved us and then gave up.
+///
+/// Format: next-domain-name, then type bitmaps in (window, length, bits) blocks.
+/// Only window 0 is needed — every type we use is below 256.
+pub fn nsec_rdata(next_name: &str, types: &[u16]) -> Vec<u8> {
+    let mut out = encode_name(next_name);
+    let max = types.iter().copied().max().unwrap_or(0);
+    let len = (max / 8) as usize + 1;
+    let mut bitmap = vec![0u8; len];
+    for &t in types {
+        // Bit order within a byte is most-significant-first.
+        bitmap[(t / 8) as usize] |= 0x80 >> (t % 8);
+    }
+    out.push(0);              // window block 0
+    out.push(len as u8);      // bitmap length
+    out.extend_from_slice(&bitmap);
+    out
 }
 
 /// Encode TXT rdata from key=value strings. Each entry is length-prefixed.
