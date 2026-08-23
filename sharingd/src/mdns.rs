@@ -149,10 +149,20 @@ impl Browser {
         srv.extend_from_slice(&dns::encode_name(&host));
         out.push(dns::record(&inst, dns::TYPE_SRV, TTL, &srv, true));
 
-        // AirDrop's TXT carries capability flags. We advertise the minimum a peer
-        // needs to see; the rest is meaningless until the protocol exists.
+        // TXT modelled on what a real Mac puts on the wire, captured on this
+        // link:
+        //
+        //   sn=com.apple.sharingd.AirDrop  at=004eb9b20bd5
+        //   sid=AA6F93C8-...               dnm=K-MBProM5   _dc=1
+        //
+        // `dnm` is the device name a peer displays, which is the one field that
+        // matters to a human. The rest are Apple's own identifiers and are not
+        // ours to forge -- we send what we can honestly say about ourselves.
+        let dnm = format!("dnm={}", device_name());
+        let sid = format!("sid={}", self.instance.to_uppercase());
+        let txt: Vec<&str> = vec![&dnm, &sid, "_dc=1"];
         out.push(dns::record(&inst, dns::TYPE_TXT, TTL,
-                             &dns::txt_rdata(&["flags=1"]), true));
+                             &dns::txt_rdata(&txt), true));
 
         if let Some(a) = self.our_addr() {
             out.push(dns::record(&host, dns::TYPE_AAAA, TTL, &a.octets(), true));
@@ -204,7 +214,16 @@ impl Browser {
                     q.qtype == dns::TYPE_SRV || q.qtype == dns::TYPE_TXT || q.qtype == QTYPE_ANY
                 }
                 // Our host: where to reach it.
-                _ => q.qtype == dns::TYPE_AAAA || q.qtype == QTYPE_ANY,
+                //
+                // Answer type A as well as AAAA. Apple's stack asks for A even
+                // on an IPv6-only link -- captured on the wire: after seeing our
+                // PTR and SRV it sent "Q A c66a180ad90e.local" twice and nothing
+                // else. We have no IPv4, so answering with our AAAA is the
+                // useful reply; staying silent looks like a host that does not
+                // exist, and the peer drops us.
+                _ => q.qtype == dns::TYPE_AAAA
+                    || q.qtype == dns::TYPE_A
+                    || q.qtype == QTYPE_ANY,
             }
         });
         if !mine {
@@ -327,9 +346,46 @@ fn short(instance: &str) -> &str {
     instance.split('.').next().unwrap_or(instance)
 }
 
-/// A stable 12-hex-character instance name, derived from the interface's MAC so
-/// it survives a restart without needing stored state. Apple's are opaque
-/// identifiers of the same shape.
+/// A human-visible name for this device, for the TXT `dnm` field. Uses whatever
+/// the platform already knows rather than inventing one.
+fn device_name() -> String {
+    for prop in ["persist.barq.name", "ro.product.model", "ro.product.device"] {
+        if let Some(v) = read_prop(prop) {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                return v;
+            }
+        }
+    }
+    "Barq".to_string()
+}
+
+fn read_prop(name: &str) -> Option<String> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    let mut buf = [0u8; 128];
+    // SAFETY: cname is NUL-terminated and buf exceeds PROP_VALUE_MAX.
+    let n = unsafe {
+        libc::__system_property_get(cname.as_ptr(), buf.as_mut_ptr() as *mut libc::c_char)
+    };
+    if n <= 0 {
+        return None;
+    }
+    std::str::from_utf8(&buf[..n as usize]).ok().map(|s| s.to_string())
+}
+
+/// A 12-hex-character instance name derived from the interface MAC, matching the
+/// shape Apple uses.
+///
+/// NOT stable across sessions, despite what an earlier version of this comment
+/// claimed: AWDL randomises the interface MAC every time the link comes up, so
+/// the name changes on every restart of barqd. Observed going from
+/// c66a180ad90e to 92c8e169f34a across one reboot.
+///
+/// That is arguably correct for privacy -- a fixed identifier is a tracking
+/// handle -- but it means a peer cannot recognise this device as one it has seen
+/// before. If pairing ever needs continuity, the identity has to come from
+/// somewhere other than the MAC, and be a deliberate choice rather than a
+/// side effect.
 fn instance_name(iface: &str) -> String {
     if let Ok(mac) = std::fs::read_to_string(format!("/sys/class/net/{iface}/address")) {
         let hex: String = mac.trim().split(':').collect();
