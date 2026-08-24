@@ -1,5 +1,15 @@
 # Reverse-engineering AirDrop properly
 
+> **Scope correction.** This rig is for building our **own AWDL implementation** --
+> a universal driver that does not depend on `libmosey`. It is **not** a debugging
+> tool for the current stack.
+>
+> Once AWDL is established, everything above it is BLE plus ordinary TCP/IP on a
+> working interface, and both endpoints are ours to inspect. Reaching for a
+> monitor-mode capture to debug an HTTPS exchange is the wrong instrument: slower,
+> harder, and it answers a question that `logcat` and `openssl` already answer.
+> Use it when the question is genuinely about the air, not about our own sockets.
+
 ## Why a dedicated rig
 
 Everything established so far came from one vantage point: an Android phone running our
@@ -48,6 +58,10 @@ implementation to compare our behaviour against, and it can act as a *peer* unde
 control, which the Mac never will be.
 
 ## What to capture, in order
+
+These are all questions about **the radio and the AWDL layer itself**, which is what
+the rig is for. Anything above the interface -- mDNS, TLS, HTTP, the transfer -- is
+debugged at the endpoints instead.
 
 1. **iPhone → Mac AirDrop, us absent.** The whole sequence with no interference from
    us. This is the reference recording and everything else is compared against it.

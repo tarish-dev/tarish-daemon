@@ -99,6 +99,15 @@ impl Httpd {
                     if let Err(e) = self.handle(&mut tls) {
                         debug!("{peer}: {e}");
                     }
+                    // Drain whatever the peer still has queued before dropping the
+                    // socket. Closing with unread bytes in the receive buffer makes
+                    // the kernel send RST rather than FIN, and a client that gets RST
+                    // discards the response it already received and retries at once.
+                    //
+                    // Content-Length is not enough on its own: a chunked request has
+                    // none, so the body reader takes nothing and the bytes stay
+                    // queued. Draining is framing-agnostic and cheap.
+                    drain(&mut tls);
                 }
                 // Not an error worth shouting about: anything on the link may probe
                 // this port, and Apple itself opens and drops connections.
@@ -113,6 +122,9 @@ impl Httpd {
         let method = parts.next().unwrap_or_default();
         let path = parts.next().unwrap_or_default();
         info!("{method} {path}");
+        // The full head, once. We have been inferring what the peer wants from the
+        // reply it rejects; this is the peer stating it directly.
+        debug!("head: {}", head.replace("\r\n", " | ").trim_end());
 
         // Log what the PEER sends, not just what we answer. The request is the only
         // place an Apple device states what it expects; everything we know about the
@@ -190,6 +202,18 @@ fn read_body<S: Read>(s: &mut S, head: &str) -> Vec<u8> {
     }
     buf.truncate(got);
     buf
+}
+
+/// Read and discard anything still pending, briefly, so the close is graceful.
+fn drain<S: Read>(s: &mut S) {
+    let mut sink = [0u8; 2048];
+    for _ in 0..8 {
+        match s.read(&mut sink) {
+            Ok(0) => return,
+            Ok(_) => continue,
+            Err(_) => return, // timeout or reset: nothing useful left to do
+        }
+    }
 }
 
 fn hex(b: &[u8]) -> String {
