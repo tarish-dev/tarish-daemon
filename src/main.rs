@@ -159,6 +159,22 @@ fn main() {
         ),
     }
 
+    // A route in a table nothing consults does nothing. Android picks tables with
+    // fib rules keyed on fwmark, and gets no rule for an interface it does not
+    // manage -- so the route above sat in table N, was never looked up, and every
+    // lookup fell through to "32000: from all unreachable".
+    //
+    // This is what stood between a working AirDrop stack and a device that could
+    // never be reached: the peer's SYN arrived, our reply had nowhere to go, and
+    // it presented exactly as though nothing were listening on the port.
+    match route::add_rule(IFACE) {
+        Ok(()) => log::info!("rule: oif {IFACE} lookup {}", route::table_id(IFACE)),
+        Err(e) => log::warn!(
+            "routing rule not added ({e}) — the route on {IFACE} exists but nothing \
+             will consult it, so the device stays unreachable"
+        ),
+    }
+
     // The session lives exactly as long as this process. Exiting tears down the
     // interface and the device stops being discoverable, so hold here and let
     // Drop stop it cleanly on SIGTERM.
