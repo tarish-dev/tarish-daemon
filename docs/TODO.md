@@ -107,6 +107,43 @@ Deliberately **not** implemented yet. Fixing before understanding would bake in 
 and the last several wire-format guesses in this project were wrong while every
 measurement was right.
 
+## Understand before implementing: does AirDrop signal device state?
+
+Reported from using iOS: AirDrop appears to carry a state indicating the screen has been
+turned off. Not yet located in any wire format we hold, and **not** recorded in
+GoOpenDrop -- its `ReceivedBLEBeacon.DataReceived` captures the beacon payload and
+nothing ever decodes it.
+
+Two places it could live, and we do not know which:
+
+- **The undecoded `flags` bits.** `flags` is a capability bitmap, not a constant:
+  GoOpenDrop sends `136` = `0x88` (`SUPPORTS_MIXED_TYPES | SUPPORTS_DISCOVER_MAYBE`),
+  and we measured Mosey sending `489` = `0x1E9`, which is those two bits plus bits
+  0, 5, 6 and 8. Four undecoded bits, and device state is a plausible occupant.
+- **The eight zero bytes in the BLE beacon.** Our AirDrop advertisement carries
+
+  ```
+  05 12 | 00 00 00 00 00 00 00 00 | 01 | aa aa pp pp ee ee ee ee | 00
+        ^^^^^^^^^^^^^^^^^^^^^^^^^ never explained
+  ```
+
+  copied verbatim from a measured capture, which was the right call. But eight bytes of
+  always-zero is unusual in an otherwise dense format, and status flags that happen to
+  be zero in the captured state would look exactly like this.
+
+Apple also broadcasts a separate **NearbyInfo** message (type `0x10`) alongside
+AirDrop's `0x05`, which is a third candidate.
+
+**The experiment**, cheap and using what exists: `BarqBleService` already scans Apple
+beacons and logs the sender address. Log the full manufacturer payload instead, then
+lock and unlock an iPhone while it advertises and diff the bytes. The same method
+decoded the framed cpio container in one capture.
+
+**Why it matters beyond curiosity:** if Apple already models "device present but screen
+off", then Barq's app-open visibility rule maps onto something the protocol expects
+rather than being our own invention, and a peer could show us accurately instead of
+listing a device that will refuse.
+
 ## App
 
 - [ ] Share-sheet target, transfer UI, Quick Settings tile
