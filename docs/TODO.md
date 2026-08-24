@@ -19,9 +19,16 @@ blocker".
 
 - [ ] Bind a TLS listener on the advertised port
 - [ ] `POST /Discover` returning a valid Apple binary plist
-- [ ] Decide the certificate story — this is the real unknown. Contacts-only uses
-      Apple-issued client certificates we cannot produce; what "everyone" mode will
-      accept from an unknown peer is exactly what the capture rig needs to answer.
+- [x] Certificate story — **settled, and it is not an unknown.** A self-signed
+      certificate is sufficient; the peer does not validate ours. Contacts mode is
+      deliberately out of scope: it needs an Apple validation record extracted from a
+      real device that expires yearly, for identity that means little between two
+      platforms with no trust relationship anyway.
+- [ ] Minimal binary plist writer — no plist crate exists in the AOSP tree, and the
+      `/Discover` and `/Ask` bodies are flat dicts of strings and data blobs
+- [ ] TLS via `libopenssl` (BoringSSL-backed, already in the tree). No HTTP crate
+      exists either, but the surface is four routes and hand-writing it matches how
+      barqsharingd already hand-parses DNS.
 
 Only once something answers on that port does the question below become testable at all.
 

@@ -34,6 +34,61 @@ So "what will Everyone mode accept from an unknown peer" has an answer: a self-s
 certificate is enough. This was recorded as the major open unknown and as the main
 justification for a capture rig. It was neither — the answer already existed.
 
+## Scope: "everyone" only — contacts mode is deliberately not implemented
+
+Operator's decision, and it removes the single worst dependency in the protocol.
+
+Contacts-only AirDrop proves identity with an Apple-issued **validation record** and
+client certificate. Those cannot be generated; they have to be **extracted from a real
+Apple device**, and they **expire annually**. Building on them would mean a device that
+silently stops working a year later and can only be fixed by having an Apple device to
+hand.
+
+The trust it buys is also largely notional here. This is a transfer between two
+platforms that have no trust relationship in the first place; a certificate chain that
+proves "this is an Apple ID in your contacts" does not make the peer trustworthy, it
+only makes it *identified*.
+
+Concretely, this means:
+
+- `ReceiverRecordData` is **omitted** from the `/Discover` response
+- no client certificate is presented or required
+- `certs/apple_root_ca.pem` is not needed — we validate nobody
+- we are listed as an unknown device, which is correct and honest
+
+## The `/Discover` response
+
+A binary plist:
+
+| Key | Value |
+|---|---|
+| `ReceiverComputerName` | the name shown in the sender's AirDrop UI |
+| `ReceiverModelName` | device model string |
+| `ReceiverMediaCapabilities` | the JSON bytes `{"Version":1}` |
+| `ReceiverRecordData` | Apple validation record — **omitted**, see above |
+
+This settles where the display name comes from: it is **here**, in the protocol, not in
+mDNS. Consistent with Mosey publishing no name anywhere in its records, and with the
+TXT carrying only `flags`.
+
+`/Ask` answers with `ReceiverModelName` and `ReceiverComputerName`.
+
+## The TXT `flags` field has meaning
+
+GoOpenDrop advertises `flags=136` and documents it as
+`SUPPORTS_DISCOVER_MAYBE (0x80) | SUPPORTS_MIXED_TYPES (0x08)`, crediting opendrop for
+the decoding.
+
+We measured Google's Mosey advertising `flags=489` = `0x1E9`, which includes both of
+those bits and four more. Two independent implementations therefore use different
+values and both interoperate, so this is a capability bitmap and not a magic constant —
+which is worth knowing, because it means a wrong value degrades features rather than
+breaking discovery outright.
+
+Barq sends `489` because that is what was measured from a working Android
+implementation on the same hardware. The remaining bits are not decoded here and are
+not guessed at.
+
 ## HTTP quirks that are not optional
 
 Two things the handlers force explicitly, which read as noise and are not:
