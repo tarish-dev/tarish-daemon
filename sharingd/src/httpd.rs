@@ -42,6 +42,12 @@ const INBOX: &str = "/data/misc/barq/inbox";
 /// A slow or silent peer must not hold a connection open indefinitely.
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// What to do with the connection after answering a request.
+enum Disposition {
+    KeepAlive,
+    Close,
+}
+
 pub struct Httpd {
     acceptor: SslAcceptor,
     listener: TcpListener,
@@ -107,7 +113,7 @@ impl Httpd {
             match self.acceptor.accept(stream) {
                 Ok(mut tls) => {
                     debug!("TLS handshake ok from {peer}");
-                    if let Err(e) = self.handle(&mut tls) {
+                    if let Err(e) = self.serve_connection(&mut tls) {
                         debug!("{peer}: {e}");
                     }
                     // Drain whatever the peer still has queued before dropping the
@@ -127,7 +133,23 @@ impl Httpd {
         }
     }
 
-    fn handle<S: Read + Write>(&self, tls: &mut S) -> std::io::Result<()> {
+    /// Serve requests on one connection until the peer asks to close.
+    ///
+    /// **`/Ask` arrives with `Connection: keep-alive` because the Mac intends to send
+    /// `/Upload` on the SAME connection.** Answering keep-alive and then hanging up
+    /// means the upload never arrives: the peer finds the connection gone, retries
+    /// `/Ask` once, and gives up. That is a transfer that fails with no error anywhere
+    /// -- the log shows two accepted `/Ask`s and no `/Upload`.
+    fn serve_connection<S: Read + Write>(&self, tls: &mut S) -> std::io::Result<()> {
+        loop {
+            match self.handle(tls)? {
+                Disposition::KeepAlive => continue,
+                Disposition::Close => return Ok(()),
+            }
+        }
+    }
+
+    fn handle<S: Read + Write>(&self, tls: &mut S) -> std::io::Result<Disposition> {
         let head = read_head(tls)?;
         let mut parts = head.split_whitespace();
         let method = parts.next().unwrap_or_default();
@@ -185,14 +207,15 @@ impl Httpd {
                     }
                     Err(e) => {
                         error!("/Upload failed: {e}");
-                        respond(tls, 500, None, false)?
+                        respond(tls, 500, None, false)?;
+                        return Ok(Disposition::Close);
                     }
                 }
             }
 
             _ => respond(tls, 401, None, keep_alive)?,
         }
-        Ok(())
+        Ok(if keep_alive { Disposition::KeepAlive } else { Disposition::Close })
     }
 
     /// Stream an upload straight to disk.
@@ -400,6 +423,7 @@ fn drain<S: Read>(s: &mut S) {
 ///
 /// Returns None for anything that cannot be a filename at all, so the caller has to
 /// decide what to do rather than being handed a silently-mangled path.
+#[allow(dead_code)] // used by the extractor; placed first on purpose
 pub fn safe_leaf(entry_name: &str) -> Option<String> {
     let leaf = entry_name
         .rsplit(['/', '\\'])
@@ -426,6 +450,7 @@ pub fn safe_leaf(entry_name: &str) -> Option<String> {
 ///
 /// Checks with `create_new` at the caller rather than testing existence and then
 /// creating, which would be a race.
+#[allow(dead_code)] // used by the extractor; placed first on purpose
 pub fn non_clobbering(dir: &str, leaf: &str) -> String {
     let (stem, ext) = match leaf.rsplit_once('.') {
         // A leading dot is a hidden file, not an extension.
