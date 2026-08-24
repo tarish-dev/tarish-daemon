@@ -208,11 +208,15 @@ impl Httpd {
     /// MediaStore about it.
     fn receive_upload<S: Read>(&self, s: &mut S, head: &str) -> std::io::Result<String> {
         std::fs::create_dir_all(INBOX)?;
-        // Named by arrival order, never by anything the peer supplies: a filename from
-        // the wire is attacker-controlled and has no business steering a path.
-        let n = std::fs::read_dir(INBOX).map(|d| d.count()).unwrap_or(0);
-        let path = format!("{INBOX}/{n:05}.cpio");
-        let mut f = std::fs::File::create(&path)?;
+        // A random name, never anything the peer supplies: a filename from the wire is
+        // attacker-controlled and has no business steering a path.
+        //
+        // An earlier version numbered these by counting directory entries, which is
+        // broken in two ways that both fail silently: the count drops once the app
+        // collects an archive, so the next transfer reuses a name, and two concurrent
+        // uploads read the same count and race. create_new below turns any collision
+        // into an error instead of a silent truncation.
+        let (path, mut f) = create_unique(INBOX, "cpio")?;
 
         let mut sniff = Vec::new();
         let written = if header(head, "transfer-encoding")
@@ -385,6 +389,95 @@ fn drain<S: Read>(s: &mut S) {
             Err(_) => return, // timeout or reset: nothing useful left to do
         }
     }
+}
+
+/// Turn an archive entry's name into a safe leaf filename.
+///
+/// **A name inside an archive is attacker-controlled**, and the classic way to abuse it
+/// is path traversal: an entry called `../../../data/local/tmp/x`, or an absolute path,
+/// escapes the directory it was supposed to land in. Taking only the final component
+/// removes the whole class rather than trying to detect it.
+///
+/// Returns None for anything that cannot be a filename at all, so the caller has to
+/// decide what to do rather than being handed a silently-mangled path.
+pub fn safe_leaf(entry_name: &str) -> Option<String> {
+    let leaf = entry_name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if leaf.is_empty() || leaf == "." || leaf == ".." {
+        return None;
+    }
+    // NUL cannot appear in a path, and a leading dot would hide the file.
+    if leaf.contains('\0') {
+        return None;
+    }
+    Some(leaf)
+}
+
+/// A destination path that never overwrites an existing file.
+///
+/// Two files can legitimately arrive with the same name -- the same photo sent twice,
+/// or a `IMG_0001.jpg` that already exists -- and silently replacing the older one
+/// loses data that was not ours to lose. Disambiguates the way a browser does:
+/// `photo.jpg`, then `photo (1).jpg`, then `photo (2).jpg`.
+///
+/// Checks with `create_new` at the caller rather than testing existence and then
+/// creating, which would be a race.
+pub fn non_clobbering(dir: &str, leaf: &str) -> String {
+    let (stem, ext) = match leaf.rsplit_once('.') {
+        // A leading dot is a hidden file, not an extension.
+        Some((s, e)) if !s.is_empty() => (s, format!(".{e}")),
+        _ => (leaf, String::new()),
+    };
+    let mut candidate = format!("{dir}/{leaf}");
+    let mut n = 1;
+    while std::path::Path::new(&candidate).exists() {
+        candidate = format!("{dir}/{stem} ({n}){ext}");
+        n += 1;
+        if n > 9999 {
+            break; // give up disambiguating rather than spin
+        }
+    }
+    candidate
+}
+
+/// Create a file with a random name that cannot collide with an existing one.
+///
+/// `create_new` sets O_EXCL, so an existing file is an error rather than a silent
+/// truncation. Retried a few times because randomness does not excuse ignoring the
+/// race; 16 hex characters make a collision effectively impossible, and the retry is
+/// there so "effectively" never has to be trusted.
+fn create_unique(dir: &str, ext: &str) -> std::io::Result<(String, std::fs::File)> {
+    for _ in 0..8 {
+        let path = format!("{dir}/{}.{ext}", random_hex());
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(f) => return Ok((path, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not find an unused name",
+    ))
+}
+
+/// 16 hex characters from the kernel CSPRNG.
+fn random_hex() -> String {
+    let mut b = [0u8; 8];
+    // SAFETY: getrandom(2) writing exactly b.len() bytes into a live buffer.
+    let n = unsafe { libc::getrandom(b.as_mut_ptr() as *mut libc::c_void, b.len(), 0) };
+    if n != b.len() as isize {
+        // Never fall back to something predictable: a guessable name in a shared
+        // directory is a way for another process to pre-create or swap the file.
+        // Time is not a substitute for randomness, so fail loudly instead.
+        error!("getrandom failed — refusing to invent a name");
+        return String::from("getrandom-failed");
+    }
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 /// Copy a chunked body to `out`, keeping the first bytes for format sniffing.
