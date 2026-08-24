@@ -22,6 +22,40 @@ interface, and the port must be the one the SRV record advertises. Barq currentl
 advertises `8770` with **nothing bound to it**, which is why no peer could ever list us
 regardless of discovery.
 
+## Confirmed against seemoo-lab/opendrop
+
+GoOpenDrop was based on **[seemoo-lab/opendrop](https://github.com/seemoo-lab/opendrop)**,
+the Darmstadt research implementation, which is the better reference for our case because
+it supports everyone-mode with **no Apple credentials at all**. GoOpenDrop's working
+configuration used an *extracted* certificate, key and validation record, so on its own it
+could not tell us whether everyone-mode works without them. OpenDrop can, and does.
+
+| | opendrop | Barq |
+|---|---|---|
+| server certificate | self-signed, 2048-bit RSA, 365 days | same |
+| client certificate | `ssl.CERT_NONE` — *"we accept self-signed certificates as does Apple"* | none |
+| `/Discover` keys | `ReceiverMediaCapabilities`, `ReceiverComputerName`, `ReceiverModelName` | same |
+| `ReceiverRecordData` | **omitted entirely** when no validation record exists | omitted |
+
+So everyone-mode without extracted Apple credentials is not an assumption; it is how the
+reference implementation runs by default.
+
+### The handler reads a body it never uses
+
+```python
+content_length = int(self.headers["Content-Length"])
+post_data = self.rfile.read(content_length)
+```
+
+This looks redundant and is not. Closing a socket while unread data sits in the receive
+buffer makes the kernel send **RST rather than FIN**; the client treats that as a failed
+exchange, discards whatever we wrote, and retries immediately.
+
+Barq's first listener replied and closed without reading, and the symptom was a Mac
+posting `/Discover` **8035 times** in roughly forty minutes -- about three per second,
+which is retry-storm behaviour rather than polling. The response body was correct the
+whole time and never got read.
+
 ## TLS — the question I wrongly called unknown
 
 - The server presents an ordinary **self-signed certificate**. There is no need to

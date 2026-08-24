@@ -32,6 +32,9 @@ use std::time::Duration;
 /// larger is either a mistake or an attempt to make us allocate.
 const MAX_HEAD: usize = 16 * 1024;
 
+/// Cap on a request body we will buffer. Content-Length is attacker-controlled.
+const MAX_BODY: usize = 64 * 1024;
+
 /// A slow or silent peer must not hold a connection open indefinitely.
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -111,6 +114,15 @@ impl Httpd {
         let path = parts.next().unwrap_or_default();
         info!("{method} {path}");
 
+        // Log what the PEER sends, not just what we answer. The request is the only
+        // place an Apple device states what it expects; everything we know about the
+        // response so far is inference. Guessing at wire formats has been wrong twice
+        // in this project and measuring has been right every time.
+        let body = read_body(tls, &head);
+        if !body.is_empty() {
+            debug!("{path} request body ({} bytes): {}", body.len(), hex(&body));
+        }
+
         match (method, path) {
             // Apple probes this before anything else; failing it is enough to be dropped.
             ("HEAD", "/") => respond(tls, 200, None),
@@ -128,9 +140,8 @@ impl Httpd {
 
 /// Read until the end of the request head, bounded.
 ///
-/// The body is not consumed: `/Discover`'s request body does not affect our fixed
-/// answer, and reading an attacker-supplied Content-Length would be the obvious way to
-/// make this allocate.
+/// The body is read separately by `read_body`, which bounds itself rather than
+/// trusting the declared Content-Length.
 fn read_head<S: Read>(s: &mut S) -> std::io::Result<String> {
     let mut buf = Vec::with_capacity(1024);
     let mut byte = [0u8; 1];
@@ -148,6 +159,45 @@ fn read_head<S: Read>(s: &mut S) -> std::io::Result<String> {
         std::io::ErrorKind::InvalidData,
         "request head too large or truncated",
     ))
+}
+
+/// Read the request body, if the head declared one.
+///
+/// Bounded by MAX_BODY regardless of what Content-Length claims: the length is
+/// attacker-controlled and allocating on it is the obvious way to be made to
+/// exhaust memory.
+fn read_body<S: Read>(s: &mut S, head: &str) -> Vec<u8> {
+    let len = head
+        .lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim().eq_ignore_ascii_case("content-length").then(|| v.trim())
+        })
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(MAX_BODY);
+    if len == 0 {
+        return Vec::new();
+    }
+    let mut buf = vec![0u8; len];
+    let mut got = 0;
+    while got < len {
+        match s.read(&mut buf[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(_) => break,
+        }
+    }
+    buf.truncate(got);
+    buf
+}
+
+fn hex(b: &[u8]) -> String {
+    let mut out = String::with_capacity(b.len() * 2);
+    for x in b {
+        out.push_str(&format!("{x:02x}"));
+    }
+    out
 }
 
 /// Write an HTTP/1.1 response.
