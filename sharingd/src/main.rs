@@ -172,7 +172,9 @@ impl IBarqService for BarqService {
     }
 
     fn getReceivedFiles(&self) -> BinderResult<Vec<String>> {
-        Ok(httpd::received_files())
+        let files = httpd::received_files();
+        log::info!("getReceivedFiles -> {} file(s)", files.len());
+        Ok(files)
     }
 
     fn openReceivedFile(&self, name: &str) -> BinderResult<binder::ParcelFileDescriptor> {
