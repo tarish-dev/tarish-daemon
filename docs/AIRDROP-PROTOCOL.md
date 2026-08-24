@@ -68,6 +68,34 @@ So "what will Everyone mode accept from an unknown peer" has an answer: a self-s
 certificate is enough. This was recorded as the major open unknown and as the main
 justification for a capture rig. It was neither — the answer already existed.
 
+## What the peer actually sends — measured
+
+Logged from a Mac, 2026-08-24, at the moment the phone first appeared in its AirDrop
+window:
+
+```
+POST /Discover HTTP/1.1 | User-Agent: AirDrop/1.0 | Connection: close      | Transfer-Encoding: chunked
+POST /Ask      HTTP/1.1 | User-Agent: AirDrop/1.0 | Connection: keep-alive | Transfer-Encoding: chunked
+```
+
+Three things in two lines, none of which were guessable:
+
+**Requests are `Transfer-Encoding: chunked`.** There is no `Content-Length`. A body
+reader keyed on `Content-Length` takes nothing and leaves the bytes queued — and
+closing a socket with unread data in the receive buffer makes the kernel send **RST
+rather than FIN**. The peer then discards the response it already received and retries
+immediately.
+
+That is what a correct `/Discover` body looked like from the outside: **8035 posts in
+forty minutes, about thirty per second**. The reply was right the whole time and was
+being thrown away. Draining the socket before close is framing-agnostic and fixes it —
+three handshakes in ninety seconds afterwards.
+
+**`/Ask` wants `Connection: keep-alive` while `/Discover` wants `close`.** A `respond()`
+that hardcodes `Connection: close` is fine for being listed and wrong for receiving.
+
+**`User-Agent: AirDrop/1.0`** identifies the peer, if that is ever wanted.
+
 ## Scope: "everyone" only — contacts mode is deliberately not implemented
 
 Operator's decision, and it removes the single worst dependency in the protocol.
