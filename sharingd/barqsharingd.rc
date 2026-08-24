@@ -7,6 +7,15 @@
 # Started after barqd, though it does not require it: with no link up it simply
 # reports linkUp=false rather than failing.
 
+# Received archives land here. Created by init rather than by the daemon so the
+# ownership and mode are set by something that has the standing to set them, and so
+# the directory exists before the first transfer rather than on the first write.
+#
+# 0700 nobody: only this daemon can read what a peer sent until the app collects it.
+on post-fs-data
+    mkdir /data/misc/barq 0700 nobody nobody
+    mkdir /data/misc/barq/inbox 0700 nobody nobody
+
 service barqsharingd /system_ext/bin/barqsharingd
     class late_start
     user nobody

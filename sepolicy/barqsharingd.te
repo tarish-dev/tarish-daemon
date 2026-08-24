@@ -42,9 +42,23 @@ allow barqsharingd proc_net:file r_file_perms;
 allow barqsharingd sysfs_net:dir search;
 allow barqsharingd sysfs_net:file r_file_perms;
 
+# Where received archives are stored, before the app collects them.
+#
+# The daemon writes files here and nothing else: it does not read them back, and it
+# cannot reach shared storage at all. Downloads/Barq is the app's job, because the app
+# is the side with the standing to write there and to tell MediaStore about it -- and
+# because parsing a hostile archive must not happen in a process that has that standing.
+type barq_data_file, file_type, data_file_type, core_data_file_type;
+allow barqsharingd barq_data_file:dir { search write add_name };
+allow barqsharingd barq_data_file:file { create write open getattr };
+
+# Reading the directory to number the next archive.
+allow barqsharingd barq_data_file:dir read;
+
 # NOT granted, and each absence is deliberate:
 #   no capability of any kind
 #   no netlink_generic_socket   -- driving the radio is barqd's job
 #   no packet_socket            -- raw frames are barqd's job
 #   no tun_device               -- creating mosey0 is barqd's job
 #   no execute of anything
+#   no sdcard / media_rw access -- Downloads/Barq is reached by the app, never here
