@@ -20,6 +20,11 @@ init_daemon_domain(barqsharingd)
 
 # Ordinary sockets: TCP/UDP for the transfer, and the standard network access
 # an unprivileged networked daemon gets.
+#
+# This covers the AirDrop HTTPS listener -- create/bind/listen/accept on a
+# tcp_socket and node_bind on the link-local address. No rule is added here
+# speculatively: if a denial shows up, it gets derived from the real AVC with
+# gos-selinux.sh rather than guessed at in advance.
 net_domain(barqsharingd)
 
 # Publish IBarqService, and talk binder to the clients that bind it.

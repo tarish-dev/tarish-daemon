@@ -23,7 +23,7 @@ const MDNS_PORT: u16 = 5353;
 /// Port we claim in SRV. Nothing listens there yet; the protocol comes next.
 /// Mosey uses high arbitrary ports (40985, 38005, 39763), so this is not fixed
 /// by the protocol.
-const AIRDROP_PORT: u16 = 8770;
+pub(crate) const AIRDROP_PORT: u16 = 8770;
 /// DNS-SD service enumeration.
 const SERVICE_ENUM: &str = "_services._dns-sd._udp.local";
 /// The TXT a working Android peer sends. 489 = 0x1E9; bit meanings unknown.
@@ -418,7 +418,7 @@ fn instance_name(iface: &str) -> String {
 }
 
 /// The interface's IPv6 link-local address, for the AAAA record.
-fn link_local_of(iface: &str) -> Option<Ipv6Addr> {
+pub(crate) fn link_local_of(iface: &str) -> Option<Ipv6Addr> {
     let data = std::fs::read_to_string("/proc/net/if_inet6").ok()?;
     for line in data.lines() {
         let mut f = line.split_whitespace();
@@ -477,7 +477,7 @@ fn bind_reuse(port: u16) -> io::Result<UdpSocket> {
     Ok(unsafe { <UdpSocket as std::os::fd::FromRawFd>::from_raw_fd(fd) })
 }
 
-fn ifindex_of(iface: &str) -> io::Result<u32> {
+pub(crate) fn ifindex_of(iface: &str) -> io::Result<u32> {
     let c = std::ffi::CString::new(iface).map_err(|_| io::Error::other("bad interface name"))?;
     // SAFETY: c is a valid NUL-terminated string.
     let idx = unsafe { libc::if_nametoindex(c.as_ptr()) };

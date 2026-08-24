@@ -18,7 +18,9 @@
 //! Skeleton: publishes IBarqService and answers, but implements no protocol yet.
 
 mod dns;
+mod httpd;
 mod mdns;
+mod plist;
 
 use binder::{BinderFeatures, Interface, Result as BinderResult, Status, StatusCode, Strong};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -228,6 +230,37 @@ fn start_discovery(peers: PeerTable, discoverable: Discoverable) {
     });
 }
 
+/// Bring up the AirDrop HTTPS listener on the port our SRV record advertises.
+///
+/// Without this a peer that browses, resolves and reaches us gets connection-refused
+/// and shows nothing -- being listed requires a real answer to POST /Discover, not a
+/// correct mDNS record. Barq advertised 8770 with nothing bound to it for a long time.
+///
+/// mosey0 may not exist or may have no address yet when we start, since barqd brings
+/// the link up independently. Retry rather than give up: failing here permanently
+/// would mean a daemon that is running, looks healthy, and can never be discovered.
+fn start_airdrop_server() {
+    std::thread::spawn(|| {
+        let name = read_property("persist.barq.name")
+            .or_else(|| read_property("ro.product.model"))
+            .unwrap_or_else(|| "Barq".to_string());
+        let model = read_property("ro.product.model").unwrap_or_else(|| "Android".to_string());
+
+        loop {
+            match httpd::Httpd::new(IFACE, mdns::AIRDROP_PORT, &name, &model) {
+                Ok(server) => {
+                    log::info!("AirDrop server up as \"{name}\"");
+                    server.serve();
+                    // serve() only returns if the listener itself died.
+                    log::warn!("AirDrop server stopped — rebinding");
+                }
+                Err(e) => log::debug!("AirDrop server not up yet: {e}"),
+            }
+            std::thread::sleep(Duration::from_secs(5));
+        }
+    });
+}
+
 fn main() {
     android_logger::init_once(
         android_logger::Config::default()
@@ -251,6 +284,7 @@ fn main() {
     let discoverable: Discoverable = Arc::new(AtomicBool::new(initial));
 
     start_discovery(peers.clone(), discoverable.clone());
+    start_airdrop_server();
 
     let service = BarqService::new(peers, discoverable);
     let binder = BnBarqService::new_binder(service, BinderFeatures::default());

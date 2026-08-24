@@ -13,6 +13,7 @@ rust_binary {
         "libbinder_rs",
         "liblibc",
         "liblog_rust",
+        "libopenssl",
         "dev.barq-rust",
     ],
     init_rc: ["barqsharingd.rc"],
