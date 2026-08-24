@@ -66,6 +66,47 @@ Then, if both are clean and it still does not appear:
 - [ ] Act on a received BLE beacon rather than holding AWDL continuously, which costs
       more power than Apple spends
 
+## Understand before implementing: how a peer lists a dual-protocol device ONCE
+
+**Observed**, on two Android phones that both support AirDrop and Quick Share: the
+receiver lists the sender **once**, not twice. Something correlates the two
+advertisements, and we do not know what.
+
+This has to be understood **before** the Quick Share migration starts, because Barq
+will be exactly such a device -- speaking AirDrop to Apple peers and Quick Share to
+Android ones -- and getting it wrong means every Android peer sees us twice.
+
+What is established: the two identities share **nothing** at protocol level.
+
+| | AirDrop | Quick Share |
+|---|---|---|
+| mDNS | `_airdrop._tcp.local` | `_FC9F5ED42C8A._tcp.local` |
+| instance | 12 hex, rotating | 4-char endpoint id |
+| BLE | Apple mfg data `0x004C` | Google service UUID `0xFE2C` |
+| name in discovery | **none** -- TXT is only `flags=` | in endpoint info |
+
+AirDrop's TXT carries no device name at all; the name arrives later as
+`ReceiverComputerName` in the `/Discover` response. So a browser cannot even compare
+names until after a TLS connection. Correlation therefore cannot be happening at the
+mDNS layer.
+
+**Leading hypothesis: both advertisements come from the same BLE adapter**, so a
+scanner groups them by source address before either protocol is involved. That would
+explain dedup with no shared identifier anywhere above the link layer.
+
+**The experiment**, using what already exists: `BarqBleService` logs the source address
+of every AirDrop beacon it sees. Add a second scan filter for `0xFE2C` and log the same
+way, then watch the two phones that actually exhibit the behaviour. If both payloads
+appear from one address at any given moment, the hypothesis holds.
+
+**The caveat that could kill it:** Android uses resolvable private addresses that
+rotate. If the two payloads rotate *together* the grouping still works; if they rotate
+independently, address correlation cannot be the mechanism and something else is.
+
+Deliberately **not** implemented yet. Fixing before understanding would bake in a guess,
+and the last several wire-format guesses in this project were wrong while every
+measurement was right.
+
 ## App
 
 - [ ] Share-sheet target, transfer UI, Quick Settings tile

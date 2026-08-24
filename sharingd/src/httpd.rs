@@ -24,7 +24,7 @@ use openssl::pkey::PKey;
 use openssl::rsa::Rsa;
 use openssl::ssl::{SslAcceptor, SslMethod};
 use openssl::x509::{X509Builder, X509NameBuilder};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{SocketAddrV6, TcpListener};
 use std::time::Duration;
 
@@ -229,8 +229,81 @@ impl Httpd {
     /// moving files to Downloads/Barq -- where Quick Share puts its own -- is the app's
     /// job, because that is the side with the standing to write there and to tell
     /// MediaStore about it.
+    /// Unpack a received archive into the inbox.
+    ///
+    /// The payload is Apple's block-framed compression wrapper around a cpio archive in
+    /// the odc dialect -- see framed.rs for the container and why it is not gzip.
+    fn extract(&self, archive: &str) -> std::io::Result<usize> {
+        // `new`, `read_next` and `finish` come from the CpioReader trait, so it has to
+        // be in scope even though it is never named below.
+        use cpio_archive::CpioReader as _;
+
+        let f = std::fs::File::open(archive)?;
+        let mut r = cpio_archive::odc::OdcReader::new(std::io::BufReader::new(
+            crate::framed::FramedReader::new(f),
+        ));
+        let mut count = 0usize;
+
+        loop {
+            let header = match r.read_next().map_err(cpio_err)? {
+                Some(h) => h,
+                None => break,
+            };
+            let name = header.name().to_string();
+            let size = header.file_size();
+            let is_dir = header.mode() & 0o170000 == 0o040000;
+            drop(header);
+
+            // What must not become a file:
+            //   "."         the archive's own root
+            //   "._<name>"  AppleDouble sidecars -- macOS resource-fork metadata that
+            //               accompanies every file. Writing them out leaves a hidden
+            //               junk file beside each real one, which is what a naive
+            //               extractor does. Half a real transfer is these: four photos
+            //               arrived as nine entries.
+            //   directories we flatten into the inbox rather than recreating a tree
+            //
+            // TRAILER!!! needs no check -- the reader never emits it.
+            let leaf = safe_leaf(&name);
+            let skip = match &leaf {
+                None => true,
+                Some(l) => l.starts_with("._") || is_dir || size == 0,
+            };
+            if skip {
+                debug!("skipping {name:?} ({size} bytes)");
+                // finish() advances past a member we did not read.
+                r.finish().map_err(cpio_err)?;
+                continue;
+            }
+            let leaf = leaf.expect("checked above");
+
+            let dest = non_clobbering(INBOX, &leaf);
+            let mut out = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&dest)?;
+            // OdcReader is BOTH Iterator and Read, so `.take()` is ambiguous --
+            // Iterator::take counts elements, Read::take counts bytes. Name the trait.
+            let mut limited = Read::take(&mut r, size);
+            let copied = io::copy(&mut limited, &mut out)?;
+            if copied != size {
+                warn!("{dest}: expected {size} bytes, wrote {copied}");
+            }
+            info!("extracted {dest} ({copied} bytes)");
+            r.finish().map_err(cpio_err)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     fn receive_upload<S: Read>(&self, s: &mut S, head: &str) -> std::io::Result<String> {
-        std::fs::create_dir_all(INBOX)?;
+        // No create_dir_all here: init makes /data/misc/barq/inbox at post-fs-data,
+        // and calling it anyway cost a real transfer. create_dir_all stats the path
+        // first, `getattr` on the directory was not in our policy, so it could not tell
+        // the directory existed, tried to create it, and returned EEXIST -- reported as
+        // "File exists" on a perfectly good inbox.
+        //
+        // Not asking is better than asking for a permission we do not need.
         // A random name, never anything the peer supplies: a filename from the wire is
         // attacker-controlled and has no business steering a path.
         //
@@ -254,14 +327,15 @@ impl Httpd {
             stream_exact(s, &mut f, len, &mut sniff)?
         };
 
-        // Apple may gzip the cpio and nothing in the request declares it, so sniff.
-        // libarchive hides this from implementations built on it; ours has to look.
-        let gzipped = sniff.len() > 2 && sniff[0] == 0x1f && sniff[1] == 0x8b;
-        let magic: String = sniff.iter().take(6).map(|b| *b as char).collect();
-        info!(
-            "/Upload: {written} bytes, {}, leading bytes {magic:?}",
-            if gzipped { "gzip" } else { "not gzip" }
-        );
+        info!("/Upload: {written} bytes received");
+        drop(f);
+
+        match self.extract(&path) {
+            Ok(n) => info!("/Upload: extracted {n} file(s)"),
+            // The archive is kept on failure: it is the only copy of what the peer
+            // sent, and deleting it would destroy the evidence needed to fix this.
+            Err(e) => error!("/Upload: extraction failed ({e}) — archive kept at {path}"),
+        }
         Ok(path)
     }
 }
@@ -423,7 +497,6 @@ fn drain<S: Read>(s: &mut S) {
 ///
 /// Returns None for anything that cannot be a filename at all, so the caller has to
 /// decide what to do rather than being handed a silently-mangled path.
-#[allow(dead_code)] // used by the extractor; placed first on purpose
 pub fn safe_leaf(entry_name: &str) -> Option<String> {
     let leaf = entry_name
         .rsplit(['/', '\\'])
@@ -450,7 +523,6 @@ pub fn safe_leaf(entry_name: &str) -> Option<String> {
 ///
 /// Checks with `create_new` at the caller rather than testing existence and then
 /// creating, which would be a race.
-#[allow(dead_code)] // used by the extractor; placed first on purpose
 pub fn non_clobbering(dir: &str, leaf: &str) -> String {
     let (stem, ext) = match leaf.rsplit_once('.') {
         // A leading dot is a hidden file, not an extension.
@@ -573,6 +645,11 @@ fn stream_exact<S: Read, W: std::io::Write>(
     }
     out.flush()?;
     Ok(total)
+}
+
+/// cpio-archive's error type is not io::Error; give it one shape at the boundary.
+fn cpio_err(e: cpio_archive::Error) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
 }
 
 fn hex(b: &[u8]) -> String {

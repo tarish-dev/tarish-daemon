@@ -49,7 +49,7 @@ allow barqsharingd sysfs_net:file r_file_perms;
 # is the side with the standing to write there and to tell MediaStore about it -- and
 # because parsing a hostile archive must not happen in a process that has that standing.
 type barq_data_file, file_type, data_file_type, core_data_file_type;
-allow barqsharingd barq_data_file:dir { search write add_name };
+allow barqsharingd barq_data_file:dir { search write add_name getattr };
 allow barqsharingd barq_data_file:file { create write open getattr };
 
 # Reading the directory to number the next archive.

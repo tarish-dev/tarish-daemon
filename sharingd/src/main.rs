@@ -18,6 +18,7 @@
 //! Skeleton: publishes IBarqService and answers, but implements no protocol yet.
 
 mod dns;
+mod framed;
 mod httpd;
 mod mdns;
 mod plist;
