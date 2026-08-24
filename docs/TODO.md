@@ -2,7 +2,30 @@
 
 Ordered by what unblocks the most. Kept here rather than in a chat log so it survives.
 
-## Blocking: what makes a peer start browsing `_airdrop._tcp`
+## Blocking: nothing listens on the port we advertise
+
+Our SRV says `Android_XXXXXXXX.local:8770` and **nothing is bound to 8770**. Checked on
+the device: no listening socket in either daemon.
+
+This is not a detail below discovery, it is a prerequisite *for* discovery finishing.
+A sender does not list a peer because it answered mDNS. It resolves the SRV, opens
+**TLS** to that port and sends `POST /Discover`; the device appears in the AirDrop
+window only if that returns a valid response. So even a peer that browses, resolves and
+reaches us gets connection-refused and shows nothing.
+
+Which means the mDNS and BLE work, both of which are correct, could not have produced a
+visible device on their own. That was mis-framed for several cycles as "discovery is the
+blocker".
+
+- [ ] Bind a TLS listener on the advertised port
+- [ ] `POST /Discover` returning a valid Apple binary plist
+- [ ] Decide the certificate story — this is the real unknown. Contacts-only uses
+      Apple-issued client certificates we cannot produce; what "everyone" mode will
+      accept from an unknown peer is exactly what the capture rig needs to answer.
+
+Only once something answers on that port does the question below become testable at all.
+
+## Then: what makes a peer start browsing `_airdrop._tcp`
 
 Our mDNS advertisement is verified byte-for-byte identical in shape to Google's Mosey,
 and in every capture so far the only device asking for `_airdrop._tcp` has been us. BLE
