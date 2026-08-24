@@ -39,6 +39,9 @@ const MAX_BODY: usize = 64 * 1024;
 /// storage: the app moves them to Downloads/Barq, where Quick Share puts its own.
 const INBOX: &str = "/data/misc/barq/inbox";
 
+/// Report progress at most once per this many bytes.
+const PROGRESS_STEP: u64 = 256 * 1024;
+
 /// A slow or silent peer must not hold a connection open indefinitely.
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -55,6 +58,7 @@ pub struct Httpd {
     ask_body: Vec<u8>,
     discoverable: crate::Discoverable,
     callbacks: crate::Callbacks,
+    transfers: crate::Transfers,
 }
 
 impl Httpd {
@@ -66,6 +70,7 @@ impl Httpd {
         model: &str,
         discoverable: crate::Discoverable,
         callbacks: crate::Callbacks,
+        transfers: crate::Transfers,
     ) -> std::io::Result<Self> {
         let addr = crate::mdns::link_local_of(iface).ok_or_else(|| {
             std::io::Error::new(
@@ -101,7 +106,9 @@ impl Httpd {
             ("ReceiverComputerName", Value::Str(name.to_string())),
         ]);
 
-        Ok(Self { acceptor, listener, discover_body, ask_body, discoverable, callbacks })
+        Ok(Self {
+            acceptor, listener, discover_body, ask_body, discoverable, callbacks, transfers,
+        })
     }
 
     /// Accept forever. Each connection is handled on its own thread and closed after
@@ -212,7 +219,12 @@ impl Httpd {
                 return Ok(Disposition::Close);
             }
             ("POST", "/Ask") => {
-                info!("accepting transfer");
+                // A new transfer starts here, not at /Upload: /Ask is the first point
+                // the peer commits, and the UI should show something before any bytes
+                // arrive rather than sitting idle through the whole handshake.
+                let id = self.transfers.begin();
+                info!("accepting transfer {id}");
+                self.offered(id);
                 respond(tls, 200, Some(&self.ask_body), keep_alive)?
             }
 
@@ -223,13 +235,19 @@ impl Httpd {
             }
 
             ("POST", "/Upload") => {
-                match self.receive_upload(tls, &head) {
+                let id = self.transfers.current();
+                match self.receive_upload(tls, &head, id) {
                     Ok(path) => {
                         info!("/Upload stored at {path}");
+                        self.transfers.finish(id);
                         respond(tls, 200, None, keep_alive)?
                     }
                     Err(e) => {
                         error!("/Upload failed: {e}");
+                        // -1 tells the client this ended without files rather than
+                        // leaving its progress bar stuck at whatever it last saw.
+                        self.each_callback(|cb| cb.onTransferFinished(id, -1));
+                        self.transfers.finish(id);
                         respond(tls, 500, None, false)?;
                         return Ok(Disposition::Close);
                     }
@@ -252,15 +270,23 @@ impl Httpd {
     /// moving files to Downloads/Barq -- where Quick Share puts its own -- is the app's
     /// job, because that is the side with the standing to write there and to tell
     /// MediaStore about it.
-    fn visible(&self) -> bool {
-        self.discoverable.load(std::sync::atomic::Ordering::SeqCst)
+    /// Tell clients a transfer has been accepted and is about to send.
+    ///
+    /// The file names are not known yet: they live in the /Ask plist, and Barq has a
+    /// plist writer but no reader. Sending an empty list is honest -- the UI shows
+    /// "receiving" without inventing names it does not have.
+    fn offered(&self, id: i64) {
+        self.each_callback(|cb| cb.onTransferOffered(id, "", &[], 0));
     }
 
-    /// Tell any registered client that files have arrived.
-    ///
-    /// Failures are logged and ignored: a client that died holding a callback must not
-    /// be able to break receiving for the next one.
-    fn announce(&self, names: &[String]) {
+    fn progress(&self, id: i64, done: u64, total: u64) {
+        self.each_callback(|cb| cb.onTransferProgress(id, done as i64, total as i64));
+    }
+
+    fn each_callback<F>(&self, f: F)
+    where
+        F: Fn(&binder::Strong<dyn crate::IBarqCallback>) -> binder::Result<()>,
+    {
         let cbs = match self.callbacks.lock() {
             Ok(c) => c,
             Err(e) => {
@@ -269,10 +295,25 @@ impl Httpd {
             }
         };
         for cb in cbs.iter() {
-            if let Err(e) = cb.onTransferFinished(0, names.len() as i32) {
+            // A client that died holding a callback must not break receiving for the
+            // next one, so failures are logged and skipped.
+            if let Err(e) = f(cb) {
                 debug!("callback failed: {e:?}");
             }
         }
+    }
+
+    fn visible(&self) -> bool {
+        self.discoverable.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Tell any registered client that files have arrived.
+    ///
+    /// Failures are logged and ignored: a client that died holding a callback must not
+    /// be able to break receiving for the next one.
+    fn announce(&self, id: i64, names: &[String]) {
+        let n = names.len() as i32;
+        self.each_callback(|cb| cb.onTransferFinished(id, n));
     }
 
     /// Unpack a received archive into the inbox.
@@ -344,7 +385,7 @@ impl Httpd {
         Ok(names)
     }
 
-    fn receive_upload<S: Read>(&self, s: &mut S, head: &str) -> std::io::Result<String> {
+    fn receive_upload<S: Read>(&self, s: &mut S, head: &str, id: i64) -> std::io::Result<String> {
         // No create_dir_all here: init makes /data/misc/barq/inbox at post-fs-data,
         // and calling it anyway cost a real transfer. create_dir_all stats the path
         // first, `getattr` on the directory was not in our policy, so it could not tell
@@ -362,18 +403,47 @@ impl Httpd {
         // into an error instead of a silent truncation.
         let (path, mut f) = create_unique(INBOX, "cpio")?;
 
+        // The peer states the whole payload size up front in its own header, which is
+        // what makes a real percentage possible: the body is chunked, so Content-Length
+        // is absent and the stream alone cannot say how far along it is.
+        let total = header(head, "totalbytes")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+
         let mut sniff = Vec::new();
+        let mut last_report = 0u64;
+        // Throttled: a callback per 8 KB chunk would cross binder thousands of times for
+        // one photo and slow the transfer it is reporting on.
+        let mut on_progress = |done: u64| {
+            if total > 0 && done.saturating_sub(last_report) >= PROGRESS_STEP {
+                last_report = done;
+                self.progress(id, done, total);
+            }
+        };
+        let cancelled = || self.transfers.is_cancelled(id);
+
         let written = if header(head, "transfer-encoding")
             .map(|v| v.to_ascii_lowercase().contains("chunked"))
             .unwrap_or(false)
         {
-            stream_chunked(s, &mut f, &mut sniff)?
+            stream_chunked(s, &mut f, &mut sniff, &mut on_progress, &cancelled)?
         } else {
             let len = header(head, "content-length")
                 .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(0);
-            stream_exact(s, &mut f, len, &mut sniff)?
+                .unwrap_or(total);
+            stream_exact(s, &mut f, len, &mut sniff, &mut on_progress, &cancelled)?
         };
+
+        if self.transfers.is_cancelled(id) {
+            // The partial archive is useless and the user asked for it to stop, so it
+            // goes rather than lingering as a file nobody can open.
+            let _ = std::fs::remove_file(&path);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "cancelled by the user",
+            ));
+        }
+        self.progress(id, written, if total > 0 { total } else { written });
 
         info!("/Upload: {written} bytes received");
         drop(f);
@@ -387,7 +457,7 @@ impl Httpd {
                 if let Err(e) = std::fs::remove_file(&path) {
                     warn!("could not remove {path}: {e}");
                 }
-                self.announce(&names);
+                self.announce(id, &names);
             }
             // Kept on failure: it is the only copy of what the peer sent, and deleting
             // it would destroy the evidence needed to work out why.
@@ -639,6 +709,8 @@ fn stream_chunked<S: Read, W: std::io::Write>(
     s: &mut S,
     out: &mut W,
     sniff: &mut Vec<u8>,
+    on_progress: &mut dyn FnMut(u64),
+    cancelled: &dyn Fn() -> bool,
 ) -> std::io::Result<u64> {
     let mut total = 0u64;
     let mut buf = [0u8; 8192];
@@ -673,6 +745,10 @@ fn stream_chunked<S: Read, W: std::io::Write>(
             out.write_all(&buf[..n])?;
             total += n as u64;
             left -= n;
+            on_progress(total);
+            if cancelled() {
+                return Ok(total);
+            }
         }
         let _ = read_line(s); // CRLF after chunk data
     }
@@ -685,6 +761,8 @@ fn stream_exact<S: Read, W: std::io::Write>(
     out: &mut W,
     len: u64,
     sniff: &mut Vec<u8>,
+    on_progress: &mut dyn FnMut(u64),
+    cancelled: &dyn Fn() -> bool,
 ) -> std::io::Result<u64> {
     let mut total = 0u64;
     let mut buf = [0u8; 8192];
@@ -699,6 +777,10 @@ fn stream_exact<S: Read, W: std::io::Write>(
         }
         out.write_all(&buf[..n])?;
         total += n as u64;
+        on_progress(total);
+        if cancelled() {
+            return Ok(total);
+        }
     }
     out.flush()?;
     Ok(total)

@@ -50,6 +50,47 @@ type PeerTable = Arc<Mutex<Vec<mdns::Peer>>>;
 /// make the device vanish.
 type Discoverable = Arc<AtomicBool>;
 type Callbacks = Arc<Mutex<Vec<Strong<dyn IBarqCallback>>>>;
+pub(crate) type Transfers = Arc<TransferState>;
+
+/// The one transfer that can be in flight, and whether the user has cancelled it.
+///
+/// Deliberately single-slot: AirDrop sends one archive per exchange, and a peer that
+/// opens a second while the first is running would be answered on its own connection
+/// anyway. Modelling a queue we cannot yet receive would be inventing behaviour.
+#[derive(Default)]
+pub(crate) struct TransferState {
+    /// Id of the transfer in flight, 0 when idle. Ids never repeat within a boot, so a
+    /// cancel arriving late for a finished transfer cannot stop the next one.
+    current: std::sync::atomic::AtomicI64,
+    cancelled: std::sync::atomic::AtomicI64,
+    next: std::sync::atomic::AtomicI64,
+}
+
+impl TransferState {
+    pub(crate) fn begin(&self) -> i64 {
+        let id = self.next.fetch_add(1, Ordering::SeqCst) + 1;
+        self.current.store(id, Ordering::SeqCst);
+        id
+    }
+
+    pub(crate) fn current(&self) -> i64 {
+        self.current.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn finish(&self, id: i64) {
+        let _ = self.current.compare_exchange(id, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    /// Cancel by id rather than "whatever is running": a stale tap from a client that
+    /// was showing the previous transfer must not kill the current one.
+    pub(crate) fn cancel(&self, id: i64) {
+        self.cancelled.store(id, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_cancelled(&self, id: i64) -> bool {
+        id != 0 && self.cancelled.load(Ordering::SeqCst) == id
+    }
+}
 
 /// Read an Android system property.
 fn read_property(name: &str) -> Option<String> {
@@ -69,6 +110,7 @@ struct BarqService {
     // Callbacks are held weakly in spirit: a client that is not running is the
     // normal case, so nothing here may assume one exists.
     callbacks: Callbacks,
+    transfers: Transfers,
     /// Bumped by every setDiscoverable call so an older auto-off timer knows it has
     /// been superseded and must not switch visibility off under a newer request.
     visibility_generation: Arc<std::sync::atomic::AtomicU64>,
@@ -80,6 +122,7 @@ impl BarqService {
     fn new(peers: PeerTable, discoverable: Discoverable) -> Self {
         Self {
             callbacks: Arc::new(Mutex::new(Vec::new())),
+            transfers: Arc::new(TransferState::default()),
             visibility_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             discoverable,
             peers,
@@ -167,8 +210,10 @@ impl IBarqService for BarqService {
         Err(Status::from(StatusCode::NAME_NOT_FOUND))
     }
 
-    fn cancelTransfer(&self, _transfer_id: i64) -> BinderResult<()> {
-        Err(Status::from(StatusCode::NAME_NOT_FOUND))
+    fn cancelTransfer(&self, transfer_id: i64) -> BinderResult<()> {
+        log::info!("cancelTransfer({transfer_id})");
+        self.transfers.cancel(transfer_id);
+        Ok(())
     }
 
     fn getReceivedFiles(&self) -> BinderResult<Vec<String>> {
@@ -287,7 +332,7 @@ fn start_discovery(peers: PeerTable, discoverable: Discoverable) {
 /// mosey0 may not exist or may have no address yet when we start, since barqd brings
 /// the link up independently. Retry rather than give up: failing here permanently
 /// would mean a daemon that is running, looks healthy, and can never be discovered.
-fn start_airdrop_server(discoverable: Discoverable, callbacks: Callbacks) {
+fn start_airdrop_server(discoverable: Discoverable, callbacks: Callbacks, transfers: Transfers) {
     std::thread::spawn(move || {
         let name = read_property("persist.barq.name")
             .or_else(|| read_property("ro.product.model"))
@@ -302,6 +347,7 @@ fn start_airdrop_server(discoverable: Discoverable, callbacks: Callbacks) {
                 &model,
                 discoverable.clone(),
                 callbacks.clone(),
+                transfers.clone(),
             ) {
                 Ok(server) => {
                     log::info!("AirDrop server up as \"{name}\"");
@@ -346,7 +392,11 @@ fn main() {
     let service = BarqService::new(peers, discoverable.clone());
     // The HTTP server refuses transfers while invisible and announces finished ones,
     // so it needs both the flag and the callback list the service owns.
-    start_airdrop_server(discoverable, service.callbacks.clone());
+    start_airdrop_server(
+        discoverable,
+        service.callbacks.clone(),
+        service.transfers.clone(),
+    );
     let binder = BnBarqService::new_binder(service, BinderFeatures::default());
 
     if let Err(e) = binder::add_service(SERVICE_NAME, binder.as_binder()) {
