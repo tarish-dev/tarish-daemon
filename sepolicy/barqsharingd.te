@@ -31,6 +31,17 @@ net_domain(barqsharingd)
 binder_use(barqsharingd)
 add_service(barqsharingd, barq_service)
 
+# The Barq app is a system app, so it lands in the system_app domain. Publishing the
+# service is not enough on its own: a client also needs `call` on this domain and
+# `find` on the service name, and without them binder fails with a bare "remote
+# transaction failed" that says nothing about SELinux.
+#
+# binder_call both ways, because the daemon calls BACK into the app through
+# IBarqCallback to say files have arrived.
+binder_call(system_app, barqsharingd)
+binder_call(barqsharingd, system_app)
+allow system_app barq_service:service_manager find;
+
 # /proc/net/if_inet6, to find our own link-local address for the AAAA record we
 # advertise. The alternative is getifaddrs(), which would mean ~30 lines of
 # unsafe pointer walking in the most exposed process in Barq -- a worse trade

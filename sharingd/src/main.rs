@@ -49,6 +49,7 @@ type PeerTable = Arc<Mutex<Vec<mdns::Peer>>>;
 /// which owns the socket. Daemon state on purpose: closing the client must not
 /// make the device vanish.
 type Discoverable = Arc<AtomicBool>;
+type Callbacks = Arc<Mutex<Vec<Strong<dyn IBarqCallback>>>>;
 
 /// Read an Android system property.
 fn read_property(name: &str) -> Option<String> {
@@ -67,7 +68,10 @@ fn read_property(name: &str) -> Option<String> {
 struct BarqService {
     // Callbacks are held weakly in spirit: a client that is not running is the
     // normal case, so nothing here may assume one exists.
-    callbacks: std::sync::Mutex<Vec<Strong<dyn IBarqCallback>>>,
+    callbacks: Callbacks,
+    /// Bumped by every setDiscoverable call so an older auto-off timer knows it has
+    /// been superseded and must not switch visibility off under a newer request.
+    visibility_generation: Arc<std::sync::atomic::AtomicU64>,
     discoverable: Discoverable,
     peers: PeerTable,
 }
@@ -75,7 +79,8 @@ struct BarqService {
 impl BarqService {
     fn new(peers: PeerTable, discoverable: Discoverable) -> Self {
         Self {
-            callbacks: std::sync::Mutex::new(Vec::new()),
+            callbacks: Arc::new(Mutex::new(Vec::new())),
+            visibility_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             discoverable,
             peers,
         }
@@ -104,11 +109,29 @@ impl IBarqService for BarqService {
     }
 
     fn setDiscoverable(&self, discoverable: bool, duration_seconds: i32) -> BinderResult<()> {
+        // Every call supersedes any pending auto-off, so a user who reopens the app
+        // does not get switched off by a timer started the previous time.
+        let gen = self
+            .visibility_generation
+            .fetch_add(1, Ordering::SeqCst)
+            + 1;
+        if discoverable && duration_seconds > 0 {
+            let flag = self.discoverable.clone();
+            let generation = self.visibility_generation.clone();
+            let secs = duration_seconds as u64;
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(secs));
+                if generation.load(Ordering::SeqCst) == gen {
+                    flag.store(false, Ordering::SeqCst);
+                    log::info!("visibility expired after {secs}s");
+                }
+            });
+        }
         // Discoverability is DAEMON state on purpose: closing the client must not
         // stop the device being reachable, or we are back to an app that has to
         // stay resident.
         self.discoverable.store(discoverable, Ordering::SeqCst);
-        log::info!("discoverable={discoverable} (duration {duration_seconds}s not yet honoured)");
+        log::info!("discoverable={discoverable} duration={duration_seconds}s");
         Ok(())
     }
 
@@ -146,6 +169,28 @@ impl IBarqService for BarqService {
 
     fn cancelTransfer(&self, _transfer_id: i64) -> BinderResult<()> {
         Err(Status::from(StatusCode::NAME_NOT_FOUND))
+    }
+
+    fn getReceivedFiles(&self) -> BinderResult<Vec<String>> {
+        Ok(httpd::received_files())
+    }
+
+    fn openReceivedFile(&self, name: &str) -> BinderResult<binder::ParcelFileDescriptor> {
+        // The name is resolved against the inbox by the daemon, and only a leaf is
+        // accepted: a client must not be able to steer this into an arbitrary path.
+        httpd::open_received(name)
+            .map(binder::ParcelFileDescriptor::new)
+            .map_err(|e| {
+                log::warn!("openReceivedFile({name:?}) refused: {e}");
+                Status::new_exception(binder::ExceptionCode::ILLEGAL_ARGUMENT, None)
+            })
+    }
+
+    fn deleteReceivedFile(&self, name: &str) -> BinderResult<()> {
+        httpd::delete_received(name).map_err(|e| {
+            log::warn!("deleteReceivedFile({name:?}) refused: {e}");
+            Status::new_exception(binder::ExceptionCode::ILLEGAL_ARGUMENT, None)
+        })
     }
 
     fn registerCallback(&self, cb: &Strong<dyn IBarqCallback>) -> BinderResult<()> {
@@ -240,15 +285,22 @@ fn start_discovery(peers: PeerTable, discoverable: Discoverable) {
 /// mosey0 may not exist or may have no address yet when we start, since barqd brings
 /// the link up independently. Retry rather than give up: failing here permanently
 /// would mean a daemon that is running, looks healthy, and can never be discovered.
-fn start_airdrop_server() {
-    std::thread::spawn(|| {
+fn start_airdrop_server(discoverable: Discoverable, callbacks: Callbacks) {
+    std::thread::spawn(move || {
         let name = read_property("persist.barq.name")
             .or_else(|| read_property("ro.product.model"))
             .unwrap_or_else(|| "Barq".to_string());
         let model = read_property("ro.product.model").unwrap_or_else(|| "Android".to_string());
 
         loop {
-            match httpd::Httpd::new(IFACE, mdns::AIRDROP_PORT, &name, &model) {
+            match httpd::Httpd::new(
+                IFACE,
+                mdns::AIRDROP_PORT,
+                &name,
+                &model,
+                discoverable.clone(),
+                callbacks.clone(),
+            ) {
                 Ok(server) => {
                     log::info!("AirDrop server up as \"{name}\"");
                     server.serve();
@@ -276,6 +328,9 @@ fn main() {
     // privacy decision, not a default, and it belongs to the user through the
     // client. persist.barq.discoverable exists so the transport can be tested
     // before a client exists to turn it on.
+    // Default OFF. Being discoverable is the user's decision, made by opening the app;
+    // a device that advertises itself from boot is a privacy choice nobody made. The
+    // property remains only so the transport can be exercised without a client.
     let initial = read_property("persist.barq.discoverable")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -285,9 +340,11 @@ fn main() {
     let discoverable: Discoverable = Arc::new(AtomicBool::new(initial));
 
     start_discovery(peers.clone(), discoverable.clone());
-    start_airdrop_server();
 
-    let service = BarqService::new(peers, discoverable);
+    let service = BarqService::new(peers, discoverable.clone());
+    // The HTTP server refuses transfers while invisible and announces finished ones,
+    // so it needs both the flag and the callback list the service owns.
+    start_airdrop_server(discoverable, service.callbacks.clone());
     let binder = BnBarqService::new_binder(service, BinderFeatures::default());
 
     if let Err(e) = binder::add_service(SERVICE_NAME, binder.as_binder()) {

@@ -53,11 +53,20 @@ pub struct Httpd {
     listener: TcpListener,
     discover_body: Vec<u8>,
     ask_body: Vec<u8>,
+    discoverable: crate::Discoverable,
+    callbacks: crate::Callbacks,
 }
 
 impl Httpd {
     /// Bind TLS on `iface`'s link-local address at `port`.
-    pub fn new(iface: &str, port: u16, name: &str, model: &str) -> std::io::Result<Self> {
+    pub fn new(
+        iface: &str,
+        port: u16,
+        name: &str,
+        model: &str,
+        discoverable: crate::Discoverable,
+        callbacks: crate::Callbacks,
+    ) -> std::io::Result<Self> {
         let addr = crate::mdns::link_local_of(iface).ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::AddrNotAvailable,
@@ -92,7 +101,7 @@ impl Httpd {
             ("ReceiverComputerName", Value::Str(name.to_string())),
         ]);
 
-        Ok(Self { acceptor, listener, discover_body, ask_body })
+        Ok(Self { acceptor, listener, discover_body, ask_body, discoverable, callbacks })
     }
 
     /// Accept forever. Each connection is handled on its own thread and closed after
@@ -194,9 +203,23 @@ impl Httpd {
             // and the alternative is refusing every file. A prompt belongs here once
             // the app exists, and until then this is a deliberate open door -- said
             // plainly rather than buried.
+            // Visibility is the whole consent model for now: a device that is not
+            // discoverable refuses transfers outright rather than prompting. Answering
+            // 401 is what the peer already understands -- it reports "Declined".
+            ("POST", "/Ask") if !self.visible() => {
+                info!("/Ask refused — not discoverable");
+                respond(tls, 401, None, false)?;
+                return Ok(Disposition::Close);
+            }
             ("POST", "/Ask") => {
-                info!("accepting transfer from a peer (no prompt — no client yet)");
+                info!("accepting transfer");
                 respond(tls, 200, Some(&self.ask_body), keep_alive)?
+            }
+
+            ("POST", "/Upload") if !self.visible() => {
+                warn!("/Upload refused — not discoverable");
+                respond(tls, 401, None, false)?;
+                return Ok(Disposition::Close);
             }
 
             ("POST", "/Upload") => {
@@ -229,11 +252,34 @@ impl Httpd {
     /// moving files to Downloads/Barq -- where Quick Share puts its own -- is the app's
     /// job, because that is the side with the standing to write there and to tell
     /// MediaStore about it.
+    fn visible(&self) -> bool {
+        self.discoverable.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Tell any registered client that files have arrived.
+    ///
+    /// Failures are logged and ignored: a client that died holding a callback must not
+    /// be able to break receiving for the next one.
+    fn announce(&self, names: &[String]) {
+        let cbs = match self.callbacks.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("callback list poisoned: {e}");
+                return;
+            }
+        };
+        for cb in cbs.iter() {
+            if let Err(e) = cb.onTransferFinished(0, names.len() as i32) {
+                debug!("callback failed: {e:?}");
+            }
+        }
+    }
+
     /// Unpack a received archive into the inbox.
     ///
     /// The payload is Apple's block-framed compression wrapper around a cpio archive in
     /// the odc dialect -- see framed.rs for the container and why it is not gzip.
-    fn extract(&self, archive: &str) -> std::io::Result<usize> {
+    fn extract(&self, archive: &str) -> std::io::Result<Vec<String>> {
         // `new`, `read_next` and `finish` come from the CpioReader trait, so it has to
         // be in scope even though it is never named below.
         use cpio_archive::CpioReader as _;
@@ -242,7 +288,7 @@ impl Httpd {
         let mut r = cpio_archive::odc::OdcReader::new(std::io::BufReader::new(
             crate::framed::FramedReader::new(f),
         ));
-        let mut count = 0usize;
+        let mut names = Vec::new();
 
         loop {
             let header = match r.read_next().map_err(cpio_err)? {
@@ -291,9 +337,11 @@ impl Httpd {
             }
             info!("extracted {dest} ({copied} bytes)");
             r.finish().map_err(cpio_err)?;
-            count += 1;
+            if let Some(leaf) = std::path::Path::new(&dest).file_name() {
+                names.push(leaf.to_string_lossy().into_owned());
+            }
         }
-        Ok(count)
+        Ok(names)
     }
 
     fn receive_upload<S: Read>(&self, s: &mut S, head: &str) -> std::io::Result<String> {
@@ -331,9 +379,18 @@ impl Httpd {
         drop(f);
 
         match self.extract(&path) {
-            Ok(n) => info!("/Upload: extracted {n} file(s)"),
-            // The archive is kept on failure: it is the only copy of what the peer
-            // sent, and deleting it would destroy the evidence needed to fix this.
+            Ok(names) => {
+                info!("/Upload: extracted {} file(s)", names.len());
+                // The archive has served its purpose. Keeping it would double the
+                // storage every transfer costs and leave the user's files lying around
+                // in a second form they cannot see or delete.
+                if let Err(e) = std::fs::remove_file(&path) {
+                    warn!("could not remove {path}: {e}");
+                }
+                self.announce(&names);
+            }
+            // Kept on failure: it is the only copy of what the peer sent, and deleting
+            // it would destroy the evidence needed to work out why.
             Err(e) => error!("/Upload: extraction failed ({e}) — archive kept at {path}"),
         }
         Ok(path)
@@ -645,6 +702,46 @@ fn stream_exact<S: Read, W: std::io::Write>(
     }
     out.flush()?;
     Ok(total)
+}
+
+/// Leaf names of files waiting to be collected.
+///
+/// `.cpio` is excluded: an archive only survives extraction failure, and handing a
+/// client a container it cannot read would be worse than saying nothing.
+pub fn received_files() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(INBOX) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".cpio") {
+                out.push(name);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Open a received file by leaf name.
+///
+/// The name is reduced to a leaf before use, so a caller cannot walk out of the inbox
+/// with `../` or an absolute path even though the caller here is our own client.
+pub fn open_received(name: &str) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(inbox_path(name)?)
+}
+
+pub fn delete_received(name: &str) -> std::io::Result<()> {
+    std::fs::remove_file(inbox_path(name)?)
+}
+
+fn inbox_path(name: &str) -> std::io::Result<String> {
+    match safe_leaf(name) {
+        Some(leaf) if !leaf.ends_with(".cpio") => Ok(format!("{INBOX}/{leaf}")),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a collectable file name",
+        )),
+    }
 }
 
 /// cpio-archive's error type is not io::Error; give it one shape at the boundary.

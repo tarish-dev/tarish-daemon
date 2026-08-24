@@ -45,6 +45,28 @@ interface IBarqService {
     void cancelTransfer(long transferId);
 
     /**
+     * Names of files the daemon has received and not yet handed over.
+     *
+     * Leaf names only, never paths: the daemon extracted them and the client has no
+     * business constructing a path into the daemon's storage.
+     */
+    String[] getReceivedFiles();
+
+    /**
+     * Open one received file for reading.
+     *
+     * Deliberately a file descriptor rather than a shared directory. The daemon runs as
+     * `nobody` with 0700 storage that nothing else can reach, and passing an already-open
+     * fd over binder means the client never needs read access to that directory at all --
+     * no file-context grant, no group juggling, and no way to reach anything the daemon
+     * did not hand over.
+     */
+    ParcelFileDescriptor openReceivedFile(String name);
+
+    /** Drop a received file once the client has stored it somewhere the user can see. */
+    void deleteReceivedFile(String name);
+
+    /**
      * Register for events. The daemon holds the callback weakly and keeps
      * working when no client is bound — an unanswered incoming offer is surfaced
      * by the daemon itself, not by requiring a client to be running.
