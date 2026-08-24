@@ -1,0 +1,34 @@
+// VENDORED, unmodified, from crates.io: cpio-archive-0.10.0
+//
+// Vendored inside Barq rather than added to external/rust/ so the daemon builds
+// outside this tree -- on LineageOS or plain AOSP -- without the consumer having
+// to place dependencies for us. gos-barq.sh copies this whole checkout, so it
+// comes along on its own.
+//
+// Module names are suffixed _barq so they cannot collide if AOSP later carries
+// the same crate; crate_name stays real so the import path is unchanged.
+rust_library {
+    name: "libcpio_archive_barq",
+    crate_name: "cpio_archive",
+    srcs: ["src/lib.rs"],
+    edition: "2021",
+
+    // Vendored upstream source: cap its lints rather than applying ours to it.
+    //
+    // Soong builds with -D warnings, so any lint upstream happens to trip is a hard
+    // error -- simple-file-manifest failed on mismatched_lifetime_syntaxes, which is
+    // a style lint about a signature that is perfectly correct. Editing the source to
+    // satisfy it would make our copy diverge and break the next update.
+    //
+    // --cap-lints allow is precisely what cargo applies to dependency crates for this
+    // reason: lint policy belongs to code you own.
+    flags: ["--cap-lints", "allow"],
+    lints: "none",
+    system_ext_specific: true,
+    rustlibs: [
+        "libchrono",
+        "libthiserror",
+        "libis_executable_barq",
+        "libsimple_file_manifest_barq",
+    ],
+}
