@@ -23,10 +23,34 @@ interface IBarqService {
 
     /**
      * Make this device discoverable. durationSeconds of 0 means indefinitely.
-     * Visibility is deliberately the DAEMON's state, not the app's, so closing
-     * the app does not stop the device being reachable.
+     * Visibility is the DAEMON's state, not the app's, so it survives a client
+     * that is merely rebinding.
+     *
+     * It does NOT survive the radio being released: setActive(false) eventually
+     * takes AWDL down, and nothing is reachable without it. Visibility outliving
+     * the client is about not losing state across a rebind, not about receiving
+     * files with the app closed -- /Ask refuses those anyway.
      */
     void setDiscoverable(boolean discoverable, int durationSeconds);
+
+    /**
+     * Whether a client is in the foreground and needs the transport.
+     *
+     * This, not setDiscoverable, is what governs the AWDL radio. The two are
+     * deliberately separate: a client that is SENDING is not discoverable and
+     * still needs the link, so gating the radio on visibility would tear it down
+     * underneath every outgoing transfer.
+     *
+     * Call it on every onResume and onPause. A client bouncing through a file
+     * picker toggles the foreground several times a second, and the daemon applies
+     * its own hold-off, so this is cheap to call and safe to call often.
+     *
+     * Never calling it is safe: the daemon holds the radio up. That costs battery
+     * -- an idle AWDL session is not free, it runs vendor threads -- but sharing
+     * keeps working, which is the right way round for a client that has not been
+     * updated.
+     */
+    void setActive(boolean active);
 
     /** Peers currently known. Fresh as of the last discovery round. */
     BarqPeer[] getPeers();

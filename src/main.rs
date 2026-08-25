@@ -16,6 +16,7 @@ mod mosey;
 mod route;
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 const IFACE: &str = "mosey0";
 
@@ -27,6 +28,26 @@ const CHANNELS: &[u8] = &[149];
 const CONFIG: &[u8] = &[0x08, 0x01, 0x30, 0x01];
 
 const MAX_MDNS: u32 = 0x7fff_ffff;
+
+/// Whether anything actually wants the radio. Written by barqsharingd, read here.
+///
+/// A property rather than binder or an init service control, for two reasons.
+///
+/// Binder would put an IPC parser inside the process that holds CAP_NET_ADMIN,
+/// which is the one thing this daemon is structured to avoid. A property read is
+/// a shared-memory load of a single boolean -- no parsing, no attack surface.
+///
+/// `ctl.start`/`ctl.stop` would work and would NOT leak privilege (init applies
+/// the .rc's user, capabilities and seclabel regardless of who asked), but it
+/// would hand an unprivileged caller the ability to start and stop a privileged
+/// process. That is a new authority, and a battery optimisation is not worth
+/// creating one. barqd stays init-started, exactly once, at boot.
+const WANT_PROP: &str = "barq.awdl.wanted";
+
+/// How often to look at it. This is a shared-memory read, not a syscall, so the
+/// cost is far below the noise floor -- the session itself was measured at 6.5%
+/// of a core, and this is not measurable next to it.
+const POLL: Duration = Duration::from_millis(500);
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
@@ -98,6 +119,112 @@ fn country_code() -> Option<String> {
     None
 }
 
+/// Whether anything actually wants the radio right now.
+///
+/// Defaults to ON when the property is absent, and the failure mode is why. If
+/// barqsharingd never writes it -- a policy denial, a crash, an older build --
+/// defaulting off would mean AWDL never comes up and Barq is silently dead.
+/// Defaulting on means the worst case is the battery cost we had before this
+/// existed, with sharing still working. Fail towards working.
+fn wants_radio() -> bool {
+    match read_property(WANT_PROP) {
+        Some(v) => v.trim() != "0",
+        None => true,
+    }
+}
+
+/// A live AWDL link: the vendor session, plus the routing that makes the
+/// interface usable from userspace.
+///
+/// Bundled into one value so acquiring and releasing cannot drift apart. The
+/// previous arrangement did all of this once in `main` and never undid it,
+/// which was correct only because the process never let go.
+struct Link {
+    /// Held and never read. Dropping it is the entire point: mosey_stop runs from
+    /// Session's Drop, which is what takes the radio and the interface down.
+    _session: mosey::Session,
+}
+
+impl Link {
+    fn acquire() -> Result<Self, String> {
+        // Read the country at ACQUIRE time, not at start-up. It comes from the
+        // AP, so at boot there may not be one yet -- barqd used to exit(1) in
+        // that case and rely on init to retry. Asking when we actually need it
+        // removes that race entirely.
+        let country = country_code().ok_or_else(|| {
+            format!(
+                "no regulatory country. The platform reports none, which usually means \
+                 Wi-Fi has never associated -- the country normally comes from the AP. \
+                 Channel {} is not permitted in the world domain, so the radio will \
+                 refuse to come up. Set one explicitly: setprop persist.barq.country <CC>",
+                CHANNELS[0]
+            )
+        })?;
+
+        let session = mosey::Session::start(
+            CHANNELS,
+            &country,
+            MAX_MDNS,
+            mosey::OpMode::Netlink,
+            CONFIG,
+        )?;
+
+        log::info!(
+            "AWDL session up, handle={:p}, channel={}, country={}",
+            session.handle(),
+            CHANNELS[0],
+            country
+        );
+
+        // The interface appears a moment after the call returns.
+        std::thread::sleep(Duration::from_secs(2));
+        match route::add_link_local(IFACE) {
+            Ok(()) => log::info!(
+                "route: fe80::/64 dev {IFACE} table {}",
+                route::table_id(IFACE)
+            ),
+            Err(e) => log::warn!(
+                "link-local route not added ({e}) — sockets on {IFACE} will get ENETUNREACH"
+            ),
+        }
+
+        // A route in a table nothing consults does nothing. Android picks tables with
+        // fib rules keyed on fwmark, and gets no rule for an interface it does not
+        // manage -- so the route above sat in table N, was never looked up, and every
+        // lookup fell through to "32000: from all unreachable".
+        //
+        // This is what stood between a working AirDrop stack and a device that could
+        // never be reached: the peer's SYN arrived, our reply had nowhere to go, and
+        // it presented exactly as though nothing were listening on the port.
+        match route::add_rule(IFACE) {
+            Ok(()) => log::info!("rule: oif {IFACE} lookup {}", route::table_id(IFACE)),
+            Err(e) => log::warn!(
+                "routing rule not added ({e}) — the route on {IFACE} exists but nothing \
+                 will consult it, so the device stays unreachable"
+            ),
+        }
+
+        Ok(Link { _session: session })
+    }
+}
+
+impl Drop for Link {
+    fn drop(&mut self) {
+        // Take the rule out first, while the interface is still there. The routes
+        // themselves go with the interface, but a fib rule does not: it is keyed by
+        // priority and would otherwise pile up one per acquire. add_rule already
+        // deletes before adding for exactly that reason -- this closes the same hole
+        // from the other end, so a device that is idle overnight is not carrying a
+        // stack of dead rules.
+        match route::remove_rule() {
+            Ok(()) => log::info!("rule removed"),
+            Err(e) => log::warn!("could not remove routing rule: {e}"),
+        }
+        log::info!("releasing AWDL session");
+        // `session` drops here, which calls mosey_stop and takes the interface down.
+    }
+}
+
 fn main() {
     android_logger::init_once(
         android_logger::Config::default()
@@ -106,83 +233,54 @@ fn main() {
     );
 
     install_signal_handlers();
-    log::info!("starting");
+    log::info!("starting; radio follows {WANT_PROP}");
 
-    // A device with no regulatory country cannot legally use channel 149, and the
-    // failure is silent: the vendor library ACCEPTS "00", logs a bring-up that
-    // looks fine, and then returns NULL. Say so before that happens.
-    let country = match country_code() {
-        Some(c) => c,
-        None => {
-            log::error!(
-                "no regulatory country. The platform reports none, which usually \
-                 means Wi-Fi has never associated — the country normally comes \
-                 from the AP. Channel {} is not permitted in the world domain, so \
-                 the radio will refuse to come up.",
-                CHANNELS[0]
-            );
-            log::error!("set one explicitly:  setprop persist.barq.country <CC>");
-            std::process::exit(1);
-        }
-    };
-
-    let session = match mosey::Session::start(
-        CHANNELS,
-        &country,
-        MAX_MDNS,
-        mosey::OpMode::Netlink,
-        CONFIG,
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("{e}");
-            std::process::exit(1);
-        }
-    };
-
-    log::info!(
-        "AWDL session up, handle={:p}, channel={}, country={}",
-        session.handle(),
-        CHANNELS[0],
-        country
-    );
-
-    // The interface appears a moment after the call returns.
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    match route::add_link_local(IFACE) {
-        Ok(()) => log::info!(
-            "route: fe80::/64 dev {IFACE} table {}",
-            route::table_id(IFACE)
-        ),
-        Err(e) => log::warn!(
-            "link-local route not added ({e}) — sockets on {IFACE} will get ENETUNREACH"
-        ),
-    }
-
-    // A route in a table nothing consults does nothing. Android picks tables with
-    // fib rules keyed on fwmark, and gets no rule for an interface it does not
-    // manage -- so the route above sat in table N, was never looked up, and every
-    // lookup fell through to "32000: from all unreachable".
+    // The session is held only while something wants it. Holding it from boot cost
+    // 6.5% of a core continuously with no client bound and the screen off -- the
+    // vendor library runs its own threads inside this process, so an idle AWDL link
+    // is not free the way an idle socket is.
     //
-    // This is what stood between a working AirDrop stack and a device that could
-    // never be reached: the peer's SYN arrived, our reply had nowhere to go, and
-    // it presented exactly as though nothing were listening on the port.
-    match route::add_rule(IFACE) {
-        Ok(()) => log::info!("rule: oif {IFACE} lookup {}", route::table_id(IFACE)),
-        Err(e) => log::warn!(
-            "routing rule not added ({e}) — the route on {IFACE} exists but nothing \
-             will consult it, so the device stays unreachable"
-        ),
-    }
+    // What this daemon does NOT do is stop and restart itself. It stays init-started,
+    // once, at boot, keeping its capabilities for its whole life; only the session
+    // comes and goes. See WANT_PROP.
+    let mut link: Option<Link> = None;
+    let mut last_want: Option<bool> = None;
+    let mut retry_at = std::time::Instant::now();
+    let mut last_error = String::new();
 
-    // The session lives exactly as long as this process. Exiting tears down the
-    // interface and the device stops being discoverable, so hold here and let
-    // Drop stop it cleanly on SIGTERM.
     while RUNNING.load(Ordering::SeqCst) {
-        // SAFETY: pause(2) with no arguments.
-        unsafe { libc::pause() };
+        let want = wants_radio();
+        if last_want != Some(want) {
+            log::info!("{WANT_PROP}={}", if want { 1 } else { 0 });
+            last_want = Some(want);
+            retry_at = std::time::Instant::now();   // a fresh request retries at once
+        }
+
+        match (want, link.is_some()) {
+            (true, false) if std::time::Instant::now() >= retry_at => {
+                match Link::acquire() {
+                    Ok(l) => {
+                        link = Some(l);
+                        last_error.clear();
+                    }
+                    Err(e) => {
+                        // Say it once per distinct cause. Retrying every 500ms and
+                        // logging each time would bury everything else in the buffer.
+                        if e != last_error {
+                            log::error!("{e}");
+                            last_error = e;
+                        }
+                        retry_at = std::time::Instant::now() + Duration::from_secs(5);
+                    }
+                }
+            }
+            (false, true) => link = None,   // Drop does the work
+            _ => {}
+        }
+
+        std::thread::sleep(POLL);
     }
 
     log::info!("shutting down");
-    drop(session);
+    drop(link);
 }

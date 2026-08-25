@@ -153,3 +153,24 @@ listing a device that will refuse.
 
 - [ ] Monitor-mode 5 GHz adapter + BLE, OWL as a controllable peer.
       See [REVERSE-ENGINEERING.md](REVERSE-ENGINEERING.md).
+
+
+## Done since this list was written
+
+- **Per-transfer consent.** `/Ask` blocked on `respondToOffer` rather than answering 200
+  unconditionally. No answer within 45 s is a refusal, and `/Upload` is refused outright
+  without an accepted offer so a peer cannot skip the prompt by opening a new connection.
+- **On-demand AWDL.** The radio is held only while a client is on screen, a transfer is
+  running, or the device is advertising. See ARCHITECTURE.md.
+
+## Open
+
+- **Offer sizes.** `onTransferOffered` reports `totalBytes = 0`. Apple's `/Ask` carries
+  file names and UTIs but no sizes, so the prompt cannot say how big the transfer is
+  without inventing a number. Worth checking whether `Items` carries one on some senders.
+- **One transfer at a time.** `serve()` handles connections inline, so an offer waiting on
+  a person blocks the accept loop for up to 45 s. Correct for AirDrop, which does one
+  transfer at a time, but it means a second peer probing during a prompt is ignored rather
+  than refused.
+- **Single-client `setActive`.** The foreground flag is one boolean, not per-client, so
+  two clients would fight over it. There is one client today and the AIDL is ours.

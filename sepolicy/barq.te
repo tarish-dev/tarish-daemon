@@ -1,0 +1,8 @@
+# Types shared between the two Barq domains.
+#
+# Kept out of barqd.te and barqsharingd.te because a type declared in one and used
+# by the other reads as though it belongs to that domain. This one belongs to
+# neither: it is the channel between them.
+
+# Whether the AWDL radio is wanted. barqsharingd sets it, barqd reads it.
+type barq_awdl_prop, property_type;

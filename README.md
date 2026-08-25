@@ -18,30 +18,50 @@ This is the same split Apple and Google both ship. Google's is `mosey_server`
 (native, `system`, `NET_ADMIN|NET_RAW`, invisible) plus a client app; Apple's is
 `sharingd`. Barq is the equivalent piece for a build that has neither.
 
-> **Architecture is changing.** Barq is moving to two processes split by
-> privilege, and to Rust. The rationale and the order of work are in
-> [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). What is described below is the
-> working C prototype of the privileged half.
+The two-process split described in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) is done, and both halves are Rust.
 
 ## Status
 
-Working, and narrow. On a GrapheneOS build for Pixel 10 with **no Google
-applications installed**:
+**Bidirectional AirDrop with a Mac, on a GrapheneOS build with no Google
+applications installed, under SELinux enforcing.** Files go both ways, the peer
+shows a real device name, and an incoming transfer has to be accepted by a person.
 
 ```
-init.svc.barqd = running        pid = 3520
-context = u:r:barqd:s0          user = system
-barqd: AWDL session up, handle=0xf00cfac6a13e980, channel=149
-barqd: route: fe80::/64 dev mosey0 table 52
-mosey0  fe80::857:88ff:fe44:9fe9/64
+init.svc.barqd        = running     u:r:barqd:s0        user system
+init.svc.barqsharingd = running     u:r:barqsharingd:s0 user nobody
 
-AVC denials .......... 0
+barqd:        AWDL session up, handle=0xc00c19599c6bc80, channel=149, country=QA
+barqd:        rule: oif mosey0 lookup 54
+barqsharingd: AirDrop server up as "Pixel 10 Pro XL"
+barqsharingd: advertising as 7249a325a6b8._airdrop._tcp.local
+barqsharingd: peer 4d1a2c9f8e70 at fe80::… is "K-MBProM5"
+
 notifications ........ 0
 ```
 
-Peer discovery, master election and availability-window synchronisation all run;
-a macOS peer is discovered, elected master and installed in the kernel neighbour
-table.
+| | state |
+|---|---|
+| AWDL bring-up, routing, peers | working |
+| mDNS browse + advertise, with withdrawal | working |
+| TLS, `/Discover`, `/Ask`, `/Upload` | working |
+| receive from a Mac, cpio + AppleDouble extraction | working |
+| send to a Mac, gzip payload, decline reported | working |
+| per-transfer accept/decline prompt | working |
+| radio held only while something wants it | working |
+| contacts-only AirDrop | **not implemented, not planned** — it needs a real Apple contact certificate, which expires. Everyone-mode only. |
+
+### The radio is held on demand
+
+`barqd` does not hold AWDL from boot any more. An idle session costs **6.5% of a
+core continuously** — `libmosey` runs its own threads inside whichever process
+holds the handle — so the session follows `barq.awdl.wanted`, which
+`barqsharingd` sets from *a client is on screen, or a transfer is running, or we
+are advertising*. Released, `barqd` costs 0.05%.
+
+`barqd` itself is still started once by `init` at boot and never restarted; only
+the session comes and goes. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for
+why it is a property and not `ctl.start` or binder.
 
 **What Barq does not do yet:** mDNS (`_airdrop._tcp.local`), the AirDrop protocol
 itself, and the IPC implementation. It is the transport and nothing above it.
@@ -51,8 +71,10 @@ itself, and the IPC implementation. It is the transport and nothing above it.
 The daemon owns the client contract, in `aidl/dev/barq/`:
 
 ```
-IBarqService.aidl    getStatus, setDiscoverable, getPeers, sendFiles,
-                     respondToOffer, cancelTransfer, register/unregisterCallback
+IBarqService.aidl    getStatus, setDiscoverable, setActive, getPeers, sendFiles,
+                     respondToOffer, cancelTransfer, getReceivedFiles,
+                     openReceivedFile, deleteReceivedFile,
+                     register/unregisterCallback
 IBarqCallback.aidl   onPeerFound/Lost, onTransferOffered/Progress/Finished
 ```
 
@@ -63,15 +85,17 @@ so the two cannot drift apart silently.
 
 Two rules the contract encodes deliberately:
 
-- **Discoverability is daemon state, not app state.** Closing the client must not
-  stop the device being reachable.
+- **Discoverability is daemon state, not app state.** It survives a client that is
+  merely rebinding. It does not survive the radio being released — see
+  `setActive`, which is a separate signal on purpose, because a client that is
+  *sending* is not discoverable and needs the link more than ever.
 - **Every callback is `oneway`.** The daemon must never block on a UI process
   that may be slow, frozen, or about to be killed. A client that is not running
   is the normal case, not an error.
 
 ## What is actually Barq, and what is not
 
-Barq is ~400 lines. It would be misleading to call it an AWDL implementation.
+`barqd` is ~300 lines and `barqsharingd` around 3,000. It would be misleading to call it an AWDL implementation.
 
 | Layer | Provided by | Whose |
 |---|---|---|
@@ -91,20 +115,44 @@ today.
 ## How it works
 
 ```
-init  --(sys.boot_completed)-->  barqd
-                                   |  dlopen libmosey_daemon_ffi.so
-                                   |  mosey_start_5(channels, country, config, ...)
-                                   |      -> wonder.ko over nl80211
-                                   |      -> mosey0 appears with a link-local address
-                                   |  RTM_NEWROUTE  fe80::/64 dev mosey0 table <ifindex>
-                                   |  hold the session handle
+app  --binder-->  barqsharingd  --property-->  barqd  --dlopen-->  libmosey
+     setActive()                 barq.awdl.wanted
+
+init  --(sys.boot_completed)-->  barqd        (once, and never restarted)
+                                   |  wait for barq.awdl.wanted
+                                   |
+                                   |  on 1:  mosey_start_5(channels, country, config, ...)
+                                   |             -> wonder.ko over nl80211
+                                   |             -> mosey0 appears with a link-local address
+                                   |         RTM_NEWROUTE  fe80::/64 dev mosey0 table <ifindex>
+                                   |         RTM_NEWRULE   oif mosey0 lookup <ifindex>
+                                   |
+                                   |  on 0:  RTM_DELRULE, then mosey_stop(handle)
+                                   |
                                    +-- SIGTERM --> mosey_stop(handle)
+
+init  --(sys.boot_completed)-->  barqsharingd (no capabilities)
+                                   |  publish dev.barq.IBarqService
+                                   |  mDNS browse/advertise on mosey0
+                                   |  TLS listener on [fe80::…%mosey0]:8770
+                                   +  rebind both whenever mosey0 is replaced
 ```
 
 Two details that are not obvious and cost real time to find:
 
 **The session lives exactly as long as the process holding the handle.** Exit and
-`mosey0` disappears. `barqd` therefore does nothing but hold it.
+`mosey0` disappears. `barqd` therefore does nothing but hold it — which is also
+why the client app must never be the holder.
+
+**It can be stopped and started again in one process.** `mosey_start_5` after
+`mosey_stop` works: new handle, new interface index, new link-local address, ~360 ms
+plus a 2 s settle. This was tested before anything was built on it, because
+`libmosey` is a closed blob and the whole on-demand design depends on it.
+
+**Every cycle changes the interface index, and the table id IS the index.** So the
+fib rule is deleted before it is added and removed on release, and anything holding
+a socket on `mosey0` has to notice and rebind. Note that a blocking `accept()` on a
+socket bound to an address that no longer exists never returns *and never errors*.
 
 **An address is not enough.** Android routes by fwmark and gives a new interface
 its own routing table, which starts *empty* — `connect()` returns
@@ -115,12 +163,19 @@ never needs permission to execute anything.
 ## Layout
 
 ```
-src/barqd.c              the daemon
+src/main.rs              barqd — the privileged half: session lifecycle, routing
+src/mosey.rs             the vendor FFI, isolated to one file
+src/route.rs             netlink: the link-local route and the fib rule
+sharingd/src/            barqsharingd — mDNS, TLS, HTTP, plist, cpio, transfers
 aidl/dev/barq/           the client contract (AIDL)
 init/barq.rc             init service: user system, group system inet, NET_ADMIN NET_RAW
-Android.bp               cc_binary, system_ext
-sepolicy/barqd.te        SELinux domain
-sepolicy/file_contexts   labels /system_ext/bin/barqd
+Android.bp               rust_binary x2, system_ext
+sepolicy/barqd.te        SELinux domain, privileged half
+sepolicy/barqsharingd.te SELinux domain, no capabilities
+sepolicy/barq.te         types shared between the two
+sepolicy/file_contexts   labels both binaries
+sepolicy/service_contexts labels the binder service name
+sepolicy/property_contexts labels barq.awdl.wanted
 docs/ARCHITECTURE.md     the two-process split and the Rust decision
 docs/MOSEY-FFI.md        the vendor ABI barqd calls, and how it was recovered
 docs/INTEGRATING.md      what a platform must provide, and the traps
@@ -133,13 +188,17 @@ wants the platform toolchain, labelling and signing. Drop it into an AOSP-derive
 tree and add it to a product:
 
 ```make
-PRODUCT_PACKAGES += barqd
+PRODUCT_PACKAGES += barqd barqsharingd
 ```
 
 then install `sepolicy/` into the tree's private policy. The GrapheneOS buildfarm
 does this with `scripts/gos-barq.sh`.
 
-`sepolicy/barqd.te` must be installed **with** `sepolicy/file_contexts`. Without
+All of `sepolicy/` must be installed, not just the `.te` files — `file_contexts`
+labels the executables, `service_contexts` labels the binder service name, and
+`property_contexts` labels `barq.awdl.wanted`. Each missing one fails differently
+and none of them fails loudly. In particular, `sepolicy/barqd.te` must be
+installed **with** `sepolicy/file_contexts`. Without
 the label the domain exists but nothing ever runs in it — the build succeeds,
 policy contains `barqd`, and `init` silently runs the daemon in its own domain
 instead. That failure looks correct from every angle except the one that matters.

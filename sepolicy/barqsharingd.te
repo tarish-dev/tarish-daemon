@@ -105,3 +105,15 @@ allow barqsharingd barq_data_file:file unlink;
 #   no tun_device               -- creating mosey0 is barqd's job
 #   no execute of anything
 #   no sdcard / media_rw access -- Downloads/Barq is reached by the app, never here
+
+# Telling barqd whether the AWDL radio is wanted.
+#
+# This is the ONLY property this domain may set, and it carries one boolean. The
+# asymmetry is deliberate: the unprivileged half decides *whether* the radio is
+# needed, and the privileged half decides *how* to bring it up. Nothing about the
+# channel, the country or the interface crosses this boundary.
+#
+# Denied, barqd keeps the radio up and Barq still works -- see WANT_PROP. So a
+# missing rule here shows up as battery life, not as a broken transfer, which is
+# exactly the failure mode to prefer but also an easy one to miss.
+set_prop(barqsharingd, barq_awdl_prop)

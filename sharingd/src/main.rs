@@ -41,6 +41,11 @@ const SERVICE_NAME: &str = "dev.barq.IBarqService/default";
 /// how this process knows the transport is alive, without talking to barqd.
 const IFACE: &str = "mosey0";
 
+/// The property barqd watches to decide whether to hold the AWDL radio.
+/// Its default when absent is ON, so a policy denial here degrades to the old
+/// battery cost rather than to a device that cannot share at all.
+const WANT_PROP: &str = "barq.awdl.wanted";
+
 /// Peers found by the discovery thread. Shared rather than owned by the service
 /// so discovery keeps running whether or not a client is bound — a device must
 /// stay discoverable with the app closed.
@@ -73,6 +78,16 @@ type PeerNames = Arc<Mutex<std::collections::HashMap<String, String>>>;
 type QueryNow = Arc<AtomicBool>;
 pub(crate) type Transfers = Arc<TransferState>;
 
+// Transfer outcomes reported through IBarqCallback.onTransferFinished.
+//
+// Declined is deliberately distinct from failed. Someone pressing Decline on the other
+// device is a normal answer, not an error, and telling a user "could not send" when the
+// truth is "they said no" is both wrong and unhelpful -- it invites them to retry
+// something that will be refused again.
+const STATUS_OK: i32 = 0;
+const STATUS_FAILED: i32 = -1;
+const STATUS_DECLINED: i32 = -2;
+
 /// The one transfer that can be in flight, and whether the user has cancelled it.
 ///
 /// Deliberately single-slot: AirDrop sends one archive per exchange, and a peer that
@@ -80,6 +95,14 @@ pub(crate) type Transfers = Arc<TransferState>;
 /// anyway. Modelling a queue we cannot yet receive would be inventing behaviour.
 #[derive(Default)]
 pub(crate) struct TransferState {
+    /// The answer to the offer currently on screen, once a person gives one.
+    ///
+    /// One slot, not a map: AirDrop offers one transfer at a time, and a second offer
+    /// arriving while the first is on screen replaces it rather than queueing. Keyed by
+    /// id anyway, so a late answer to a transfer that has already timed out is
+    /// discarded instead of accepting the next one on that person's behalf.
+    decision: Mutex<Option<(i64, bool)>>,
+    decided: std::sync::Condvar,
     /// Id of the transfer in flight, 0 when idle. Ids never repeat within a boot, so a
     /// cancel arriving late for a finished transfer cannot stop the next one.
     current: std::sync::atomic::AtomicI64,
@@ -110,6 +133,36 @@ impl TransferState {
 
     pub(crate) fn is_cancelled(&self, id: i64) -> bool {
         id != 0 && self.cancelled.load(Ordering::SeqCst) == id
+    }
+
+    /// Record a person's answer to an offer and wake whoever is waiting for it.
+    pub(crate) fn answer(&self, id: i64, accept: bool) {
+        if let Ok(mut d) = self.decision.lock() {
+            *d = Some((id, accept));
+        }
+        self.decided.notify_all();
+    }
+
+    /// Block until someone answers offer `id`, or the wait runs out.
+    ///
+    /// `None` means nobody answered, and the caller must treat that as a refusal.
+    /// Defaulting the other way would make the timeout a way to get a file onto the
+    /// device by waiting -- the exact thing the prompt exists to prevent.
+    pub(crate) fn await_answer(&self, id: i64, timeout: Duration) -> Option<bool> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut guard = self.decision.lock().ok()?;
+        loop {
+            if let Some((answered, accept)) = *guard {
+                *guard = None;
+                if answered == id {
+                    return Some(accept);
+                }
+                // An answer to some earlier offer. Drop it rather than let it stand in
+                // for this one.
+            }
+            let left = deadline.checked_duration_since(std::time::Instant::now())?;
+            guard = self.decided.wait_timeout(guard, left).ok()?.0;
+        }
     }
 }
 
@@ -154,6 +207,119 @@ fn read_property(name: &str) -> Option<String> {
     std::str::from_utf8(&buf[..n as usize]).ok().map(|s| s.to_string())
 }
 
+// Set an Android system property.
+//
+// Declared here rather than taken from the libc crate so the call does not depend
+// on which bionic symbols that crate happens to re-export for this target.
+extern "C" {
+    fn __system_property_set(name: *const libc::c_char, value: *const libc::c_char) -> libc::c_int;
+}
+
+fn write_property(name: &str, value: &str) -> bool {
+    let (Ok(n), Ok(v)) = (std::ffi::CString::new(name), std::ffi::CString::new(value)) else {
+        return false;
+    };
+    // SAFETY: both strings are NUL-terminated and outlive the call.
+    unsafe { __system_property_set(n.as_ptr(), v.as_ptr()) == 0 }
+}
+
+/// Tell barqd whether the AWDL radio is wanted.
+///
+/// WHY A THREAD AND NOT A WRITE AT EACH CALL SITE
+///
+/// The foreground flag flaps. Opening a file picker produced eight onPause/onResume
+/// pairs in five seconds on a real device, and tearing the radio down and back up on
+/// each of those would be both slower and less reliable than leaving it up -- every
+/// cycle recreates mosey0 with a new index and makes every socket bound to it stale.
+/// So the decision is made in one place, on a timer, with a hold-off.
+///
+/// The three inputs are OR-ed because each is independently sufficient:
+///
+///   active        a client is in the foreground and may send or receive at any moment
+///   transfer      bytes are moving; releasing the link here would kill it outright
+///   discoverable  we are advertising, and advertising without a link is a lie
+///
+/// Rising edges apply immediately -- that is the latency a person actually feels,
+/// staring at an empty device list. Falling edges wait out LINGER.
+fn start_radio_gate(active: Arc<AtomicBool>, transfers: Transfers, discoverable: Discoverable) {
+    // How long the radio stays up after nothing wants it any more.
+    //
+    // Long enough to ride out a file picker, a rotation, or a glance at another app
+    // and come back to a live list; short enough that putting the phone in a pocket
+    // stops costing anything within a minute.
+    const LINGER: Duration = Duration::from_secs(30);
+
+    std::thread::spawn(move || {
+        let mut applied: Option<bool> = None;
+        let mut idle_since: Option<std::time::Instant> = None;
+        // The linger is for coming DOWN from busy. At boot nothing has asked for the
+        // radio yet, and treating that as a falling edge would hold it up for thirty
+        // seconds on every reboot for no one.
+        let mut ever_busy = false;
+        let mut next_try: Option<std::time::Instant> = None;
+        let mut warned = false;
+        let mut failures: u32 = 0;
+
+        loop {
+            let busy = active.load(Ordering::SeqCst)
+                || transfers.current() != 0
+                || discoverable.load(Ordering::SeqCst);
+
+            let want = if busy {
+                ever_busy = true;
+                idle_since = None;
+                true
+            } else if !ever_busy {
+                false
+            } else {
+                let since = *idle_since.get_or_insert_with(std::time::Instant::now);
+                since.elapsed() < LINGER
+            };
+
+            if applied != Some(want) && next_try.map_or(true, |t| std::time::Instant::now() >= t) {
+                if write_property(WANT_PROP, if want { "1" } else { "0" }) {
+                    log::info!("radio {} ({WANT_PROP}={})",
+                               if want { "wanted" } else { "released" },
+                               if want { 1 } else { 0 });
+                    applied = Some(want);
+                    next_try = None;
+                    warned = false;
+                    failures = 0;
+                } else {
+                    // Keep trying, but slowly.
+                    //
+                    // An earlier version recorded the write as applied even when it
+                    // failed, so one failure meant the gate never tried again for that
+                    // state. That is wrong for anything transient -- property service
+                    // not yet up, a policy reload -- and the cost of being wrong is the
+                    // radio stuck in whatever state it was last in.
+                    //
+                    // Retrying on every pass instead would put a denial in the audit log
+                    // twice a second when the cause is a missing rule, which is the
+                    // common case and is not transient at all. Ten seconds is quiet
+                    // enough for that and quick enough that nobody notices the other.
+                    if !warned {
+                        log::warn!(
+                            "could not set {WANT_PROP} — check set_prop(barqsharingd, \
+                             barq_awdl_prop); barqd will keep the radio up"
+                        );
+                        warned = true;
+                    }
+                    // Back off towards a minute. A missing rule is permanent until the
+                    // next flash, and every attempt writes an AVC denial into the audit
+                    // log -- at a flat ten seconds that is thousands of identical lines
+                    // a day, which is how a log stops being worth reading.
+                    failures = failures.saturating_add(1);
+                    let wait = std::cmp::min(10 * u64::from(failures), 60);
+                    next_try = Some(std::time::Instant::now() + Duration::from_secs(wait));
+                }
+            }
+
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    });
+}
+
 struct BarqService {
     // Callbacks are held weakly in spirit: a client that is not running is the
     // normal case, so nothing here may assume one exists.
@@ -165,6 +331,8 @@ struct BarqService {
     /// been superseded and must not switch visibility off under a newer request.
     visibility_generation: Arc<std::sync::atomic::AtomicU64>,
     discoverable: Discoverable,
+    /// Whether a client is in the foreground. Governs the radio, not visibility.
+    active: Arc<AtomicBool>,
     peers: PeerTable,
 }
 
@@ -177,6 +345,7 @@ impl BarqService {
             query_now: Arc::new(AtomicBool::new(false)),
             visibility_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             discoverable,
+            active: Arc::new(AtomicBool::new(false)),
             peers,
         }
     }
@@ -244,6 +413,14 @@ impl IBarqService for BarqService {
         // stay resident.
         self.discoverable.store(discoverable, Ordering::SeqCst);
         log::info!("discoverable={discoverable} duration={duration_seconds}s");
+        Ok(())
+    }
+
+    fn setActive(&self, active: bool) -> BinderResult<()> {
+        // Idempotent and deliberately quiet: this is called on every onResume and
+        // onPause, which on a real device means several times a second while a file
+        // picker is opening. The gate thread decides what to do about it.
+        self.active.store(active, Ordering::SeqCst);
         Ok(())
     }
 
@@ -371,10 +548,18 @@ impl IBarqService for BarqService {
             match result {
                 Ok(()) => {
                     log::info!("send {id} complete");
-                    announce(&|cb| cb.onTransferFinished(id, 0));
+                    announce(&|cb| cb.onTransferFinished(id, STATUS_OK));
                 }
                 Err(e) => {
                     log::warn!("send {id} failed: {e}");
+                    // A refusal is not a fault, and a client should be able to say so.
+                    // PermissionDenied is what send() returns when /Ask answers with a
+                    // non-200: the person on the other device pressed Decline.
+                    let status = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                        STATUS_DECLINED
+                    } else {
+                        STATUS_FAILED
+                    };
                     // A refused or reset connection means that peer is no longer there.
                     // Forgetting it now is better than leaving the picker offering a
                     // device that cannot be reached until the expiry timer notices.
@@ -389,7 +574,7 @@ impl IBarqService for BarqService {
                         }
                         log::info!("forgot unreachable peer {peer_instance}");
                     }
-                    announce(&|cb| cb.onTransferFinished(id, -1));
+                    announce(&|cb| cb.onTransferFinished(id, status));
                 }
             }
             transfers.finish(id);
@@ -397,8 +582,10 @@ impl IBarqService for BarqService {
         Ok(id)
     }
 
-    fn respondToOffer(&self, _transfer_id: i64, _accept: bool) -> BinderResult<()> {
-        Err(Status::from(StatusCode::NAME_NOT_FOUND))
+    fn respondToOffer(&self, transfer_id: i64, accept: bool) -> BinderResult<()> {
+        log::info!("respondToOffer({transfer_id}, accept={accept})");
+        self.transfers.answer(transfer_id, accept);
+        Ok(())
     }
 
     fn cancelTransfer(&self, transfer_id: i64) -> BinderResult<()> {
@@ -492,11 +679,65 @@ fn start_discovery(
         // Asked once per peer per boot. Without this the loop would re-probe every
         // peer on every pass, which is a TLS connection each time.
         let mut probed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Which instance of the interface we are bound to. The table id IS the index,
+        // and barqd recreates mosey0 with a new one every time it re-acquires the
+        // radio, so this is the identity that matters -- not the name.
+        let mut bound_idx = mdns::ifindex_of(IFACE).unwrap_or(0);
+        let mut waiting_logged = false;
         let mut failures = 0u32;
         let mut since_query = Duration::from_secs(99);
         let mut since_announce = Duration::ZERO;
         let mut was_advertising = false;
         loop {
+            // barqd holds AWDL only while something wants it, so mosey0 genuinely
+            // disappears and comes back with a new index. Two things follow.
+            //
+            // With no interface there is nothing to browse: polling a dead socket at
+            // 2 Hz and logging a failed query every four seconds would cost more than
+            // releasing the radio ever saved, and would bury the log. Go idle instead.
+            //
+            // With a DIFFERENT interface, rebind immediately rather than waiting for
+            // three failed queries to infer it. The failure counter is still there as
+            // a backstop for sockets that die without the index changing, but it is no
+            // longer how the common case is detected -- it used to take up to twelve
+            // seconds, which is most of the time a person is willing to stare at an
+            // empty list.
+            let now_idx = mdns::ifindex_of(IFACE).unwrap_or(0);
+            if now_idx == 0 {
+                if bound_idx != 0 {
+                    log::info!("{IFACE} is gone — discovery idle until it returns");
+                    bound_idx = 0;
+                    was_advertising = false;
+                    if let Ok(mut shared) = peers.lock() {
+                        shared.clear();   // nothing here is reachable any more
+                    }
+                }
+                std::thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+            if now_idx != bound_idx {
+                match mdns::Browser::new(IFACE) {
+                    Ok(b) => {
+                        log::info!("{IFACE} is up as index {now_idx} — bound");
+                        browser = b;
+                        bound_idx = now_idx;
+                        failures = 0;
+                        was_advertising = false;      // re-assert on the new socket
+                        since_query = Duration::from_secs(99);
+                        waiting_logged = false;
+                    }
+                    Err(e) => {
+                        // Usually just the address not being assigned yet, a moment
+                        // after the index appears. Say it once, then wait quietly.
+                        if !waiting_logged {
+                            log::info!("waiting for an address on {IFACE} ({e})");
+                            waiting_logged = true;
+                        }
+                        std::thread::sleep(Duration::from_millis(500));
+                        continue;
+                    }
+                }
+            }
             // Advertising follows the flag, so a client turning discoverability
             // on or off takes effect without restarting anything.
             // Any peer that has become reachable but is still nameless gets asked
@@ -531,8 +772,16 @@ fn start_discovery(
                     Err(e) => log::warn!("cannot advertise: {e}"),
                 }
             } else if !want && was_advertising {
-                browser.stop_advertising();
-                log::info!("no longer advertising");
+                // The goodbye is the part that actually removes us from a peer's list.
+                // If it does not go out we stay listed for the record TTL, so a failure
+                // here is worth saying rather than swallowing.
+                match browser.stop_advertising() {
+                    Ok(()) => log::info!("no longer advertising (withdrawn)"),
+                    Err(e) => log::warn!(
+                        "no longer advertising, but the goodbye failed ({e}) — peers \
+                         will keep listing this device until the TTL expires"
+                    ),
+                }
                 was_advertising = false;
             }
 
@@ -570,6 +819,7 @@ fn start_discovery(
                 match mdns::Browser::new(IFACE) {
                     Ok(b) => {
                         browser = b;
+                        bound_idx = mdns::ifindex_of(IFACE).unwrap_or(0);
                         failures = 0;
                         was_advertising = false;   // re-assert on the new socket
                         since_query = Duration::from_secs(99);
@@ -630,7 +880,19 @@ fn start_airdrop_server(discoverable: Discoverable, callbacks: Callbacks, transf
                 }
                 Err(e) => log::debug!("AirDrop server not up yet: {e}"),
             }
-            std::thread::sleep(Duration::from_secs(5));
+            // Two very different waits behind one failure.
+            //
+            // If mosey0 exists, barqd has just brought it up and the address is
+            // moments away -- retrying slowly here is dead time a person spends
+            // looking at a device that cannot yet receive. If it does not exist, the
+            // radio is released and nothing is coming; polling fast would be a wakeup
+            // source for as long as the phone is in a pocket.
+            let coming_up = mdns::ifindex_of(IFACE).is_ok();
+            std::thread::sleep(if coming_up {
+                Duration::from_millis(500)
+            } else {
+                Duration::from_secs(5)
+            });
         }
     });
 }
@@ -670,9 +932,14 @@ fn main() {
     // The HTTP server refuses transfers while invisible and announces finished ones,
     // so it needs both the flag and the callback list the service owns.
     start_airdrop_server(
-        discoverable,
+        discoverable.clone(),
         service.callbacks.clone(),
         service.transfers.clone(),
+    );
+    start_radio_gate(
+        service.active.clone(),
+        service.transfers.clone(),
+        discoverable,
     );
     let binder = BnBarqService::new_binder(service, BinderFeatures::default());
 

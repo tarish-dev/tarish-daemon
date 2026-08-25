@@ -1,0 +1,7 @@
+# Whether anything wants the AWDL radio. Written by barqsharingd, read by barqd.
+#
+# A property rather than binder: barqd holds CAP_NET_ADMIN and CAP_NET_RAW, and a
+# property read is a shared-memory load of one boolean -- no parser, no IPC surface
+# in the privileged process. See barqd's WANT_PROP comment for why this is also not
+# ctl.start/ctl.stop.
+barq.awdl.wanted    u:object_r:barq_awdl_prop:s0    exact bool

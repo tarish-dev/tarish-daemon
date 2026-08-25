@@ -180,6 +180,25 @@ pub fn add_rule(iface: &str) -> io::Result<()> {
     send_nl(RTM_NEWRULE, &body)
 }
 
+/// Take our fib rules back out, however many have accumulated.
+///
+/// The counterpart to `add_rule`'s opening sweep. Releasing the link without this
+/// leaves a rule pointing at the table of an interface that no longer exists, and
+/// because rules match by priority the stale one wins over the next one added.
+pub fn remove_rule() -> io::Result<()> {
+    let mut removed = 0;
+    for _ in 0..8 {
+        if del_rule().is_err() {
+            break;   // nothing left at our priority
+        }
+        removed += 1;
+    }
+    if removed == 0 {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "no rule at our priority"));
+    }
+    Ok(())
+}
+
 /// Delete one rule at our priority. Errors once none remain, which is the stop signal.
 fn del_rule() -> io::Result<()> {
     let rt = RtMsg {

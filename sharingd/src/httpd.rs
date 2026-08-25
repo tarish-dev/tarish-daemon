@@ -25,7 +25,7 @@ use openssl::rsa::Rsa;
 use openssl::ssl::{SslAcceptor, SslMethod};
 use openssl::x509::{X509Builder, X509NameBuilder};
 use std::io::{self, Read, Write};
-use std::net::{SocketAddrV6, TcpListener};
+use std::net::{Ipv6Addr, SocketAddrV6, TcpListener, TcpStream};
 use std::time::Duration;
 
 /// Cap on the request head we will buffer. AirDrop's requests are small; anything
@@ -45,6 +45,20 @@ const PROGRESS_STEP: u64 = 256 * 1024;
 /// A slow or silent peer must not hold a connection open indefinitely.
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How long a non-blocking accept waits between tries. Short enough that a peer
+/// does not notice, long enough that an idle listener is not a wakeup source.
+const ACCEPT_POLL: Duration = Duration::from_millis(250);
+
+/// Check the interface every this many accept polls -- about two seconds.
+const IFACE_CHECK_EVERY: u32 = 8;
+
+/// How long an offer waits on screen before it is refused.
+///
+/// The sender shows "Waiting…" for as long as this takes, which is what an Apple
+/// receiver does too. Long enough to pick the phone up and read the prompt; short
+/// enough that a device left face-down does not hold the connection open all day.
+const ASK_TIMEOUT: Duration = Duration::from_secs(45);
+
 /// What to do with the connection after answering a request.
 enum Disposition {
     KeepAlive,
@@ -54,11 +68,50 @@ enum Disposition {
 pub struct Httpd {
     acceptor: SslAcceptor,
     listener: TcpListener,
+    /// What we bound to, kept so `serve` can tell when it has been replaced.
+    iface: String,
+    addr: Ipv6Addr,
+    scope: u32,
     discover_body: Vec<u8>,
     ask_body: Vec<u8>,
     discoverable: crate::Discoverable,
     callbacks: crate::Callbacks,
     transfers: crate::Transfers,
+}
+
+/// Who is offering, and what.
+///
+/// Best-effort by design: a peer controls this body, so every field is optional and a
+/// body that will not parse yields empty strings rather than a refusal. The prompt is
+/// still shown -- "something wants to send you a file" with no name is a worse prompt
+/// but a far better outcome than accepting silently because the plist was odd.
+fn describe_offer(body: &[u8]) -> (String, Vec<String>) {
+    let Some(v) = plist::parse(body) else {
+        return (String::new(), Vec::new());
+    };
+    let from = v
+        .get("SenderComputerName")
+        .and_then(|s| s.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    let mut names = Vec::new();
+    if let Some(plist::Val::Array(items)) = v.get("Files") {
+        for it in items {
+            // FileName is what Apple sends; FileBomPath is the archive path and is the
+            // only thing present on some senders, so fall back to its last component.
+            let n = it
+                .get("FileName")
+                .and_then(|s| s.as_str())
+                .or_else(|| it.get("FileBomPath").and_then(|s| s.as_str()))
+                .unwrap_or_default();
+            let leaf = n.rsplit('/').next().unwrap_or(n);
+            if !leaf.is_empty() {
+                names.push(leaf.to_string());
+            }
+        }
+    }
+    (from, names)
 }
 
 impl Httpd {
@@ -107,45 +160,111 @@ impl Httpd {
         ]);
 
         Ok(Self {
-            acceptor, listener, discover_body, ask_body, discoverable, callbacks, transfers,
+            acceptor,
+            listener,
+            iface: iface.to_string(),
+            addr,
+            scope,
+            discover_body,
+            ask_body,
+            discoverable,
+            callbacks,
+            transfers,
         })
     }
 
     /// Accept forever. Each connection is handled on its own thread and closed after
     /// one exchange, because AirDrop sets `Connection: close` on every response.
     pub fn serve(&self) {
-        for stream in self.listener.incoming() {
-            let stream = match stream {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("accept failed: {e}");
-                    continue;
-                }
-            };
-            let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
-            let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
-            let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+        // Non-blocking accept, so this loop can notice the interface going out from
+        // under it.
+        //
+        // A blocking accept() on a socket bound to an address that no longer exists
+        // does not return and does not error -- it simply waits for a connection that
+        // can never arrive. serve() would sit there for the life of the process while
+        // the rebind loop outside waited for it to come back, and receiving would stay
+        // dead until the daemon was restarted by hand.
+        //
+        // That mattered little while barqd held the link from boot to shutdown. Now
+        // that the radio is released whenever nothing wants it, mosey0 disappears and
+        // returns with a NEW index routinely, so this is the difference between a
+        // stack that survives the second transfer and one that does not.
+        if self.listener.set_nonblocking(true).is_err() {
+            // Better to serve with the old blocking behaviour than not to serve.
+            warn!("listener will not poll — cannot detect {} being replaced", self.iface);
+        }
 
-            match self.acceptor.accept(stream) {
-                Ok(mut tls) => {
-                    debug!("TLS handshake ok from {peer}");
-                    if let Err(e) = self.serve_connection(&mut tls) {
-                        debug!("{peer}: {e}");
-                    }
-                    // Drain whatever the peer still has queued before dropping the
-                    // socket. Closing with unread bytes in the receive buffer makes
-                    // the kernel send RST rather than FIN, and a client that gets RST
-                    // discards the response it already received and retries at once.
-                    //
-                    // Content-Length is not enough on its own: a chunked request has
-                    // none, so the body reader takes nothing and the bytes stay
-                    // queued. Draining is framing-agnostic and cheap.
-                    drain(&mut tls);
+        let mut ticks = 0u32;
+        loop {
+            match self.listener.accept() {
+                Ok((stream, _)) => {
+                    // The listener is non-blocking; the accepted socket must not be,
+                    // or every read in the transfer path returns WouldBlock.
+                    let _ = stream.set_nonblocking(false);
+                    self.serve_one(stream);
                 }
-                // Not an error worth shouting about: anything on the link may probe
-                // this port, and Apple itself opens and drops connections.
-                Err(e) => debug!("TLS handshake from {peer} failed: {e}"),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    ticks += 1;
+                    // Roughly every two seconds, not every poll: this asks the kernel
+                    // for the interface list, which is far more expensive than the
+                    // accept it is riding along with.
+                    if ticks % IFACE_CHECK_EVERY == 0 && self.iface_changed() {
+                        info!("{} was replaced — dropping the listener to rebind", self.iface);
+                        return;
+                    }
+                    std::thread::sleep(ACCEPT_POLL);
+                }
+                Err(e) => {
+                    // Return rather than spin. The caller re-creates the listener a few
+                    // seconds later, which is the recovery for anything durable here;
+                    // continuing would busy-loop on a socket that keeps failing.
+                    warn!("accept failed: {e} — rebinding");
+                    return;
+                }
             }
+        }
+    }
+
+    /// Everything that happens on one accepted connection.
+    fn serve_one(&self, stream: TcpStream) {
+        let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+        let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+
+        match self.acceptor.accept(stream) {
+            Ok(mut tls) => {
+                debug!("TLS handshake ok from {peer}");
+                if let Err(e) = self.serve_connection(&mut tls) {
+                    debug!("{peer}: {e}");
+                }
+                // Drain whatever the peer still has queued before dropping the
+                // socket. Closing with unread bytes in the receive buffer makes
+                // the kernel send RST rather than FIN, and a client that gets RST
+                // discards the response it already received and retries at once.
+                //
+                // Content-Length is not enough on its own: a chunked request has
+                // none, so the body reader takes nothing and the bytes stay
+                // queued. Draining is framing-agnostic and cheap.
+                drain(&mut tls);
+            }
+            // Not an error worth shouting about: anything on the link may probe
+            // this port, and Apple itself opens and drops connections.
+            Err(e) => debug!("TLS handshake from {peer} failed: {e}"),
+        }
+    }
+
+    /// Has the interface we are bound to been replaced, or gone?
+    ///
+    /// Both halves matter. A new index with the same address still means a different
+    /// interface, and an address change on the same index means our bound address is
+    /// no longer local. Either way the listener is holding something dead.
+    fn iface_changed(&self) -> bool {
+        match (
+            crate::mdns::link_local_of(&self.iface),
+            crate::mdns::ifindex_of(&self.iface),
+        ) {
+            (Some(addr), Ok(scope)) => addr != self.addr || scope != self.scope,
+            _ => true,
         }
     }
 
@@ -202,6 +321,25 @@ impl Httpd {
 
         match (method, path) {
             // Apple probes this before anything else; failing it is enough to be dropped.
+            // Say nothing at all while invisible.
+            //
+            // Withdrawing the mDNS record is necessary but not sufficient: a peer that
+            // still has us cached, or that was told about us by something else, asks
+            // /Discover and we answered with this device's NAME. That is what kept the
+            // phone on a Mac's AirDrop list with the screen off -- the record was gone,
+            // but anything that asked directly was told who we are and got a device to
+            // draw. An invisible device does not identify itself.
+            ("HEAD", "/") if !self.visible() => {
+                debug!("HEAD / refused — not discoverable");
+                respond(tls, 401, None, false)?;
+                return Ok(Disposition::Close);
+            }
+            ("POST", "/Discover") if !self.visible() => {
+                info!("/Discover refused — not discoverable");
+                respond(tls, 401, None, false)?;
+                return Ok(Disposition::Close);
+            }
+
             ("HEAD", "/") => respond(tls, 200, None, keep_alive)?,
             ("POST", "/Discover") => respond(tls, 200, Some(&self.discover_body), keep_alive)?,
 
@@ -223,13 +361,53 @@ impl Httpd {
                 // the peer commits, and the UI should show something before any bytes
                 // arrive rather than sitting idle through the whole handshake.
                 let id = self.transfers.begin();
-                info!("accepting transfer {id}");
-                self.offered(id);
-                respond(tls, 200, Some(&self.ask_body), keep_alive)?
+                let (from, names) = describe_offer(&body);
+                info!("offer {id} from {from:?}: {} file(s) {names:?}", names.len());
+                self.offered(id, &from, &names);
+
+                // ASK, do not assume. Answering 200 here unconditionally meant any
+                // device in range could put a file on this one while the app was open,
+                // with no prompt and no record -- visibility was the entire consent
+                // model. It is a person's decision, so a person makes it.
+                //
+                // This blocks the accept loop for up to ASK_TIMEOUT. That is deliberate
+                // and matches the protocol: the peer is holding this connection open
+                // waiting for exactly this answer, and will send /Upload on it.
+                match self.transfers.await_answer(id, ASK_TIMEOUT) {
+                    Some(true) => {
+                        info!("offer {id} accepted");
+                        respond(tls, 200, Some(&self.ask_body), keep_alive)?
+                    }
+                    Some(false) => {
+                        info!("offer {id} declined");
+                        self.transfers.finish(id);
+                        // 401 is what an Apple receiver sends on decline, and what our
+                        // own sender already reads back as "Declined".
+                        respond(tls, 401, None, false)?;
+                        return Ok(Disposition::Close);
+                    }
+                    None => {
+                        warn!("offer {id} went unanswered for {ASK_TIMEOUT:?} — refusing");
+                        self.transfers.finish(id);
+                        respond(tls, 401, None, false)?;
+                        return Ok(Disposition::Close);
+                    }
+                }
             }
 
-            ("POST", "/Upload") if !self.visible() => {
-                warn!("/Upload refused — not discoverable");
+            // Gated on an ACCEPTED OFFER, not on visibility.
+            //
+            // The consent for these bytes was given at /Ask, and it does not evaporate
+            // because the visibility timer lapsed between the prompt and the upload --
+            // that would fail a transfer the user agreed to, halfway through, for no
+            // reason they could see. current() is non-zero only between an accepted
+            // /Ask and the upload that follows it, which is exactly the window.
+            //
+            // It also closes the other door: /Ask and /Upload normally share one
+            // connection, but nothing stops a peer opening a fresh one and posting
+            // straight to /Upload, walking right past the prompt.
+            ("POST", "/Upload") if self.transfers.current() == 0 => {
+                warn!("/Upload with no accepted offer — refused");
                 respond(tls, 401, None, false)?;
                 return Ok(Disposition::Close);
             }
@@ -275,8 +453,10 @@ impl Httpd {
     /// The file names are not known yet: they live in the /Ask plist, and Barq has a
     /// plist writer but no reader. Sending an empty list is honest -- the UI shows
     /// "receiving" without inventing names it does not have.
-    fn offered(&self, id: i64) {
-        self.each_callback(|cb| cb.onTransferOffered(id, "", &[], 0));
+    fn offered(&self, id: i64, from: &str, names: &[String]) {
+        // totalBytes is 0: Apple's /Ask carries file names and types but no sizes, so
+        // reporting anything else would be inventing it.
+        self.each_callback(|cb| cb.onTransferOffered(id, from, names, 0));
     }
 
     fn progress(&self, id: i64, done: u64, total: u64) {

@@ -14,5 +14,13 @@ oneway interface IBarqCallback {
     void onTransferProgress(long transferId, long bytesDone, long bytesTotal);
 
     /** status: 0 = complete, non-zero = failed or cancelled. */
+    /**
+     * A transfer ended.
+     *
+     * status is 0 on success, -1 on failure, and -2 when the person on the other device
+     * declined. Declined is separate on purpose: it is a normal answer rather than an
+     * error, and reporting it as "could not send" invites a retry that will be refused
+     * again.
+     */
     void onTransferFinished(long transferId, int status);
 }

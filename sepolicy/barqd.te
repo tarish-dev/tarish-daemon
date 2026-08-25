@@ -73,6 +73,11 @@ allowxperm barqd self:unix_dgram_socket ioctl { 0x8913-0x8914 0x8946 0x8994 };
 get_prop(barqd, wifi_config_prop)
 get_prop(barqd, vendor_default_prop)
 
+# The radio is held only while something wants it, and this is how barqd is told.
+# Read-only on purpose: barqd never writes it, so a bug here cannot make the
+# privileged daemon assert a state the unprivileged one did not ask for.
+get_prop(barqd, barq_awdl_prop)
+
 allow barqd sysfs_net:dir search;
 allow barqd sysfs_net:file r_file_perms;
 allow barqd sysfs_net:lnk_file r_file_perms;

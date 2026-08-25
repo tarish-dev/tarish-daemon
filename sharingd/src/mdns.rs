@@ -104,10 +104,39 @@ impl Browser {
         })
     }
 
-    pub fn stop_advertising(&mut self) {
-        // A goodbye (TTL 0) would be politer, but claiming records we are about
-        // to stop answering for is worse than going quiet. Peers expire us.
+    /// Stop advertising, and tell peers so rather than letting them time us out.
+    ///
+    /// The previous version just went quiet, on the reasoning that a goodbye "claims
+    /// records we are about to stop answering for". That was wrong on both counts: a
+    /// goodbye claims nothing, it is the RFC 6762 §10.1 withdrawal, and going quiet
+    /// does not remove us -- it leaves us listed for the rest of the TTL.
+    ///
+    /// With TTL at 120 s that is two minutes during which a Mac shows this phone,
+    /// lets someone pick it, and gets the transfer refused. Screen off, app closed,
+    /// still on the list. Being invisible has to be something we say, not something
+    /// the other side eventually infers.
+    pub fn stop_advertising(&mut self) -> io::Result<()> {
+        if !self.advertising {
+            return Ok(());
+        }
         self.advertising = false;
+        self.goodbye()
+    }
+
+    /// Withdraw our records: the same set, TTL 0.
+    fn goodbye(&self) -> io::Result<()> {
+        let pkt = dns::response(&self.records_with_ttl(0));
+        // Repeated, because a withdrawal that is lost has no second chance -- the next
+        // thing that would correct a peer's view is the TTL expiring, which is the
+        // whole problem. Cheap: three small packets, once, on the way out.
+        let mut last = Ok(());
+        for i in 0..3 {
+            if i > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            last = self.send_multicast(&pkt);
+        }
+        last
     }
 
     pub fn instance(&self) -> &str {
@@ -146,6 +175,11 @@ impl Browser {
 
     /// The record set that describes us: what we are, where, and how to reach us.
     fn our_records(&self) -> Vec<Vec<u8>> {
+        self.records_with_ttl(TTL)
+    }
+
+    /// The same set at an arbitrary TTL. Zero is a withdrawal; see `goodbye`.
+    fn records_with_ttl(&self, ttl: u32) -> Vec<Vec<u8>> {
         let inst = self.full_instance();
         let host = self.host();
         let mut out = Vec::with_capacity(4);
@@ -153,10 +187,10 @@ impl Browser {
         // Service enumeration: "this host offers _airdrop._tcp". Mosey sends it
         // and Barq did not; a browser that enumerates services rather than
         // querying ours by name would never have seen us.
-        out.push(dns::record(SERVICE_ENUM, dns::TYPE_PTR, TTL,
+        out.push(dns::record(SERVICE_ENUM, dns::TYPE_PTR, ttl,
                              &dns::encode_name(AIRDROP_SERVICE), false));
 
-        out.push(dns::record(AIRDROP_SERVICE, dns::TYPE_PTR, TTL,
+        out.push(dns::record(AIRDROP_SERVICE, dns::TYPE_PTR, ttl,
                              &dns::encode_name(&inst), false));
 
         let mut srv = Vec::with_capacity(16);
@@ -164,7 +198,7 @@ impl Browser {
         srv.extend_from_slice(&0u16.to_be_bytes());        // weight
         srv.extend_from_slice(&AIRDROP_PORT.to_be_bytes());
         srv.extend_from_slice(&dns::encode_name(&host));
-        out.push(dns::record(&inst, dns::TYPE_SRV, TTL, &srv, true));
+        out.push(dns::record(&inst, dns::TYPE_SRV, ttl, &srv, true));
 
         // One key. Captured from Google's Mosey, which interoperates:
         //
@@ -174,22 +208,22 @@ impl Browser {
         // _appsvcprepair and _applicationservicepairing services and never
         // appear on _airdrop._tcp -- copying them onto this service was wrong.
         // 489 is 0x1E9; the bit meanings are not known.
-        out.push(dns::record(&inst, dns::TYPE_TXT, TTL,
+        out.push(dns::record(&inst, dns::TYPE_TXT, ttl,
                              &dns::txt_rdata(&[AIRDROP_FLAGS]), true));
 
         if let Some(a) = self.our_addr() {
-            out.push(dns::record(&host, dns::TYPE_AAAA, TTL, &a.octets(), true));
+            out.push(dns::record(&host, dns::TYPE_AAAA, ttl, &a.octets(), true));
             // Reverse lookup, as Mosey publishes.
-            out.push(dns::record(&reverse_name(&a), dns::TYPE_PTR, TTL,
+            out.push(dns::record(&reverse_name(&a), dns::TYPE_PTR, ttl,
                                  &dns::encode_name(&host), true));
         }
 
         // NSEC for both names we own. This is the correct reply to a query for a
         // type we do not have -- notably A on our host, which is exactly what an
         // Apple peer asked for and got silence.
-        out.push(dns::record(&inst, dns::TYPE_NSEC, TTL,
+        out.push(dns::record(&inst, dns::TYPE_NSEC, ttl,
                              &dns::nsec_rdata(&inst, &[dns::TYPE_TXT, dns::TYPE_SRV]), true));
-        out.push(dns::record(&host, dns::TYPE_NSEC, TTL,
+        out.push(dns::record(&host, dns::TYPE_NSEC, ttl,
                              &dns::nsec_rdata(&host, &[dns::TYPE_AAAA]), true));
         out
     }
