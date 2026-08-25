@@ -41,6 +41,10 @@ pub struct Peer {
     pub host: String,
     pub port: u16,
     pub addr: Option<Ipv6Addr>,
+    /// Display name, once /Discover has been asked. mDNS never carries it: AirDrop's
+    /// TXT record holds only `flags`, so the only way to learn what a device calls
+    /// itself is to connect and ask.
+    pub name: Option<String>,
     pub last_seen: Instant,
 }
 
@@ -324,6 +328,7 @@ impl Browser {
                                 host: String::new(),
                                 port: 0,
                                 addr: None,
+                                name: None,
                                 last_seen: Instant::now(),
                             }
                         });

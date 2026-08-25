@@ -19,6 +19,7 @@
 
 mod dns;
 mod framed;
+mod send;
 mod httpd;
 mod mdns;
 mod plist;
@@ -93,6 +94,33 @@ impl TransferState {
 }
 
 /// Read an Android system property.
+/// A human name for this device, sent to the peer as SenderComputerName.
+///
+/// This is the one place a person actually reads our identity, so it prefers something
+/// they set over something the vendor did.
+fn device_name() -> String {
+    read_property("persist.barq.name")
+        .or_else(|| read_property("ro.product.model"))
+        .unwrap_or_else(|| "Barq".to_string())
+}
+
+/// Take an owned File from a descriptor the client passed over binder.
+///
+/// The parcel's descriptor is closed when the transaction returns, so it has to be
+/// duplicated: the send runs on another thread and would otherwise read from a closed
+/// fd, which presents as a truncated file rather than an error.
+fn dup_file(pfd: &binder::ParcelFileDescriptor) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    // SAFETY: dup(2) on a descriptor the parcel currently owns; the result is a fresh
+    // descriptor this process owns and hands straight to File.
+    let raw = unsafe { libc::dup(pfd.as_raw_fd()) };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: raw is a valid descriptor we just created and do not use elsewhere.
+    Ok(unsafe { std::fs::File::from_raw_fd(raw) })
+}
+
 fn read_property(name: &str) -> Option<String> {
     let cname = std::ffi::CString::new(name).ok()?;
     let mut buf = [0u8; 128];
@@ -140,6 +168,23 @@ impl BarqService {
 
 impl Interface for BarqService {}
 
+impl BarqService {
+    /// Turn a peer id from the client back into something we can connect to.
+    ///
+    /// A peer is only sendable once its SRV and AAAA records have both been seen: the
+    /// port comes from one and the address from the other, and mDNS delivers them in
+    /// whatever order it likes.
+    fn resolve(&self, peer_id: &str) -> Option<send::Target> {
+        let peers = self.peers.lock().ok()?;
+        let peer = peers.iter().find(|p| p.short_id() == peer_id || p.instance == peer_id)?;
+        Some(send::Target {
+            addr: peer.addr?,
+            port: if peer.port != 0 { peer.port } else { return None },
+            scope: mdns::ifindex_of(IFACE).ok()?,
+        })
+    }
+}
+
 impl IBarqService for BarqService {
     fn getStatus(&self) -> BinderResult<BarqStatus> {
         Ok(BarqStatus {
@@ -184,10 +229,11 @@ impl IBarqService for BarqService {
             .iter()
             .map(|p| BarqPeer {
                 id: p.instance.clone(),
-                // Apple advertises a 12-hex-character identifier, not a name. A
-                // friendly name needs the TXT record or a connection, so show the
-                // identifier rather than inventing something.
-                name: p.short_id().to_string(),
+                // Apple advertises a 12-hex-character identifier, never a name -- its
+                // TXT record carries only `flags`. The real name comes from asking the
+                // peer over /Discover, which happens in the background; until that
+                // answers, the identifier is what we honestly have.
+                name: p.name.clone().unwrap_or_else(|| p.short_id().to_string()),
                 model: String::new(),
                 rssi: 0,
             })
@@ -196,14 +242,88 @@ impl IBarqService for BarqService {
 
     fn sendFiles(
         &self,
-        _peer_id: &str,
-        _files: &[binder::ParcelFileDescriptor],
-        _names: &[String],
+        peer_id: &str,
+        files: &[binder::ParcelFileDescriptor],
+        names: &[String],
     ) -> BinderResult<i64> {
-        Err(Status::new_exception(
-            binder::ExceptionCode::UNSUPPORTED_OPERATION,
-            Some(&std::ffi::CString::new("no transfer protocol yet").unwrap()),
-        ))
+        if files.len() != names.len() {
+            log::warn!("sendFiles: {} descriptors but {} names", files.len(), names.len());
+            return Err(Status::new_exception(binder::ExceptionCode::ILLEGAL_ARGUMENT, None));
+        }
+        let target = match self.resolve(peer_id) {
+            Some(t) => t,
+            None => {
+                log::warn!("sendFiles: peer {peer_id:?} is not known");
+                return Err(Status::new_exception(binder::ExceptionCode::ILLEGAL_ARGUMENT, None));
+            }
+        };
+
+        // Descriptors are duplicated out of the binder parcel now: they belong to this
+        // transaction and would be closed under the worker thread otherwise.
+        let mut items = Vec::with_capacity(files.len());
+        for (fd, name) in files.iter().zip(names) {
+            let file = match dup_file(fd) {
+                Ok(f) => f,
+                Err(e) => {
+                    log::warn!("sendFiles: could not take {name:?}: {e}");
+                    return Err(Status::new_exception(binder::ExceptionCode::ILLEGAL_ARGUMENT, None));
+                }
+            };
+            let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+            items.push(send::Item {
+                file,
+                // A name from a client still has no business steering a path on the
+                // peer's disk, so it is reduced to a leaf like a received one.
+                name: httpd::safe_leaf(name).unwrap_or_else(|| "file".to_string()),
+                size,
+            });
+        }
+
+        let id = self.transfers.begin();
+        let transfers = self.transfers.clone();
+        let callbacks = self.callbacks.clone();
+        let name = device_name();
+        let model = read_property("ro.product.model").unwrap_or_else(|| "Android".into());
+
+        // Sending happens off the binder thread: a transfer runs for as long as it runs,
+        // and holding a binder worker for that would block every other call into us.
+        std::thread::spawn(move || {
+            let announce = |f: &dyn Fn(&Strong<dyn IBarqCallback>) -> binder::Result<()>| {
+                if let Ok(cbs) = callbacks.lock() {
+                    for cb in cbs.iter() {
+                        let _ = f(cb);
+                    }
+                }
+            };
+            announce(&|cb| cb.onTransferOffered(id, "", &[], 0));
+
+            let result = send::send(
+                &target,
+                items,
+                &name,
+                &model,
+                |done, total| {
+                    if let Ok(cbs) = callbacks.lock() {
+                        for cb in cbs.iter() {
+                            let _ = cb.onTransferProgress(id, done as i64, total as i64);
+                        }
+                    }
+                },
+                || transfers.is_cancelled(id),
+            );
+            match result {
+                Ok(()) => {
+                    log::info!("send {id} complete");
+                    announce(&|cb| cb.onTransferFinished(id, 0));
+                }
+                Err(e) => {
+                    log::warn!("send {id} failed: {e}");
+                    announce(&|cb| cb.onTransferFinished(id, -1));
+                }
+            }
+            transfers.finish(id);
+        });
+        Ok(id)
     }
 
     fn respondToOffer(&self, _transfer_id: i64, _accept: bool) -> BinderResult<()> {
@@ -259,6 +379,26 @@ impl IBarqService for BarqService {
 /// Runs whether or not a client is bound, because discoverability is daemon
 /// state. Waits for the link rather than failing at start: barqd may still be
 /// bringing it up, and a restart loop over a missing interface helps nobody.
+/// Ask a peer what it is called, once, in the background.
+///
+/// AirDrop carries no name in mDNS, so this is the only way to show a person something
+/// they recognise instead of twelve hex characters. Failures are expected and quiet: a
+/// peer that is not discoverable to us simply will not answer, which is not a fault.
+fn probe_name(peers: PeerTable, instance: String, target: send::Target) {
+    std::thread::spawn(move || match send::discover(&target) {
+        Ok(Some(name)) => {
+            log::info!("peer {instance} is {name:?}");
+            if let Ok(mut table) = peers.lock() {
+                if let Some(p) = table.iter_mut().find(|p| p.instance == instance) {
+                    p.name = Some(name);
+                }
+            }
+        }
+        Ok(None) => log::debug!("peer {instance} did not give a name"),
+        Err(e) => log::debug!("peer {instance} /Discover failed: {e}"),
+    });
+}
+
 fn start_discovery(peers: PeerTable, discoverable: Discoverable) {
     std::thread::spawn(move || {
         let mut browser = loop {
@@ -274,12 +414,36 @@ fn start_discovery(peers: PeerTable, discoverable: Discoverable) {
             }
         };
 
+        // Asked once per peer per boot. Without this the loop would re-probe every
+        // peer on every pass, which is a TLS connection each time.
+        let mut probed: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut since_query = Duration::from_secs(99);
         let mut since_announce = Duration::ZERO;
         let mut was_advertising = false;
         loop {
             // Advertising follows the flag, so a client turning discoverability
             // on or off takes effect without restarting anything.
+            // Any peer that has become reachable but is still nameless gets asked
+            // once. Collected under the lock and probed outside it, because a probe
+            // opens a TLS connection and holding the table through that would stall
+            // every getPeers call for the duration.
+            let mut to_probe = Vec::new();
+            if let Ok(mut table) = peers.lock() {
+                for p in table.iter_mut() {
+                    if p.name.is_none() && p.port != 0 && !probed.contains(&p.instance) {
+                        if let Some(addr) = p.addr {
+                            probed.insert(p.instance.clone());
+                            to_probe.push((p.instance.clone(), addr, p.port));
+                        }
+                    }
+                }
+            }
+            for (instance, addr, port) in to_probe {
+                if let Ok(scope) = mdns::ifindex_of(IFACE) {
+                    probe_name(peers.clone(), instance, send::Target { addr, port, scope });
+                }
+            }
+
             let want = discoverable.load(Ordering::SeqCst);
             if want && !was_advertising {
                 match browser.advertise() {

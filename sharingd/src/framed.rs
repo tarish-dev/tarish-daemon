@@ -112,3 +112,81 @@ fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {
     }
     Ok(got)
 }
+
+
+// ---------------------------------------------------------------- writing ---
+
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
+use std::io::Write;
+
+/// Block size we emit. Apple's own stored blocks were 131072 bytes, so this matches
+/// what its receiver already handles rather than picking a size and hoping.
+const BLOCK: usize = 128 * 1024;
+
+/// Writes the block-framed container Apple expects around a cpio stream.
+///
+/// Each block is deflated and prefixed with a 4-byte big-endian header; the top bit
+/// would mark a stored block, which we never emit -- deflate of incompressible data is
+/// only marginally larger, and always compressing keeps one path instead of two.
+///
+/// `finish()` must be called: the last partial block is only written there, and dropping
+/// the writer without it produces an archive that is short by up to one block. Drop
+/// cannot do it because flushing can fail and a Drop impl has nowhere to report that.
+pub struct FramedWriter<W: Write> {
+    inner: W,
+    buf: Vec<u8>,
+}
+
+impl<W: Write> FramedWriter<W> {
+    pub fn new(inner: W) -> Self {
+        Self { inner, buf: Vec::with_capacity(BLOCK) }
+    }
+
+    fn emit(&mut self) -> io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let mut enc = ZlibEncoder::new(Vec::with_capacity(self.buf.len() / 2), Compression::default());
+        enc.write_all(&self.buf)?;
+        let block = enc.finish()?;
+        if block.len() > 0x7FFF_FFFF {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "block too large to frame"));
+        }
+        self.inner.write_all(&(block.len() as u32).to_be_bytes())?;
+        self.inner.write_all(&block)?;
+        self.buf.clear();
+        Ok(())
+    }
+
+    /// Flush the tail block and hand back the underlying writer.
+    pub fn finish(mut self) -> io::Result<W> {
+        self.emit()?;
+        self.inner.flush()?;
+        Ok(self.inner)
+    }
+}
+
+impl<W: Write> Write for FramedWriter<W> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        let mut rest = data;
+        while !rest.is_empty() {
+            let space = BLOCK - self.buf.len();
+            let take = space.min(rest.len());
+            self.buf.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+            if self.buf.len() == BLOCK {
+                self.emit()?;
+            }
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        // Deliberately NOT emitting a partial block here. cpio writes small headers
+        // between files and a flush per header would produce a block per entry, which
+        // compresses badly and looks nothing like what Apple sends. finish() is what
+        // ends the stream.
+        self.inner.flush()
+    }
+}
