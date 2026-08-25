@@ -492,6 +492,7 @@ fn start_discovery(
         // Asked once per peer per boot. Without this the loop would re-probe every
         // peer on every pass, which is a TLS connection each time.
         let mut probed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut failures = 0u32;
         let mut since_query = Duration::from_secs(99);
         let mut since_announce = Duration::ZERO;
         let mut was_advertising = false;
@@ -546,10 +547,36 @@ fn start_discovery(
             // Query on our own timer, or immediately when a client is looking.
             let asked = query_now.swap(false, Ordering::SeqCst);
             if asked || since_query >= Duration::from_secs(4) {
-                if let Err(e) = browser.query() {
-                    log::warn!("query failed: {e}");
+                match browser.query() {
+                    Ok(()) => failures = 0,
+                    Err(e) => {
+                        failures += 1;
+                        log::warn!("query failed: {e} ({failures} in a row)");
+                    }
                 }
                 since_query = Duration::ZERO;
+            }
+
+            // Rebind when the interface goes out from under us.
+            //
+            // barqd recreates mosey0 with a NEW interface index whenever it restarts,
+            // and a socket bound to the old one is dead for good: every send returns
+            // ENETUNREACH and this loop would log that forever while discovery quietly
+            // returned nothing. Nothing else notices, because the daemon is up, the
+            // interface exists, and the address looks fine -- it is simply a different
+            // interface than the one we are bound to.
+            if failures >= 3 {
+                log::warn!("mDNS socket is stale — rebinding to {IFACE}");
+                match mdns::Browser::new(IFACE) {
+                    Ok(b) => {
+                        browser = b;
+                        failures = 0;
+                        was_advertising = false;   // re-assert on the new socket
+                        since_query = Duration::from_secs(99);
+                        log::info!("rebound to {IFACE}");
+                    }
+                    Err(e) => log::warn!("rebind failed ({e}) — will retry"),
+                }
             }
             browser.poll();
             // Long enough to ride out a rotation and a missed announcement, short
