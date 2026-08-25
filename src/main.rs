@@ -90,30 +90,56 @@ fn read_property(name: &str) -> Option<String> {
     Some(s.to_string())
 }
 
-/// Regulatory country, in priority order:
+/// Regulatory country, in priority order.
 ///
-///   1. `persist.barq.country` — explicit operator override
-///   2. `ro.boot.wificountrycode`, `persist.vendor.wifi.country` — the platform's
+/// WHERE THIS ACTUALLY COMES FROM
 ///
-/// Returns None when the platform has no country, rather than silently
-/// substituting the world domain. See the warning in `main`: "00" is accepted by
-/// the vendor library and then fails to bring the radio up, which is a genuinely
-/// confusing way to find out.
+/// An earlier version read only the three Wi-Fi sources and concluded "no country"
+/// whenever they were empty, with a message blaming Wi-Fi never having associated.
+/// That was wrong, and it cost a device: on a phone with a SIM and no Wi-Fi ever
+/// connected, the platform knew the country perfectly well --
+///
+///     Wifi Country Code = QA
+///     mCountryCodeFromDriverQA   SupportedChannelListIn5g[149, 153, 157, 161]
+///
+/// -- while `persist.vendor.wifi.country` was empty and `ro.boot.wificountrycode`
+/// was "00". Channel 149 was permitted the whole time. It worked on the development
+/// phone only because that one had associated to an AP at some point, which persists
+/// the country; a phone that never had would never come up, and the log would send
+/// you looking at Wi-Fi.
+///
+/// The SIM is authoritative when Wi-Fi has not persisted anything, and it is where
+/// the platform's own WifiCountryCode looks too.
+///
+///   1. `persist.barq.country`            explicit operator override
+///   2. `persist.vendor.wifi.country`     what the Wi-Fi stack persisted, if anything
+///   3. `gsm.operator.iso-country`        the network the SIM is registered on
+///   4. `gsm.sim.operator.iso-country`    the SIM's home country
+///   5. `ro.boot.wificountrycode`         boot default, usually "00" -- last on purpose
+///
+/// Returns None only when nothing knows. "00" is never accepted: the vendor library
+/// takes it, logs a bring-up that looks fine, and then returns NULL.
 fn country_code() -> Option<String> {
     for prop in [
         "persist.barq.country",
-        "ro.boot.wificountrycode",
         "persist.vendor.wifi.country",
+        "gsm.operator.iso-country",
+        "gsm.sim.operator.iso-country",
+        "ro.boot.wificountrycode",
     ] {
-        if let Some(v) = read_property(prop) {
-            let v = v.trim().to_uppercase();
-            if v.len() == 2 && v.chars().all(|c| c.is_ascii_alphabetic()) {
-                log::info!("country {v} (from {prop})");
-                return Some(v);
-            }
-            if v == "00" {
-                log::warn!("{prop}=00 — the world regulatory domain, no country set");
-            }
+        let Some(raw) = read_property(prop) else { continue };
+
+        // Multi-SIM devices publish one value per slot, comma separated, so a
+        // single-SIM phone reads "qa," -- which fails a length check on the whole
+        // string and is exactly how this was missed.
+        let v = raw.split(',').next().unwrap_or("").trim().to_uppercase();
+
+        if v.len() == 2 && v.chars().all(|c| c.is_ascii_alphabetic()) {
+            log::info!("country {v} (from {prop})");
+            return Some(v);
+        }
+        if v == "00" {
+            log::debug!("{prop}=00 — the world regulatory domain, no country set");
         }
     }
     None
@@ -147,16 +173,18 @@ struct Link {
 
 impl Link {
     fn acquire() -> Result<Self, String> {
-        // Read the country at ACQUIRE time, not at start-up. It comes from the
-        // AP, so at boot there may not be one yet -- barqd used to exit(1) in
-        // that case and rely on init to retry. Asking when we actually need it
-        // removes that race entirely.
+        // Read the country at ACQUIRE time, not at start-up. It comes from the SIM
+        // or from an AP, so at boot there may not be one yet -- barqd used to
+        // exit(1) in that case and rely on init to retry. Asking when we actually
+        // need it removes that race entirely.
         let country = country_code().ok_or_else(|| {
             format!(
-                "no regulatory country. The platform reports none, which usually means \
-                 Wi-Fi has never associated -- the country normally comes from the AP. \
-                 Channel {} is not permitted in the world domain, so the radio will \
-                 refuse to come up. Set one explicitly: setprop persist.barq.country <CC>",
+                "no regulatory country from any source: persist.barq.country, \
+                 persist.vendor.wifi.country, gsm.operator.iso-country, \
+                 gsm.sim.operator.iso-country, ro.boot.wificountrycode. With no SIM and \
+                 no Wi-Fi association there is nothing to read. Channel {} is not \
+                 permitted in the world domain, so the radio will refuse to come up. \
+                 Set one explicitly: setprop persist.barq.country <CC>",
                 CHANNELS[0]
             )
         })?;
@@ -192,10 +220,6 @@ impl Link {
         // fib rules keyed on fwmark, and gets no rule for an interface it does not
         // manage -- so the route above sat in table N, was never looked up, and every
         // lookup fell through to "32000: from all unreachable".
-        //
-        // This is what stood between a working AirDrop stack and a device that could
-        // never be reached: the peer's SYN arrived, our reply had nowhere to go, and
-        // it presented exactly as though nothing were listening on the port.
         match route::add_rule(IFACE) {
             Ok(()) => log::info!("rule: oif {IFACE} lookup {}", route::table_id(IFACE)),
             Err(e) => log::warn!(
@@ -212,10 +236,7 @@ impl Drop for Link {
     fn drop(&mut self) {
         // Take the rule out first, while the interface is still there. The routes
         // themselves go with the interface, but a fib rule does not: it is keyed by
-        // priority and would otherwise pile up one per acquire. add_rule already
-        // deletes before adding for exactly that reason -- this closes the same hole
-        // from the other end, so a device that is idle overnight is not carrying a
-        // stack of dead rules.
+        // priority and would otherwise pile up one per acquire.
         match route::remove_rule() {
             Ok(()) => log::info!("rule removed"),
             Err(e) => log::warn!("could not remove routing rule: {e}"),

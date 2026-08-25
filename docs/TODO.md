@@ -165,6 +165,17 @@ listing a device that will refuse.
 
 ## Open
 
+- **Channel 149 is hardcoded, and it is not legal everywhere.** `CHANNELS = &[149]`
+  (5745 MHz, U-NII-3). Permitted in Qatar, the US and much of Asia; largely **not**
+  permitted for Wi-Fi in the EU. The country is now read correctly and follows the
+  device, but in a region where 149 is barred the vendor library will refuse to bring
+  the radio up and Barq will fail closed with a correct country in the log -- which
+  will read as a different bug than it is.
+
+  Apple picks per region (2.4 GHz ch 6, or 5 GHz 44/149), so the fix is a channel
+  table keyed on the regulatory domain rather than a constant. Until then the honest
+  statement is: Barq works where channel 149 is permitted.
+
 - **Drop `android_logger` from the privileged half — before any production build.**
 
   `barqd`'s own header states the rule: *"every dependency is part of its threat
