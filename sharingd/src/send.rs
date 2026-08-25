@@ -19,7 +19,7 @@
 use crate::framed::FramedWriter;
 use crate::plist::{self, Value};
 use cpio_archive::odc::{OdcBuilder, OdcHeader};
-use log::{debug, info};
+use log::{debug, info, warn};
 use openssl::ssl::{SslConnector, SslMethod, SslStream, SslVerifyMode};
 use std::io::{self, Read, Write};
 use std::net::{Ipv6Addr, SocketAddrV6, TcpStream};
@@ -188,6 +188,7 @@ fn request<S: Write>(tls: &mut S, path: &str, body: &[u8], keep_alive: bool) -> 
         if keep_alive { "keep-alive" } else { "close" },
         body.len()
     );
+    debug!("-> {}", head.replace("\r\n", " | ").trim_end());
     tls.write_all(head.as_bytes())?;
     tls.write_all(body)?;
     tls.flush()
@@ -208,32 +209,118 @@ fn read_response<S: Read>(tls: &mut S) -> io::Result<(u16, Vec<u8>)> {
         }
     }
     let text = String::from_utf8_lossy(&head).into_owned();
+    // Log what the peer actually said. A status of 0 means nothing parseable came back
+    // at all, which is a different problem from a refusal and was being reported as one.
+    debug!("response head ({} bytes): {:?}", head.len(), text.replace("\r\n", " | "));
     let status = text
         .split_whitespace()
         .nth(1)
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(0);
-
-    let len = text
-        .lines()
-        .find_map(|l| {
-            let (k, v) = l.split_once(':')?;
-            k.trim().eq_ignore_ascii_case("content-length").then(|| v.trim())
-        })
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0)
-        .min(MAX);
-
-    let mut body = vec![0u8; len];
-    let mut got = 0;
-    while got < len {
-        match tls.read(&mut body[got..]) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => got += n,
-        }
+    if status == 0 {
+        warn!("no parseable status line from the peer");
     }
-    body.truncate(got);
+
+    // Apple replies CHUNKED, not with a Content-Length. Reading only Content-Length
+    // yields an empty body and a peer that looks like it said nothing -- which is
+    // exactly how "did not give a name" was produced by a peer answering 200 OK with
+    // its name in the body. The same mistake broke the receive side first.
+    let chunked = text.lines().any(|l| {
+        l.split_once(':')
+            .map(|(k, v)| {
+                k.trim().eq_ignore_ascii_case("transfer-encoding")
+                    && v.to_ascii_lowercase().contains("chunked")
+            })
+            .unwrap_or(false)
+    });
+
+    let body = if chunked {
+        read_chunked_body(tls, MAX)?
+    } else {
+        let len = text
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.trim().eq_ignore_ascii_case("content-length").then(|| v.trim())
+            })
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(MAX);
+        let mut buf = vec![0u8; len];
+        let mut got = 0;
+        while got < len {
+            match tls.read(&mut buf[got..]) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got += n,
+            }
+        }
+        buf.truncate(got);
+        buf
+    };
+    debug!("response body: {} bytes", body.len());
     Ok((status, body))
+}
+
+/// RFC 7230 chunked decoding for a response body, bounded.
+fn read_chunked_body<S: Read>(tls: &mut S, max: usize) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        let line = match read_crlf_line(tls) {
+            Some(l) => l,
+            None => break,
+        };
+        let size = match usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16) {
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        if size == 0 {
+            // Trailers, then done.
+            while let Some(l) = read_crlf_line(tls) {
+                if l.is_empty() {
+                    break;
+                }
+            }
+            break;
+        }
+        if out.len() + size > max {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "response body too large"));
+        }
+        let mut chunk = vec![0u8; size];
+        let mut got = 0;
+        while got < size {
+            match tls.read(&mut chunk[got..]) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got += n,
+            }
+        }
+        chunk.truncate(got);
+        let short = got < size;
+        out.extend_from_slice(&chunk);
+        if short {
+            break;
+        }
+        let _ = read_crlf_line(tls);   // CRLF after the chunk data
+    }
+    Ok(out)
+}
+
+fn read_crlf_line<S: Read>(tls: &mut S) -> Option<String> {
+    let mut buf = Vec::with_capacity(16);
+    let mut b = [0u8; 1];
+    while buf.len() < 256 {
+        match tls.read(&mut b) {
+            Ok(0) | Err(_) => return None,
+            Ok(_) => {}
+        }
+        if b[0] == b'\n' {
+            while buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+            return Some(String::from_utf8_lossy(&buf).into_owned());
+        }
+        buf.push(b[0]);
+    }
+    None
 }
 
 /// Wraps writes in HTTP chunked framing.
