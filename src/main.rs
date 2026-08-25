@@ -20,8 +20,18 @@ use std::time::Duration;
 
 const IFACE: &str = "mosey0";
 
-/// AWDL channel. 149 is what the vendor stack uses on this hardware; 5745 MHz.
-const CHANNELS: &[u8] = &[149];
+/// AWDL channels to try, in order of preference.
+///
+/// Not one constant, because one constant is wrong somewhere. 149 (5745 MHz,
+/// U-NII-3) is what the vendor stack uses here and what Apple prefers, but it is not
+/// permitted for Wi-Fi in much of the EU. 44 (5220 MHz, U-NII-2A) is the other 5 GHz
+/// channel Apple uses, and 6 (2.4 GHz) is the social channel every region allows.
+///
+/// The regulatory decision is NOT ours to compute: the vendor library is given the
+/// country and refuses a channel it may not use. So offer candidates and let it
+/// choose -- the one it accepts is by definition the one that is legal and supported
+/// here, which is a better answer than any table we could maintain.
+const CHANNEL_CANDIDATES: &[&[u8]] = &[&[149], &[44], &[6]];
 
 /// Serialised `StartMoseyConfig`: field 1 = is_dbs_supported, field 6 =
 /// rate_adaptation. These four bytes are what the vendor daemon itself passes.
@@ -159,6 +169,50 @@ fn wants_radio() -> bool {
     }
 }
 
+/// Which radio shape this device exposes.
+///
+/// The vendor library supports two, and they are not interchangeable:
+///
+///   Netlink   wants a wiphy named `wonder`, and creates `wonder0` from it
+///   Radiotap  rides a PRE-EXISTING `radiotap0` interface
+///
+/// Which one a device gives you is a vendor decision, not a setting. mustang
+/// (Pixel 10 Pro XL) presents the `wonder` wiphy; frankel (Pixel 10) presents
+/// `radiotap0` and no `wonder` wiphy at all, with `wonder.ko` loaded but its
+/// `physical_name` parameter empty. Hardcoding Netlink meant frankel failed with
+///
+///     Error starting mosey: init_driver
+///     Caused by: Could not find wiphy <wonder>
+///
+/// while the country, the policy and the channel were all correct -- which reads
+/// like a transport fault and is really a wrong-mode fault.
+///
+/// So look at what is actually there rather than assuming, and keep the other as a
+/// fallback: this is a closed library on vendor hardware, and the next device may
+/// present a third arrangement we have not seen.
+fn radio_modes() -> Vec<mosey::OpMode> {
+    // Asked of /sys/class/net, which this domain can already read, and NOT of
+    // /sys/class/ieee80211, which it cannot:
+    //
+    //     avc: denied { read } name="ieee80211" scontext=u:r:barqd:s0
+    //          tcontext=u:object_r:sysfs:s0 tclass=dir
+    //
+    // Granting that would mean read of generic sysfs for one hint that only decides
+    // which order to try two options in. The fallback already covers being wrong, so
+    // the cheaper signal is the better one -- a device presenting radiotap0 wants the
+    // Radiotap path, and anything else gets Netlink first.
+    let has_radiotap = std::path::Path::new("/sys/class/net/radiotap0").exists();
+    log::info!("radio survey: radiotap0={has_radiotap}");
+
+    // An ordering, not a decision. Both are always tried, because this is a hint and
+    // the vendor library is the authority.
+    if has_radiotap {
+        vec![mosey::OpMode::Radiotap, mosey::OpMode::Netlink]
+    } else {
+        vec![mosey::OpMode::Netlink, mosey::OpMode::Radiotap]
+    }
+}
+
 /// A live AWDL link: the vendor session, plus the routing that makes the
 /// interface usable from userspace.
 ///
@@ -178,30 +232,57 @@ impl Link {
         // exit(1) in that case and rely on init to retry. Asking when we actually
         // need it removes that race entirely.
         let country = country_code().ok_or_else(|| {
-            format!(
-                "no regulatory country from any source: persist.barq.country, \
-                 persist.vendor.wifi.country, gsm.operator.iso-country, \
-                 gsm.sim.operator.iso-country, ro.boot.wificountrycode. With no SIM and \
-                 no Wi-Fi association there is nothing to read. Channel {} is not \
-                 permitted in the world domain, so the radio will refuse to come up. \
-                 Set one explicitly: setprop persist.barq.country <CC>",
-                CHANNELS[0]
-            )
+            "no regulatory country from any source: persist.barq.country, \
+             persist.vendor.wifi.country, gsm.operator.iso-country, \
+             gsm.sim.operator.iso-country, ro.boot.wificountrycode. With no SIM and no \
+             Wi-Fi association there is nothing to read, and no channel is permitted in \
+             the world domain. Set one explicitly: setprop persist.barq.country <CC>"
+                .to_string()
         })?;
 
-        let session = mosey::Session::start(
-            CHANNELS,
-            &country,
-            MAX_MDNS,
-            mosey::OpMode::Netlink,
-            CONFIG,
-        )?;
+        // Try each shape until one takes. A failure here is the library telling us the
+        // device is not arranged the way we guessed, which is information, not an error
+        // worth giving up on.
+        // Try each shape and channel until one takes. A refusal here is the library
+        // telling us the device is not arranged the way we guessed, or that the
+        // regulatory domain forbids that channel -- both are information, not errors
+        // worth giving up on.
+        //
+        // Mode is the outer loop because it is a property of the hardware and does not
+        // change; channel is inner because it is a regulatory question the library
+        // answers differently in different countries.
+        let mut session = None;
+        let mut chosen = None;
+        let mut last = String::new();
+        'search: for mode in radio_modes() {
+            for channels in CHANNEL_CANDIDATES {
+                match mosey::Session::start(channels, &country, MAX_MDNS, mode, CONFIG) {
+                    Ok(s) => {
+                        session = Some(s);
+                        chosen = Some((mode, channels));
+                        break 'search;
+                    }
+                    Err(e) => {
+                        log::debug!("{mode:?} + channel {channels:?} refused: {e}");
+                        last = e;
+                    }
+                }
+            }
+        }
+
+        let session = session.ok_or_else(|| {
+            format!(
+                "no combination of radio mode and channel was accepted in {country}. \
+                 Tried {:?} against channels {CHANNEL_CANDIDATES:?}. Last error: {last}",
+                radio_modes()
+            )
+        })?;
+        let (mode, channels) = chosen.expect("set with session");
 
         log::info!(
-            "AWDL session up, handle={:p}, channel={}, country={}",
+            "AWDL session up, handle={:p}, mode={mode:?}, channel={}, country={country}",
             session.handle(),
-            CHANNELS[0],
-            country
+            channels[0],
         );
 
         // The interface appears a moment after the call returns.

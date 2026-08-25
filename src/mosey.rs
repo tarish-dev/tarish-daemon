@@ -43,12 +43,15 @@ type Start5 = unsafe extern "C" fn(
 
 type Stop = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
 
-/// Radio backend. Constant in every observed call, because it selects the whole
-/// backend rather than a mode within one.
-#[allow(dead_code)]
-#[derive(Clone, Copy)]
+/// Radio backend. Selects the whole backend, not a mode within one.
+///
+/// Which of these a device offers is a vendor decision. Both are real and both are
+/// in use across the Pixel 10 family, so neither is "the wrong one" -- an earlier
+/// comment here called Radiotap "not what we want", which was true of the phone in
+/// front of us at the time and false of the next one.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OpMode {
-    /// `Preexisting { iface_name: "radiotap0" }`, ArtIoctl. Not what we want.
+    /// `Preexisting { iface_name: "radiotap0" }`, ArtIoctl.
     Radiotap = 1,
     /// `AsNeeded { iface_name: "wonder0", wiphy_name: "wonder" }`, Netlink.
     Netlink = 2,
