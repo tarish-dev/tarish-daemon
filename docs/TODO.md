@@ -39,13 +39,38 @@ why. The device simply stops being able to send or receive, and the app looks br
    state that plainly — the same reasoning as the "AirDrop radio is not running"
    card: an app that silently does less is indistinguishable from one that is broken.
 
-**Measure before building any of it**
+**Measured: Google's own implementation fails the same way**
 
-- Does lockdown actually block Barq today? `barqsharingd` is a native daemon with its
-  own uid, and the lockdown rules are applied over uid ranges that may or may not
-  cover it. It is possible we are already exempt, in which case the honest fix is the
-  opposite one: make sure we are *not*, and then implement the above. **This is the
-  first question and it decides the whole shape of the work.**
+Tested by the operator on the previous build, with privileged GMS and Play Store
+installed: with *Block connections without VPN* on, **AirDrop through Google's own
+stack does not work either**. Same setting, same outcome.
+
+Three things follow, and they matter more than the original framing:
+
+1. **This is not a Barq deficiency.** The whole peer-to-peer class is blocked, and a
+   privileged, system-integrated, Google-signed implementation is blocked with it.
+   Anyone hitting this on stock Android hits it too.
+2. **There is no app-level workaround to copy.** Google, with a privileged app and
+   every platform integration available to them, did not solve it — so we should not
+   expect to find a supported API that quietly exempts us. If one existed, theirs
+   would use it.
+3. **The fix is therefore a platform change, and we can make one.** Barq ships inside
+   an OS we build. Google's app could not modify netd, the bpf rules or
+   ConnectivityService; we can. That is a real advantage and it cuts both ways: we
+   would be putting a hole in a security control *in our own OS*, for our own app,
+   which is exactly why the per-transfer human authorisation above is a requirement
+   and not a nicety. A platform exemption with no human in the loop is a backdoor
+   with our name on it.
+
+**Still to measure**
+
+- The test above used Google's stack, which runs as a privileged *app* uid.
+  `barqsharingd` is a native daemon with its own uid, and lockdown is applied over uid
+  ranges. It is possible the daemon is already outside them and only the app-side
+  traffic was blocked — that would change what needs building. **Answer this first.**
+- Which layer actually drops the packet: the bpf owner match, an iptables rule, or
+  routing. The narrowest place to make a scoped, temporary exception is whichever one
+  it is, and guessing wrong means weakening more than necessary.
 - Which mechanism actually opens the path, and can it be scoped to one socket rather
   than one uid? A per-uid exemption for the transfer window is much wider than it
   sounds — everything that daemon does is exempt for that period.
