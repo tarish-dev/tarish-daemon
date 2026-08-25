@@ -72,6 +72,32 @@ allow barqsharingd barq_data_file:file { create write open getattr };
 allow barqsharingd barq_data_file:dir { read open };
 allow barqsharingd barq_data_file:file read;
 
+# The client reads received files through a descriptor this daemon opens and passes
+# over binder. Handing over an already-open fd does NOT exempt the receiver from
+# needing permission on the file itself, which is what an earlier version of this
+# assumed: collection to Downloads/Barq failed silently and the transfer looked like it
+# arrived and vanished.
+allow system_app barq_data_file:file read;
+allow system_app barq_data_file:dir search;
+
+# And the reverse, for sending: the client passes descriptors for files it opened from
+# MediaStore, so this daemon has to be allowed to use an fd that mediaprovider owns.
+# Without it, sharing anything from the gallery fails before a byte is read.
+allow barqsharingd mediaprovider_app:fd use;
+
+# ...and read the file behind that descriptor. Files the user picks live on the FUSE
+# view of external storage, so they are labelled `fuse` rather than anything of ours.
+# Being allowed to USE a descriptor is not the same as being allowed to READ what it
+# points at, which is the distinction that broke sending: the daemon took the fd and
+# then got EACCES on the first byte.
+allow barqsharingd fuse:file { read getattr };
+
+# Removing an archive once it is extracted, and a received file once the client has
+# stored it. Writing into a directory does not imply being allowed to take things out
+# of it -- unlink needs remove_name on the directory as well as the file.
+allow barqsharingd barq_data_file:dir remove_name;
+allow barqsharingd barq_data_file:file unlink;
+
 # NOT granted, and each absence is deliberate:
 #   no capability of any kind
 #   no netlink_generic_socket   -- driving the radio is barqd's job

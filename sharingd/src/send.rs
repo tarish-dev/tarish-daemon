@@ -16,7 +16,8 @@
 //! certificate, and we do not validate theirs. Contacts-only needs an Apple validation
 //! record that cannot be generated.
 
-use crate::framed::FramedWriter;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use crate::plist::{self, Value};
 use cpio_archive::odc::{OdcBuilder, OdcHeader};
 use log::{debug, info, warn};
@@ -102,17 +103,28 @@ pub fn send(
         "POST /Upload HTTP/1.1\r\n\
          Connection: close\r\n\
          Content-Type: application/x-cpio\r\n\
+         Accept: */*\r\n\
+         User-Agent: AirDrop/1.0\r\n\
+         Accept-Language: en-us\r\n\
          TotalBytes: {total}\r\n\
          Transfer-Encoding: chunked\r\n\r\n"
     );
     tls.write_all(head.as_bytes())?;
 
+    // GZIP, not the block-framed container.
+    //
+    // The two directions are NOT symmetric, which cost a transfer to discover. Apple's
+    // sender wraps its cpio in a block-framed zlib container -- that is what arrives
+    // when a Mac sends to us, and what framed.rs decodes. But an Apple RECEIVER expects
+    // an ordinary gzip stream, which is what opendrop sends and what interoperates.
+    // Mirroring the receive format back at the peer made it reset the connection the
+    // moment bytes started arriving.
     let sent = {
         let chunker = ChunkedWriter { inner: &mut tls };
-        let mut framed = FramedWriter::new(chunker);
+        let mut gz = GzEncoder::new(chunker, Compression::default());
         let mut done = 0u64;
         {
-            let mut cpio = OdcBuilder::new(&mut framed);
+            let mut cpio = OdcBuilder::new(&mut gz);
             for mut item in items {
                 if cancelled() {
                     return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
@@ -132,7 +144,7 @@ pub fn send(
             cpio.finish()
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         }
-        let chunker = framed.finish()?;
+        let chunker = gz.finish()?;
         chunker.end()?;
         done
     };
@@ -180,10 +192,18 @@ fn connect(target: &Target) -> io::Result<SslStream<TcpStream>> {
 }
 
 fn request<S: Write>(tls: &mut S, path: &str, body: &[u8], keep_alive: bool) -> io::Result<()> {
+    // These headers are not decoration. A receiver that does not recognise the client
+    // closes the connection without answering at all -- which is exactly what happened:
+    // /Discover was tolerated, /Ask got zero bytes back and no status line. Apple's own
+    // requests to us carry User-Agent: AirDrop/1.0, and opendrop sends this same set.
     let head = format!(
         "POST {path} HTTP/1.1\r\n\
          Connection: {}\r\n\
          Content-Type: application/octet-stream\r\n\
+         Accept: */*\r\n\
+         User-Agent: AirDrop/1.0\r\n\
+         Accept-Language: en-us\r\n\
+         Accept-Encoding: br, gzip, deflate\r\n\
          Content-Length: {}\r\n\r\n",
         if keep_alive { "keep-alive" } else { "close" },
         body.len()
@@ -380,13 +400,16 @@ fn ask_body(items: &[Item], sender_name: &str, sender_model: &str) -> Vec<u8> {
                 // up by this, so "./name" in both places or it finds nothing.
                 ("FileBomPath".into(), Value::Str(format!("./{}", i.name))),
                 ("FileIsDirectory".into(), Value::Bool(false)),
-                ("ConvertedMediaFormats".into(), Value::Bool(false)),
+                ("ConvertMediaFormats".into(), Value::Bool(false)),
             ])
         })
         .collect();
 
     plist::encode(&Value::Dict(vec![
         ("SenderComputerName".into(), Value::Str(sender_name.to_string())),
+        // A per-session identifier. The reference implementations both send one; a
+        // receiver may key its accept/decline state off it.
+        ("SenderID".into(), Value::Str(sender_id())),
         ("SenderModelName".into(), Value::Str(sender_model.to_string())),
         // Apple's own sender identifies as Finder. A receiver may key behaviour off
         // this, and claiming to be something it has never seen invites a refusal.
@@ -394,6 +417,25 @@ fn ask_body(items: &[Item], sender_name: &str, sender_model: &str) -> Vec<u8> {
         ("ConvertMediaFormats".into(), Value::Bool(false)),
         ("Files".into(), Value::Array(files)),
     ]))
+}
+
+/// A random per-session sender identifier, in the shape Apple uses.
+///
+/// Generated once per process rather than per transfer, so a receiver that remembers a
+/// decision sees the same sender across a session.
+fn sender_id() -> String {
+    use std::sync::OnceLock;
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| {
+        let mut b = [0u8; 8];
+        // SAFETY: getrandom(2) filling a live buffer of the stated length.
+        let n = unsafe { libc::getrandom(b.as_mut_ptr() as *mut libc::c_void, b.len(), 0) };
+        if n != b.len() as isize {
+            return "0000000000000000".to_string();
+        }
+        b.iter().map(|x| format!("{x:02X}")).collect()
+    })
+    .clone()
 }
 
 /// Apple uniform type identifier for a filename.

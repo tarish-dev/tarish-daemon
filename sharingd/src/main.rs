@@ -58,6 +58,14 @@ type Callbacks = Arc<Mutex<Vec<Strong<dyn IBarqCallback>>>>;
 /// within half a second of being resolved -- which is exactly what happened: the log
 /// said the peer was "K-MBProM5" and getPeers kept returning the hex identifier.
 type PeerNames = Arc<Mutex<std::collections::HashMap<String, String>>>;
+/// Set when a client asks for peers, so discovery can query at once instead of waiting
+/// for its own timer.
+///
+/// Someone looking at a device list expects it to be live. Polling getPeers while the
+/// browser only queried every ten seconds and held peers for ninety meant the list
+/// showed devices that had already gone -- and a send to one of those fails with
+/// "connection refused", because nothing is listening at the cached address any more.
+type QueryNow = Arc<AtomicBool>;
 pub(crate) type Transfers = Arc<TransferState>;
 
 /// The one transfer that can be in flight, and whether the user has cancelled it.
@@ -147,6 +155,7 @@ struct BarqService {
     callbacks: Callbacks,
     transfers: Transfers,
     names: PeerNames,
+    query_now: QueryNow,
     /// Bumped by every setDiscoverable call so an older auto-off timer knows it has
     /// been superseded and must not switch visibility off under a newer request.
     visibility_generation: Arc<std::sync::atomic::AtomicU64>,
@@ -160,6 +169,7 @@ impl BarqService {
             callbacks: Arc::new(Mutex::new(Vec::new())),
             transfers: Arc::new(TransferState::default()),
             names: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            query_now: Arc::new(AtomicBool::new(false)),
             visibility_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             discoverable,
             peers,
@@ -233,6 +243,9 @@ impl IBarqService for BarqService {
     }
 
     fn getPeers(&self) -> BinderResult<Vec<BarqPeer>> {
+        // Someone is looking, so make discovery work rather than serving whatever the
+        // last ten-second sweep happened to leave behind.
+        self.query_now.store(true, Ordering::SeqCst);
         let peers = self.peers.lock().map_err(|_| Status::from(StatusCode::UNKNOWN_ERROR))?;
         let names = self.names.lock().map_err(|_| Status::from(StatusCode::UNKNOWN_ERROR))?;
         Ok(peers
@@ -294,6 +307,8 @@ impl IBarqService for BarqService {
 
         let id = self.transfers.begin();
         let transfers = self.transfers.clone();
+        let peers_for_send = self.peers.clone();
+        let peer_instance = peer_id.to_string();
         let callbacks = self.callbacks.clone();
         let name = device_name();
         let model = read_property("ro.product.model").unwrap_or_else(|| "Android".into());
@@ -331,6 +346,20 @@ impl IBarqService for BarqService {
                 }
                 Err(e) => {
                     log::warn!("send {id} failed: {e}");
+                    // A refused or reset connection means that peer is no longer there.
+                    // Forgetting it now is better than leaving the picker offering a
+                    // device that cannot be reached until the expiry timer notices.
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionRefused
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::TimedOut
+                    ) {
+                        if let Ok(mut table) = peers_for_send.lock() {
+                            table.retain(|p| p.instance != peer_instance);
+                        }
+                        log::info!("forgot unreachable peer {peer_instance}");
+                    }
                     announce(&|cb| cb.onTransferFinished(id, -1));
                 }
             }
@@ -410,7 +439,12 @@ fn probe_name(names: PeerNames, instance: String, target: send::Target) {
     });
 }
 
-fn start_discovery(peers: PeerTable, names: PeerNames, discoverable: Discoverable) {
+fn start_discovery(
+    peers: PeerTable,
+    names: PeerNames,
+    discoverable: Discoverable,
+    query_now: QueryNow,
+) {
     std::thread::spawn(move || {
         let mut browser = loop {
             match mdns::Browser::new(IFACE) {
@@ -479,14 +513,19 @@ fn start_discovery(peers: PeerTable, names: PeerNames, discoverable: Discoverabl
             }
 
             // Re-query periodically; peers answer, and new ones announce anyway.
-            if since_query >= Duration::from_secs(10) {
+            // Query on our own timer, or immediately when a client is looking.
+            let asked = query_now.swap(false, Ordering::SeqCst);
+            if asked || since_query >= Duration::from_secs(4) {
                 if let Err(e) = browser.query() {
                     log::warn!("query failed: {e}");
                 }
                 since_query = Duration::ZERO;
             }
             browser.poll();
-            browser.expire(Duration::from_secs(90));
+            // Ninety seconds was far too generous: an Apple peer rotates its instance
+            // and closes its window long before that, so the list kept offering devices
+            // that would refuse a connection.
+            browser.expire(Duration::from_secs(25));
 
             if let Ok(mut shared) = peers.lock() {
                 *shared = browser.peers();
@@ -563,7 +602,12 @@ fn main() {
     let discoverable: Discoverable = Arc::new(AtomicBool::new(initial));
 
     let service = BarqService::new(peers.clone(), discoverable.clone());
-    start_discovery(peers, service.names.clone(), discoverable.clone());
+    start_discovery(
+        peers,
+        service.names.clone(),
+        discoverable.clone(),
+        service.query_now.clone(),
+    );
     // The HTTP server refuses transfers while invisible and announces finished ones,
     // so it needs both the flag and the callback list the service owns.
     start_airdrop_server(

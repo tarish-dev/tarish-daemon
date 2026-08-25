@@ -133,11 +133,18 @@ const BLOCK: usize = 128 * 1024;
 /// `finish()` must be called: the last partial block is only written there, and dropping
 /// the writer without it produces an archive that is short by up to one block. Drop
 /// cannot do it because flushing can fail and a Drop impl has nowhere to report that.
+///
+/// **Currently unused.** Sending gzips instead: an Apple receiver expects a plain gzip
+/// stream, and only Apple's *sender* emits this container. Kept because it is the
+/// written record of a format neither reference documents, and because sending it is
+/// the obvious thing to try if a peer ever refuses gzip.
+#[allow(dead_code)]
 pub struct FramedWriter<W: Write> {
     inner: W,
     buf: Vec<u8>,
 }
 
+#[allow(dead_code)]
 impl<W: Write> FramedWriter<W> {
     pub fn new(inner: W) -> Self {
         Self { inner, buf: Vec::with_capacity(BLOCK) }
