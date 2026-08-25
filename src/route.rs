@@ -263,6 +263,9 @@ fn send_nl_flags(msg_ty: u16, body: &[u8], flags: u16) -> io::Result<()> {
     });
     msg.extend_from_slice(body);
 
+    // SAFETY: sockaddr_nl is plain old data and all-zeros is a valid value for it --
+    // that is how the netlink address is meant to be initialised before the family
+    // and pid fields are set below.
     let mut kernel: libc::sockaddr_nl = unsafe { mem::zeroed() };
     kernel.nl_family = libc::AF_NETLINK as u16;
 

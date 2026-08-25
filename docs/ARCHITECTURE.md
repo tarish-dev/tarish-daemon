@@ -26,6 +26,40 @@ process means a bug in a cpio header is a compromise of a privileged process.
 The privileged half is small, stable, and parses nothing from the network — it
 calls a vendor library and adds a route. Keeping it that way is the point.
 
+### How privileged is the privileged half, really
+
+Measured, not asserted (2026-08-25):
+
+| | `barqd` | `barqsharingd` |
+|---|---|---|
+| code | **509 lines** — 16% of the Rust here | 2,689 lines |
+| `CapEff` at runtime | `0x3000` — NET_ADMIN + NET_RAW, exactly two | `0x0000` — none |
+| declared dependencies | 3 | 8 |
+| network parsers | none | mDNS, TLS, HTTP, plist, cpio, gzip |
+
+`barqd` reads bytes from outside itself in exactly two places, and neither is
+network input: one property read into a 128-byte buffer against a 92-byte
+`PROP_VALUE_MAX`, and one netlink ACK into a fixed 512-byte buffer, length-checked
+before any indexing, from the kernel. Everything `unsafe` is at an FFI boundary.
+
+**The honest caveat: our code is not the risk in that process — `libmosey` is.**
+`barqd` holds no persistent sockets of its own; its netlink socket is opened and
+closed per call. Every socket in its fd table, plus `/dev/tun` and the epoll and
+eventfd, belongs to the vendor library — which parses hostile over-the-air AWDL
+frames inside a process holding `CAP_NET_ADMIN` and `CAP_NET_RAW`.
+
+That is structural rather than a regression. `libmosey` needs those capabilities
+to drive `wonder.ko`, so it cannot be moved to the unprivileged half without
+giving up AWDL entirely. What the split still buys is real — a cpio or TLS bug is
+not a privileged compromise — but "the privileged half is 500 auditable lines" is
+true and incomplete: those lines are auditable in an hour and the blob sharing
+their address space is not auditable at all. It is confined to `barqd`'s SELinux
+domain and reached through five FFI functions in one file, and that is the whole
+of the mitigation.
+
+Replacing `libmosey` with an open implementation is the only thing that changes
+this, which is why the FFI is isolated to `src/mosey.rs`.
+
 The client app talks to `barqsharingd`, not to `barqd`. The app never needs the
 privileged process, and `barqd` publishes no binder service — which is why its
 SELinux domain deliberately grants no `servicemanager` access.
@@ -60,23 +94,14 @@ we would parse ourselves regardless.
 calling it needs `unsafe`. That is confined to one module in `barqd`, which is
 also the only place a vendor ABI change can break us.
 
-## What this means for the current C daemon
+## Order of work — done
 
-`barqd` as it exists — C, working, holding AWDL at boot with zero denials — is a
-**prototype of the privileged half**. It stays until the Rust port replaces it,
-because a working daemon beats a planned one. It is not the shape we are keeping.
+1. ~~Port `barqd` to Rust.~~ Done. The C prototype is gone.
+2. ~~`barqsharingd`: its own user, SELinux domain, `IBarqService`.~~ Done.
+3. ~~mDNS on `mosey0`.~~ Done, including withdrawal.
+4. ~~The AirDrop protocol.~~ Done, both directions, with a consent prompt.
 
-## Order of work
-
-1. Port `barqd` to Rust. Small, self-contained, proves the Rust build and the
-   FFI boundary in the tree.
-2. `barqsharingd` skeleton: its own user, SELinux domain, and the `IBarqService`
-   implementation. No protocol yet.
-3. mDNS on `mosey0`, so peers become discoverable.
-4. The AirDrop protocol.
-
-Each step is testable on hardware before the next, which is how the transport got
-built and is the reason it works.
+Each step was tested on hardware before the next, which is why it works.
 
 
 ## The radio is held on demand

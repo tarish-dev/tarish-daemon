@@ -65,7 +65,11 @@ pub struct Session {
     _lib: *mut c_void,
 }
 
-// The handle is only ever touched from the thread that made it, or on shutdown.
+// SAFETY: the handle is only ever touched from the thread that made it, or on
+// shutdown. barqd creates, holds and drops a Session entirely on its main thread --
+// the acquire/release loop never moves one across threads -- so this impl is not
+// actually exercised today. It exists so a Session can be owned by a struct that
+// something else wants to move.
 unsafe impl Send for Session {}
 
 fn last_dlerror() -> String {

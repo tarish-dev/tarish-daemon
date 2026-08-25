@@ -165,6 +165,34 @@ listing a device that will refuse.
 
 ## Open
 
+- **Drop `android_logger` from the privileged half — before any production build.**
+
+  `barqd`'s own header states the rule: *"every dependency is part of its threat
+  model, and one property read does not justify one."* It then links a full regex
+  engine for log filtering. Confirmed in its runtime maps:
+
+  ```
+  libregex  libregex_automata  libregex_syntax  libaho_corasick  libmemchr  libenv_filter
+  ```
+
+  AOSP builds `libandroid_logger` with the `regex` feature and `libenv_filter`
+  baked in, and ships no regex-free variant, so this arrives whether or not it is
+  wanted. `barqd` never uses filter strings — it sets a tag and a max level — so
+  the whole engine is dead weight in the one process holding `CAP_NET_ADMIN` and
+  `CAP_NET_RAW`.
+
+  Fix is ~20 lines calling `__android_log_write` through libc, leaving `barqd`
+  linking only libc and the `log` facade. **Deliberately deferred:** convenient
+  logging is worth more than the dependency while the daemon is still being
+  developed, and swapping the logger mid-development trades a real debugging aid
+  for a theoretical gain. Do it when hardening for a release build, and re-check
+  the maps afterwards rather than assuming.
+
+- **Two `unsafe` sites without a `SAFETY:` tag** — `unsafe impl Send for Session`
+  (which has an untagged justification above it) and a `mem::zeroed()` on a
+  `sockaddr_nl`. Both benign; tagged now, noted here because the audit that finds
+  them should find zero next time.
+
 - **Offer sizes.** `onTransferOffered` reports `totalBytes = 0`. Apple's `/Ask` carries
   file names and UTIs but no sizes, so the prompt cannot say how big the transfer is
   without inventing a number. Worth checking whether `Items` carries one on some senders.
