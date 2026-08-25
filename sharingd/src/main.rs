@@ -51,6 +51,13 @@ type PeerTable = Arc<Mutex<Vec<mdns::Peer>>>;
 /// make the device vanish.
 type Discoverable = Arc<AtomicBool>;
 type Callbacks = Arc<Mutex<Vec<Strong<dyn IBarqCallback>>>>;
+/// Names learned from /Discover, keyed by mDNS instance.
+///
+/// Kept OUTSIDE the peer table on purpose. The browser owns its own map and republishes
+/// it over the shared table twice a second, so a name written into that table is wiped
+/// within half a second of being resolved -- which is exactly what happened: the log
+/// said the peer was "K-MBProM5" and getPeers kept returning the hex identifier.
+type PeerNames = Arc<Mutex<std::collections::HashMap<String, String>>>;
 pub(crate) type Transfers = Arc<TransferState>;
 
 /// The one transfer that can be in flight, and whether the user has cancelled it.
@@ -139,6 +146,7 @@ struct BarqService {
     // normal case, so nothing here may assume one exists.
     callbacks: Callbacks,
     transfers: Transfers,
+    names: PeerNames,
     /// Bumped by every setDiscoverable call so an older auto-off timer knows it has
     /// been superseded and must not switch visibility off under a newer request.
     visibility_generation: Arc<std::sync::atomic::AtomicU64>,
@@ -151,6 +159,7 @@ impl BarqService {
         Self {
             callbacks: Arc::new(Mutex::new(Vec::new())),
             transfers: Arc::new(TransferState::default()),
+            names: Arc::new(Mutex::new(std::collections::HashMap::new())),
             visibility_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             discoverable,
             peers,
@@ -225,6 +234,7 @@ impl IBarqService for BarqService {
 
     fn getPeers(&self) -> BinderResult<Vec<BarqPeer>> {
         let peers = self.peers.lock().map_err(|_| Status::from(StatusCode::UNKNOWN_ERROR))?;
+        let names = self.names.lock().map_err(|_| Status::from(StatusCode::UNKNOWN_ERROR))?;
         Ok(peers
             .iter()
             .map(|p| BarqPeer {
@@ -233,7 +243,10 @@ impl IBarqService for BarqService {
                 // TXT record carries only `flags`. The real name comes from asking the
                 // peer over /Discover, which happens in the background; until that
                 // answers, the identifier is what we honestly have.
-                name: p.name.clone().unwrap_or_else(|| p.short_id().to_string()),
+                name: names
+                    .get(&p.instance)
+                    .cloned()
+                    .unwrap_or_else(|| p.short_id().to_string()),
                 model: String::new(),
                 rssi: 0,
             })
@@ -384,14 +397,12 @@ impl IBarqService for BarqService {
 /// AirDrop carries no name in mDNS, so this is the only way to show a person something
 /// they recognise instead of twelve hex characters. Failures are expected and quiet: a
 /// peer that is not discoverable to us simply will not answer, which is not a fault.
-fn probe_name(peers: PeerTable, instance: String, target: send::Target) {
+fn probe_name(names: PeerNames, instance: String, target: send::Target) {
     std::thread::spawn(move || match send::discover(&target) {
         Ok(Some(name)) => {
             log::info!("peer {instance} is {name:?}");
-            if let Ok(mut table) = peers.lock() {
-                if let Some(p) = table.iter_mut().find(|p| p.instance == instance) {
-                    p.name = Some(name);
-                }
+            if let Ok(mut cache) = names.lock() {
+                cache.insert(instance, name);
             }
         }
         Ok(None) => log::debug!("peer {instance} did not give a name"),
@@ -399,7 +410,7 @@ fn probe_name(peers: PeerTable, instance: String, target: send::Target) {
     });
 }
 
-fn start_discovery(peers: PeerTable, discoverable: Discoverable) {
+fn start_discovery(peers: PeerTable, names: PeerNames, discoverable: Discoverable) {
     std::thread::spawn(move || {
         let mut browser = loop {
             match mdns::Browser::new(IFACE) {
@@ -430,7 +441,7 @@ fn start_discovery(peers: PeerTable, discoverable: Discoverable) {
             let mut to_probe = Vec::new();
             if let Ok(mut table) = peers.lock() {
                 for p in table.iter_mut() {
-                    if p.name.is_none() && p.port != 0 && !probed.contains(&p.instance) {
+                    if p.port != 0 && !probed.contains(&p.instance) {
                         if let Some(addr) = p.addr {
                             probed.insert(p.instance.clone());
                             to_probe.push((p.instance.clone(), addr, p.port));
@@ -440,7 +451,7 @@ fn start_discovery(peers: PeerTable, discoverable: Discoverable) {
             }
             for (instance, addr, port) in to_probe {
                 if let Ok(scope) = mdns::ifindex_of(IFACE) {
-                    probe_name(peers.clone(), instance, send::Target { addr, port, scope });
+                    probe_name(names.clone(), instance, send::Target { addr, port, scope });
                 }
             }
 
@@ -551,9 +562,8 @@ fn main() {
     }
     let discoverable: Discoverable = Arc::new(AtomicBool::new(initial));
 
-    start_discovery(peers.clone(), discoverable.clone());
-
-    let service = BarqService::new(peers, discoverable.clone());
+    let service = BarqService::new(peers.clone(), discoverable.clone());
+    start_discovery(peers, service.names.clone(), discoverable.clone());
     // The HTTP server refuses transfers while invisible and announces finished ones,
     // so it needs both the flag and the callback list the service owns.
     start_airdrop_server(

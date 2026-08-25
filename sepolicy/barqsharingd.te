@@ -63,8 +63,14 @@ type barq_data_file, file_type, data_file_type, core_data_file_type;
 allow barqsharingd barq_data_file:dir { search write add_name getattr };
 allow barqsharingd barq_data_file:file { create write open getattr };
 
-# Reading the directory to number the next archive.
-allow barqsharingd barq_data_file:dir read;
+# Listing the inbox, and reading an archive back to extract it.
+#
+# Both were missing and both were derived from real denials rather than guessed:
+# read_dir needs `open` on the directory as well as `read`, and the extractor reopens
+# the .cpio it just wrote. The symptom was a transfer that arrived and then never
+# completed -- the bytes landed, extraction failed silently, and nothing appeared.
+allow barqsharingd barq_data_file:dir { read open };
+allow barqsharingd barq_data_file:file read;
 
 # NOT granted, and each absence is deliberate:
 #   no capability of any kind
