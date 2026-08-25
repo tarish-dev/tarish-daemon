@@ -22,6 +22,7 @@ use std::mem;
 const NETLINK_ROUTE: i32 = 0;
 const RTM_NEWROUTE: u16 = 24;
 const RTM_NEWRULE: u16 = 32;
+const RTM_DELRULE: u16 = 33;
 
 const NLM_F_REQUEST: u16 = 0x01;
 const NLM_F_ACK: u16 = 0x04;
@@ -134,6 +135,23 @@ pub fn add_link_local(iface: &str) -> io::Result<()> {
 pub fn add_rule(iface: &str) -> io::Result<()> {
     let idx = index_of(iface)?;
 
+    // Clear our own old rules first.
+    //
+    // The table number IS the interface index, and the interface is recreated with a
+    // NEW index every time this daemon restarts. Adding without deleting leaves a rule
+    // pointing at a table whose interface is gone -- and because both rules sit at the
+    // same priority, the stale one matches FIRST and sends everything into an empty
+    // table. The symptom is total: the link looks up, the address is there, and not a
+    // single packet reaches a peer.
+    //
+    // Deleting by priority rather than by table clears whatever we left behind
+    // previously, without needing to know what index it had.
+    for _ in 0..8 {
+        if del_rule().is_err() {
+            break;   // nothing left at our priority
+        }
+    }
+
     // fib_rule_hdr has the same layout as rtmsg: the fields we call protocol,
     // scope and ty are res1, res2 and action there. Reusing the struct keeps one
     // definition rather than two identical ones.
@@ -162,6 +180,24 @@ pub fn add_rule(iface: &str) -> io::Result<()> {
     send_nl(RTM_NEWRULE, &body)
 }
 
+/// Delete one rule at our priority. Errors once none remain, which is the stop signal.
+fn del_rule() -> io::Result<()> {
+    let rt = RtMsg {
+        family: libc::AF_INET6 as u8,
+        table: RT_TABLE_UNSPEC,
+        ty: FR_ACT_TO_TBL,
+        ..Default::default()
+    };
+    let mut body = Vec::with_capacity(64);
+    // SAFETY: RtMsg is repr(C) and plain old data.
+    body.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(&rt as *const RtMsg as *const u8, mem::size_of::<RtMsg>())
+    });
+    body.resize(align4(body.len()), 0);
+    put_attr(&mut body, FRA_PRIORITY, &RULE_PRIORITY.to_ne_bytes());
+    send_nl_flags(RTM_DELRULE, &body, NLM_F_REQUEST | NLM_F_ACK)
+}
+
 fn index_of(iface: &str) -> io::Result<u32> {
     let cname = CString::new(iface).map_err(|_| io::Error::other("bad interface name"))?;
     // SAFETY: cname is a valid NUL-terminated string.
@@ -174,6 +210,11 @@ fn index_of(iface: &str) -> io::Result<u32> {
 
 /// Send one netlink request and interpret the ack.
 fn send_nl(msg_ty: u16, body: &[u8]) -> io::Result<()> {
+    send_nl_flags(msg_ty, body, NLM_F_REQUEST | NLM_F_CREATE | NLM_F_EXCL | NLM_F_ACK)
+}
+
+/// Same transport, explicit flags: a delete must not carry CREATE|EXCL.
+fn send_nl_flags(msg_ty: u16, body: &[u8], flags: u16) -> io::Result<()> {
     // SAFETY: plain socket(2) with constant arguments.
     let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_DGRAM, NETLINK_ROUTE) };
     if fd < 0 {
@@ -191,7 +232,7 @@ fn send_nl(msg_ty: u16, body: &[u8]) -> io::Result<()> {
     let hdr = NlMsgHdr {
         len: (mem::size_of::<NlMsgHdr>() + body.len()) as u32,
         ty: msg_ty,
-        flags: NLM_F_REQUEST | NLM_F_CREATE | NLM_F_EXCL | NLM_F_ACK,
+        flags,
         seq: 1,
         pid: 0,
     };

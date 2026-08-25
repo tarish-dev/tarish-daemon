@@ -51,12 +51,17 @@ type PeerTable = Arc<Mutex<Vec<mdns::Peer>>>;
 /// make the device vanish.
 type Discoverable = Arc<AtomicBool>;
 type Callbacks = Arc<Mutex<Vec<Strong<dyn IBarqCallback>>>>;
-/// Names learned from /Discover, keyed by mDNS instance.
+/// Names learned from /Discover, keyed by the peer's LINK-LOCAL ADDRESS.
 ///
-/// Kept OUTSIDE the peer table on purpose. The browser owns its own map and republishes
-/// it over the shared table twice a second, so a name written into that table is wiped
-/// within half a second of being resolved -- which is exactly what happened: the log
-/// said the peer was "K-MBProM5" and getPeers kept returning the hex identifier.
+/// Kept outside the peer table because the browser republishes that table twice a
+/// second and would wipe anything written into it.
+///
+/// Keyed by address rather than mDNS instance because **Apple rotates its instance
+/// name**. Keyed by instance, every rotation threw the name away: the peer briefly had
+/// no name, the client filters unnamed peers, and the device vanished from the list and
+/// came back a second later. Rotation also leaves the old and new instances both
+/// present for a moment, which is how the same laptop appeared twice. The address
+/// survives rotation, so both symptoms go with it.
 type PeerNames = Arc<Mutex<std::collections::HashMap<String, String>>>;
 /// Set when a client asks for peers, so discovery can query at once instead of waiting
 /// for its own timer.
@@ -248,17 +253,41 @@ impl IBarqService for BarqService {
         self.query_now.store(true, Ordering::SeqCst);
         let peers = self.peers.lock().map_err(|_| Status::from(StatusCode::UNKNOWN_ERROR))?;
         let names = self.names.lock().map_err(|_| Status::from(StatusCode::UNKNOWN_ERROR))?;
-        Ok(peers
-            .iter()
+        // One entry per DEVICE, not per mDNS instance.
+        //
+        // Apple rotates its instance name, and for a few seconds after a rotation both
+        // the old and the new instance are live -- which is how the same laptop showed
+        // up twice. Collapsing on the resolved name and keeping the most recently seen
+        // instance gives one row per device, and the newest instance is the one whose
+        // address and port are still good.
+        let mut newest: std::collections::HashMap<String, &mdns::Peer> =
+            std::collections::HashMap::new();
+        for p in peers.iter() {
+            let key = p
+                .addr
+                .and_then(|a| names.get(&a.to_string()).cloned())
+                .unwrap_or_else(|| p.instance.clone());
+            newest
+                .entry(key)
+                .and_modify(|kept| {
+                    if p.last_seen > kept.last_seen {
+                        *kept = p;
+                    }
+                })
+                .or_insert(p);
+        }
+
+        Ok(newest
+            .values()
             .map(|p| BarqPeer {
                 id: p.instance.clone(),
                 // Apple advertises a 12-hex-character identifier, never a name -- its
                 // TXT record carries only `flags`. The real name comes from asking the
                 // peer over /Discover, which happens in the background; until that
                 // answers, the identifier is what we honestly have.
-                name: names
-                    .get(&p.instance)
-                    .cloned()
+                name: p
+                    .addr
+                    .and_then(|a| names.get(&a.to_string()).cloned())
                     .unwrap_or_else(|| p.short_id().to_string()),
                 model: String::new(),
                 rssi: 0,
@@ -427,11 +456,12 @@ impl IBarqService for BarqService {
 /// they recognise instead of twelve hex characters. Failures are expected and quiet: a
 /// peer that is not discoverable to us simply will not answer, which is not a fault.
 fn probe_name(names: PeerNames, instance: String, target: send::Target) {
+    let key = target.addr.to_string();
     std::thread::spawn(move || match send::discover(&target) {
         Ok(Some(name)) => {
-            log::info!("peer {instance} is {name:?}");
+            log::info!("peer {instance} at {key} is {name:?}");
             if let Ok(mut cache) = names.lock() {
-                cache.insert(instance, name);
+                cache.insert(key, name);
             }
         }
         Ok(None) => log::debug!("peer {instance} did not give a name"),
@@ -522,10 +552,12 @@ fn start_discovery(
                 since_query = Duration::ZERO;
             }
             browser.poll();
-            // Ninety seconds was far too generous: an Apple peer rotates its instance
-            // and closes its window long before that, so the list kept offering devices
-            // that would refuse a connection.
-            browser.expire(Duration::from_secs(25));
+            // Long enough to ride out a rotation and a missed announcement, short
+            // enough that a device which has gone away stops being offered. Ninety
+            // seconds was far too generous and left the list advertising peers that
+            // would refuse a connection; twenty-five was tight enough that an ordinary
+            // gap between announcements looked like the device had left.
+            browser.expire(Duration::from_secs(45));
 
             if let Ok(mut shared) = peers.lock() {
                 *shared = browser.peers();
