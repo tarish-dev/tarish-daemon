@@ -370,6 +370,21 @@ impl BarqService {
     fn resolve(&self, peer_id: &str) -> Option<send::Target> {
         let peers = self.peers.lock().ok()?;
         let peer = peers.iter().find(|p| p.short_id() == peer_id || p.instance == peer_id)?;
+
+        // Never resolve to ourselves.
+        //
+        // The third and last of three independent guards, and the one that matches the
+        // symptom exactly: this device discovered itself, and SENDING is what turned
+        // that into a prompt asking the person to accept a file from themselves. The
+        // browser should never have offered it and the server would now refuse it, but
+        // this is the step that actually dials, so it checks too.
+        if let Some(a) = peer.addr {
+            if mdns::link_local_of(IFACE) == Some(a) {
+                log::warn!("refusing to send to our own address {a} — ignoring peer {peer_id}");
+                return None;
+            }
+        }
+
         Some(send::Target {
             addr: peer.addr?,
             port: if peer.port != 0 { peer.port } else { return None },

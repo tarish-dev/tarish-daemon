@@ -159,6 +159,42 @@ impl Browser {
         self.announce()
     }
 
+    /// Is this address one of ours?
+    ///
+    /// THE ONLY SELF-TEST THAT DOES NOT DRIFT. The instance name is derived from the
+    /// interface MAC and snapshotted when the Browser is built -- and since the radio
+    /// became on-demand, mosey0 is destroyed and recreated with a NEW MAC every time
+    /// it is acquired. So a name-based check is comparing against whatever the MAC
+    /// happened to be at construction, and anything of ours that arrives from either
+    /// side of that boundary sails past it.
+    ///
+    /// An address is checked against /proc/net/if_inet6 at the moment of the question,
+    /// so it cannot be stale. If a record points at an address that is currently ours,
+    /// it is us, whatever it calls itself.
+    ///
+    /// The symptom when this is missed: the device lists itself, and tapping it makes
+    /// the phone open an AirDrop connection to its own link-local address and prompt
+    /// the person to accept a file from themselves.
+    /// Is this service instance ours, by either the name we were built with or the
+    /// one the interface would give us right now?
+    ///
+    /// Both, because the two disagree exactly when it matters. `self.instance` is
+    /// fixed at construction; the second is recomputed from the interface's current
+    /// MAC. Across a radio release and re-acquire the MAC changes, so an announcement
+    /// we made on one side of that boundary does not match the name we hold on the
+    /// other.
+    fn is_self_instance(&self, instance: &str) -> bool {
+        if instance == self.full_instance() {
+            return true;
+        }
+        let now = format!("{}.{}", instance_name(&self.iface), AIRDROP_SERVICE);
+        instance == now
+    }
+
+    fn is_self_addr(&self, a: Ipv6Addr) -> bool {
+        self.our_addr() == Some(a)
+    }
+
     fn our_addr(&self) -> Option<Ipv6Addr> {
         link_local_of(&self.iface)
     }
@@ -347,8 +383,10 @@ impl Browser {
                         // Our own announcement comes back to us: the multicast
                         // socket loops sends back by default, and we are joined
                         // to the group we send to. Listing ourselves as a peer
-                        // would put this device in its own share sheet.
-                        if instance == self.full_instance() {
+                        // would put this device in its own share sheet -- and it
+                        // did, on a device whose radio backend echoes more of what
+                        // we transmit than the one this was written against.
+                        if self.is_self_instance(&instance) {
                             continue;
                         }
                         let e = self.peers.entry(instance.clone()).or_insert_with(|| {
@@ -381,6 +419,16 @@ impl Browser {
                     let mut o = [0u8; 16];
                     o.copy_from_slice(&rec.rdata);
                     let addr = Ipv6Addr::from(o);
+
+                    // Ours. Drop whatever entry has been collecting under that host
+                    // rather than merely declining to fill in the address -- an entry
+                    // with a name and a port and no address is still offered to the
+                    // client, and is still us.
+                    if self.is_self_addr(addr) {
+                        self.peers.retain(|_, p| p.host != rec.name);
+                        continue;
+                    }
+
                     // The AAAA name is the host, not the instance, so match on it.
                     for p in self.peers.values_mut() {
                         if !p.host.is_empty() && p.host == rec.name {
@@ -408,7 +456,18 @@ impl Browser {
     }
 
     pub fn peers(&self) -> Vec<Peer> {
-        self.peers.values().cloned().collect()
+        // Filtered again here, not only where records are absorbed. Everything above
+        // is about catching a record as it arrives; this is about what leaves, and it
+        // holds even if some future path adds an entry without going through absorb.
+        // Cheap: one /proc read per call against a handful of peers.
+        // Read our address ONCE, not once per peer: is_self_addr goes to
+        // /proc/net/if_inet6 every call, and this runs on the discovery loop.
+        let me = self.our_addr();
+        self.peers
+            .values()
+            .filter(|p| p.addr.is_none() || p.addr != me)
+            .cloned()
+            .collect()
     }
 }
 

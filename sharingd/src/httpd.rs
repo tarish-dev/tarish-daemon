@@ -227,6 +227,25 @@ impl Httpd {
 
     /// Everything that happens on one accepted connection.
     fn serve_one(&self, stream: TcpStream) {
+        // REFUSE OURSELVES, at the door.
+        //
+        // Everything that stops this device listing itself as a peer lives in the mDNS
+        // browser, and that is the right place for it -- but it is one place, and it
+        // has already been wrong once: a phone discovered itself, connected to its own
+        // link-local address, and prompted the person to accept a file from
+        // themselves.
+        //
+        // This costs one comparison against the address we are bound to and does not
+        // care how the connection came to be attempted. Discovery deciding correctly
+        // and the server refusing anyway are two independent answers to the same
+        // question, which is what you want for the one that ends in a prompt.
+        if let Ok(std::net::SocketAddr::V6(a)) = stream.peer_addr() {
+            if *a.ip() == self.addr {
+                debug!("refused a connection from our own address {}", self.addr);
+                return;
+            }
+        }
+
         let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
         let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
         let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
