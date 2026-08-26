@@ -49,7 +49,33 @@ notifications ........ 0
 | send to a Mac, gzip payload, decline reported | working |
 | per-transfer accept/decline prompt | working |
 | radio held only while something wants it | working |
+| AWDL + Wi-Fi at the same time | **chip-dependent** — see below |
 | contacts-only AirDrop | **not implemented, not planned** — it needs a real Apple contact certificate, which expires. Everyone-mode only. |
+
+### AWDL and Wi-Fi share one radio
+
+Barq puts AWDL in the **opposite band** from the Wi-Fi association: 2.4 GHz when Wi-Fi
+is on 5 GHz and vice versa. The frequency comes from the client through `setActive`,
+because both daemons are native and neither can see the Wi-Fi state.
+
+That is sufficient on **BCM4390** (Pixel 10 Pro XL), where `wondertap` exists,
+`wonder.ko` binds, and AWDL runs on its own wiphy. Verified with both live for 90
+seconds continuously.
+
+It is **not** sufficient on **BCM4383** (Pixel 10), which has no `wondertap`. Barq
+falls back to driving `radiotap0`, a monitor interface that takes the physical radio
+with it whatever channel is requested — AWDL works, discovery and transfers work, and
+Wi-Fi drops and does not return until the device reboots.
+
+Check the chip, not the model. Every Pixel 10 image ships both drivers:
+
+```bash
+adb shell 'lsmod | grep bcmdhd'        # 4390 = concurrent, 4383 = exclusive
+adb shell 'ls /sys/class/ieee80211/'   # a `wonder` wiphy is the real test
+```
+
+Whether this is inherent to the chip or an artefact of hardcoding
+`is_dbs_supported=true` is the open question — see docs/TODO.md.
 
 ### The radio is held on demand
 

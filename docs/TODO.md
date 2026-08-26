@@ -9,6 +9,49 @@ did not exist, and the live work was two hundred lines down.
 
 ## Open
 
+### AWDL and Wi-Fi cannot run together on BCM4383, and the fallback hides it
+
+**Second priority, after VPN lockdown.**
+
+The coexistence work landed and is verified on BCM**4390** (mustang): AWDL goes in the
+opposite band from the Wi-Fi association and both run indefinitely. On BCM**4383**
+(frankel) the same code picks the right band and Wi-Fi dies anyway, does not recover
+when AWDL stops, survives a Wi-Fi toggle, and needs a reboot. Full measurements in the
+integrator's BUILD-NOTES 40.
+
+The difference is `wondertap`. 4390 exposes it, so `wonder.ko` binds and the Netlink
+path drives a real `wonder` wiphy. 4383 does not, so barqd falls back to driving
+`radiotap0` — a monitor interface, which takes the physical radio with it whatever
+channel is requested.
+
+**Is `is_dbs_supported` a lie on 4383?** We hardcode it true for every device:
+
+```rust
+const CFG_DBS_SUPPORTED: [u8; 2] = [0x08, 0x01];
+```
+
+If that chip cannot do dual-band simultaneous, the library believes it can hold both,
+does not time-slice, and stands on the STA — exactly what is observed. One byte tests
+it (`08 01` -> `08 00`). **Run this first**; if it is the answer, the flag should be
+derived from the chip rather than assumed, the same way the STA frequency now is.
+
+**The fallback should not fail this way.** It exists so a device without a `wonder`
+wiphy still works, and it does — discovery and transfers are fine on frankel. But
+costing the user their network until they reboot is not graceful degradation. Options,
+in order of preference:
+
+  1. If the DBS theory holds, fix the config and keep the fallback.
+  2. Otherwise refuse the radiotap path **while Wi-Fi is associated**, and say so in
+     the app — the same treatment as "AirDrop radio is not running".
+  3. Only as a last resort, refuse radiotap entirely, which costs 4383 devices AWDL
+     altogether.
+
+**Testing this needs the override properties to work on a user build.** They are
+gated behind properties a shell cannot set there, which is why the one-byte test has
+not been run. Gate the overrides on `ro.debuggable` and it becomes seconds instead of
+a signed build per hypothesis — that plumbing already paid for itself once, finding
+the channel answer in two minutes rather than three build cycles.
+
 ### Always-on VPN lockdown breaks peer-to-peer, and should not just fail silently
 
 **Priority: first.** Operator requirement.
