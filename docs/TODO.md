@@ -9,7 +9,7 @@ did not exist, and the live work was two hundred lines down.
 
 ## Open
 
-### BLOCKED: barqsharingd cannot send on wlan0 — it runs as `nobody`
+### barqsharingd cannot send on wlan0 as `nobody` — the uid is the variable, PROVEN
 
 Quick Share LAN discovery is written and compiles; the socket binds, joins
 224.0.0.251 and receives. **Every send returns EPERM.**
@@ -46,9 +46,33 @@ Options, and none is obviously right:
    requests a network the uid must already be permitted on -- if the latter, it
    changes nothing.
 
-**Measure option 3 first**: it is cheap and, if it works, costs nothing
-architecturally. If it does not, the real choice is between 1 and 2, and 2 is more
-consistent with everything else here.
+**Measured, and the uid is the cause.** Changed only `user nobody` -> `user system`
+in the .rc on device, nothing else, rebooted:
+
+    as nobody (9999)  quickshare: query failed (Operation not permitted) — every time
+    as system (1000)  quickshare: browsing on wlan0 — sends, no error
+
+So no capability is needed and no socket option helps. It is purely which uid the
+process runs as.
+
+**And the framing above was wrong.** Option 1 was described as "directly weakens the
+thing the split exists for". It does not. Bada does exactly this as an ORDINARY
+ANDROID APP -- app uid, INTERNET permission, no privilege of any kind. A
+network-capable uid is the *normal* state; `nobody` is an unusually restricted one
+that happens to break managed-network access. The split exists to keep CAP_NET_ADMIN
+and CAP_NET_RAW out of the process that parses hostile input, and a uid that can open
+a socket on wlan0 grants neither.
+
+`system` (1000) is not the answer either -- it is far more powerful than needed and
+was used here only because it was a one-line diagnostic. What this wants is a
+**dedicated AID** with group `inet`: no capabilities, no system privileges, just a
+uid Android will route for. That is what an app gets, and it is all this needs.
+
+Remaining work: define the AID (system_ext can use an OEM AID range), update
+barqsharingd.rc, and move the /data/misc/barq ownership in the same change -- the
+inbox is 0700 nobody today and must follow the uid or the daemon loses its own
+storage. That last part is the easy thing to forget and it fails silently at the
+first transfer, not at boot.
 
 ### AWDL and Wi-Fi cannot run together on BCM4383, and the fallback hides it
 
