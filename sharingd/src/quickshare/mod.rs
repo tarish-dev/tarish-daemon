@@ -32,6 +32,7 @@
 // the list shrinks visibly as discovery lands.
 #![allow(dead_code)]
 
+pub mod discovery;
 pub mod endpoint;
 
 /// One line describing what this device would advertise as a Quick Share endpoint.
@@ -98,7 +99,7 @@ pub fn instance_name(endpoint_id: &[u8; ENDPOINT_ID_LEN]) -> String {
 /// that was not built for this service is not an id at all.
 pub fn endpoint_id_from_instance(instance: &str) -> Option<[u8; ENDPOINT_ID_LEN]> {
     let label = instance.split('.').next()?;
-    let raw = base64url_decode(label)?;
+    let raw = base64_any_decode(label.as_bytes())?;
     if raw.len() < 1 + ENDPOINT_ID_LEN + 3 || raw[0] != PCP {
         return None;
     }
@@ -140,11 +141,11 @@ fn base64url_encode(input: &[u8]) -> String {
     out
 }
 
-fn base64url_decode(input: &str) -> Option<Vec<u8>> {
+pub fn base64_any_decode(input: &[u8]) -> Option<Vec<u8>> {
     let mut acc: u32 = 0;
     let mut bits = 0u32;
     let mut out = Vec::with_capacity(input.len() * 3 / 4);
-    for c in input.bytes() {
+    for &c in input {
         // Accept the standard alphabet too: some responders emit `+` and `/`.
         let v = match c {
             b'A'..=b'Z' => c - b'A',

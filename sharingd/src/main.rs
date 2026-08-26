@@ -952,6 +952,51 @@ fn start_airdrop_server(discoverable: Discoverable, callbacks: Callbacks, transf
     });
 }
 
+/// Browse for Quick Share peers on the Wi-Fi LAN.
+///
+/// Its own thread and its own socket, separate from the AWDL discovery loop: a
+/// different interface and a different protocol, and a fault in one must not take the
+/// other with it. Retries rather than giving up -- wlan0 may have no address yet at
+/// boot, and a daemon that is running and permanently blind is worse than one that
+/// keeps trying.
+fn start_quickshare_discovery() {
+    std::thread::spawn(|| {
+        const IFACE: &str = "wlan0";
+        loop {
+            let mut browser = match quickshare::discovery::QsBrowser::new(IFACE) {
+                Ok(b) => {
+                    log::info!("quickshare: browsing on {IFACE}");
+                    b
+                }
+                Err(e) => {
+                    log::debug!("quickshare: {IFACE} not ready ({e})");
+                    std::thread::sleep(Duration::from_secs(10));
+                    continue;
+                }
+            };
+            let mut since_query = Duration::from_secs(99);
+            loop {
+                if since_query >= Duration::from_secs(10) {
+                    if let Err(e) = browser.query() {
+                        // Back off before rebinding. Breaking straight out span the
+                        // outer loop at full speed and filled the log with the same
+                        // line at the same millisecond, which hides whatever the real
+                        // cause is behind thousands of copies of the symptom.
+                        log::warn!("quickshare: query failed ({e}) — rebinding in 10s");
+                        std::thread::sleep(Duration::from_secs(10));
+                        break;
+                    }
+                    since_query = Duration::ZERO;
+                }
+                browser.poll();
+                browser.expire(Duration::from_secs(60));
+                std::thread::sleep(Duration::from_millis(500));
+                since_query += Duration::from_millis(500);
+            }
+        }
+    });
+}
+
 fn main() {
     android_logger::init_once(
         android_logger::Config::default()
@@ -1006,6 +1051,7 @@ fn main() {
     // Quick Share identity, logged once. Discovery is not wired yet; this proves the
     // derivation on real hardware rather than only in reasoning.
     log::info!("quickshare: {}", quickshare::describe_identity(&device_name()));
+    start_quickshare_discovery();
 
     // One thread is plenty for a skeleton; the transfer work will want more.
     binder::ProcessState::join_thread_pool();

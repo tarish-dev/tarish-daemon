@@ -9,6 +9,47 @@ did not exist, and the live work was two hundred lines down.
 
 ## Open
 
+### BLOCKED: barqsharingd cannot send on wlan0 — it runs as `nobody`
+
+Quick Share LAN discovery is written and compiles; the socket binds, joins
+224.0.0.251 and receives. **Every send returns EPERM.**
+
+Three explanations tested and eliminated, on mustang:
+
+| tried | result |
+|---|---|
+| routing — no `oif`, falls to `32000: from all unreachable` | `ip route get 224.0.0.251 uid 9999` resolves to wlan0. Also with `mark 0` and with the wlan0 netid `0x65`. Not routing. |
+| `IP_MULTICAST_IF` to name the egress interface (rule `17000: oif wlan0` has no uid range, needs no capability) | still EPERM |
+| separate send socket bound to wlan0's own IPv4 rather than INADDR_ANY | still EPERM |
+
+What is left is **per-uid network access**. barqsharingd runs as uid 9999
+(`nobody`) with group 3003 (`inet`) and no capabilities. It sends fine on `mosey0`
+— because that interface is outside Android's network management: barqd creates it
+and installs its own fib rule, so nothing enforces per-uid access there. `wlan0` is
+a managed network and is enforced.
+
+So this is not a socket problem and no socket option will fix it. It is a question
+about **what uid the unprivileged half runs as**, which is an architectural decision
+and deliberately not one to make while chasing a bug.
+
+Options, and none is obviously right:
+
+1. **Run barqsharingd as a uid permitted on managed networks** (`system`, or a
+   dedicated AID). Simplest, and directly weakens the thing the split exists for:
+   this process parses hostile input from the network and holds nothing.
+2. **Have barqd open and mark the socket, and pass the fd over binder.** Keeps the
+   privilege split intact and reuses a mechanism already in the design — file
+   transfer already passes fds. Costs a new AIDL call and makes the privileged half
+   responsible for one more thing.
+3. **`android_setsocknetwork()` from libnetd_client**, which is the supported way to
+   bind a socket to a network. Needs checking whether it grants permission or merely
+   requests a network the uid must already be permitted on -- if the latter, it
+   changes nothing.
+
+**Measure option 3 first**: it is cheap and, if it works, costs nothing
+architecturally. If it does not, the real choice is between 1 and 2, and 2 is more
+consistent with everything else here.
+
 ### AWDL and Wi-Fi cannot run together on BCM4383, and the fallback hides it
 
 **Second priority, after VPN lockdown.**
