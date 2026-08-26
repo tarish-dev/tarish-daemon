@@ -20,6 +20,7 @@
 mod dns;
 mod framed;
 mod send;
+mod quickshare;
 mod httpd;
 mod mdns;
 mod plist;
@@ -1002,6 +1003,9 @@ fn main() {
         std::process::exit(1);
     }
     log::info!("published {SERVICE_NAME}");
+    // Quick Share identity, logged once. Discovery is not wired yet; this proves the
+    // derivation on real hardware rather than only in reasoning.
+    log::info!("quickshare: {}", quickshare::describe_identity(&device_name()));
 
     // One thread is plenty for a skeleton; the transfer work will want more.
     binder::ProcessState::join_thread_pool();
