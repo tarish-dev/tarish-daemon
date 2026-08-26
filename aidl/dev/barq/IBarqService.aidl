@@ -49,8 +49,17 @@ interface IBarqService {
      * -- an idle AWDL session is not free, it runs vendor threads -- but sharing
      * keeps working, which is the right way round for a client that has not been
      * updated.
+     *
+     * staFrequencyMhz is the frequency the device's Wi-Fi is currently associated
+     * on, or 0 if it is not associated. It is passed HERE rather than through its
+     * own call so there is no window where the daemon knows it should bring the
+     * radio up but not yet which band is safe.
+     *
+     * The client is the only component that can see this. Both daemons are native
+     * and have no framework access, and nothing exposes the association frequency
+     * as a file either daemon can read.
      */
-    void setActive(boolean active);
+    void setActive(boolean active, int staFrequencyMhz);
 
     /** Peers currently known. Fresh as of the last discovery round. */
     BarqPeer[] getPeers();

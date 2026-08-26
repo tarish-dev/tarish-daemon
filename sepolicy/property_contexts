@@ -4,4 +4,7 @@
 # property read is a shared-memory load of one boolean -- no parser, no IPC surface
 # in the privileged process. See barqd's WANT_PROP comment for why this is also not
 # ctl.start/ctl.stop.
-barq.awdl.wanted    u:object_r:barq_awdl_prop:s0    exact bool
+# Prefix, not one exact key: the namespace now carries the Wi-Fi frequency as well
+# as the wanted flag, and an exact rule for one leaves the other on default_prop --
+# where set_prop on our own type is still denied, which fails silently.
+barq.awdl.          u:object_r:barq_awdl_prop:s0

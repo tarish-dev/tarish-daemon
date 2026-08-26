@@ -31,11 +31,149 @@ const IFACE: &str = "mosey0";
 /// country and refuses a channel it may not use. So offer candidates and let it
 /// choose -- the one it accepts is by definition the one that is legal and supported
 /// here, which is a better answer than any table we could maintain.
-const CHANNEL_CANDIDATES: &[&[u8]] = &[&[149], &[44], &[6]];
+/// AWDL social channels by band. Apple uses 6 on 2.4 GHz, 44 and 149 on 5 GHz.
+const CHANNELS_24: &[u8] = &[6];
+const CHANNELS_5: &[u8] = &[149, 44];
+
+/// Pick AWDL's channel in the OPPOSITE band from the Wi-Fi association.
+///
+/// THIS IS THE WHOLE COEXISTENCE STORY, AND IT IS NOT ABOUT CHANNEL HOPPING.
+///
+/// `is_dbs_supported=true`: the chip runs 2.4 GHz and 5 GHz simultaneously. What it
+/// cannot do is sit on two different 5 GHz channels. Measured on mustang with Wi-Fi
+/// associated at 5700 MHz, all three with channel_hopping=true:
+///
+///     channels=[6,44,149]   -> used 6     Wi-Fi COMPLETED, stable
+///     channels=[149,44,6]   -> used 149   Wi-Fi DISCONNECTED within 3s
+///     channels=[149]        -> used 149   Wi-Fi DISCONNECTED within 3s
+///
+/// So the library takes the FIRST channel in the list and channel_hopping changes
+/// nothing here. Two earlier hypotheses died on that bench: that hopping would let
+/// the radio interleave, and that telling the scheduler `sta_channel_freq` would be
+/// enough -- the library decoded 5520 correctly and the association still dropped.
+///
+/// With no association there is nothing to avoid, so prefer 5 GHz for the
+/// throughput. The list is still tried in order and the vendor library refuses a
+/// channel it may not use, so regulatory domains remain its decision, not ours.
+fn channels_for(sta_freq_mhz: u32) -> Vec<&'static [u8]> {
+    match sta_freq_mhz {
+        // UNKNOWN IS NOT "NOTHING TO AVOID". Taking 5 GHz here stops Wi-Fi from
+        // ASSOCIATING on 5 GHz at all, which is how a phone gets stuck: the radio is
+        // up, Wi-Fi cannot come back, so the client keeps reporting 0, so we keep
+        // taking 5 GHz. Observed exactly that. 2.4 GHz is the safer unknown -- these
+        // devices are usually on 5 GHz, and same-band only clashes when the channels
+        // differ.
+        0 => vec![CHANNELS_24, CHANNELS_5],
+        f if f >= 5000 => vec![CHANNELS_24, CHANNELS_5], // Wi-Fi on 5 GHz -> AWDL on 2.4
+        _ => vec![CHANNELS_5, CHANNELS_24],              // Wi-Fi on 2.4 -> AWDL on 5
+    }
+}
 
 /// Serialised `StartMoseyConfig`: field 1 = is_dbs_supported, field 6 =
 /// rate_adaptation. These four bytes are what the vendor daemon itself passes.
-const CONFIG: &[u8] = &[0x08, 0x01, 0x30, 0x01];
+/// Serialised `StartMoseyConfig`. The library logs how it decoded this:
+///
+///     is_dbs_supported, sta_channel_freq, daemon_amsdu, driver_ampdu,
+///     channel_hopping, rate_adaptation, maxAmsduSizeMode
+///
+/// so the protobuf field numbers are 1..7 in that order. We set field 1
+/// (is_dbs_supported) and field 6 (rate_adaptation), which is what the vendor
+/// daemon passes, plus field 2 when we know it -- see `mosey_config`.
+const CFG_DBS_SUPPORTED: [u8; 2] = [0x08, 0x01];      // field 1, varint 1
+const CFG_RATE_ADAPTATION: [u8; 2] = [0x30, 0x01];    // field 6, varint 1
+const CFG_STA_FREQ_TAG: u8 = 0x10;                    // field 2, varint
+
+/// Build the config, telling the AWDL scheduler which channel Wi-Fi is using.
+///
+/// WHY THIS MATTERS MORE THAN IT LOOKS
+///
+/// We were passing sta_channel_freq = 0, i.e. "no idea". One radio cannot sit on
+/// two 5 GHz channels at once, so with the STA channel unknown the stack parks AWDL
+/// on its own channel and the Wi-Fi association dies. Measured on mustang, Wi-Fi
+/// associated at 5520 MHz and AWDL asked for 149 (5745 MHz):
+///
+///     AWDL off    COMPLETED @ 5520MHz, steady
+///     AWDL up     DISCONNECTED, Frequency -1MHz, within 3 seconds
+///                 WifiScanningService: Scan failed - unspecified reason, repeating
+///
+/// Stock does not do this, which is the point: Google's daemon knows the STA channel
+/// and can interleave its availability windows with it. Told the same thing, the
+/// library can schedule around the association instead of standing on it.
+fn mosey_config(sta_freq_mhz: u32) -> Vec<u8> {
+    let mut v = Vec::with_capacity(8);
+    v.extend_from_slice(&CFG_DBS_SUPPORTED);
+    if sta_freq_mhz > 0 {
+        v.push(CFG_STA_FREQ_TAG);
+        let mut n = sta_freq_mhz;
+        while n >= 0x80 {
+            v.push((n as u8 & 0x7f) | 0x80);
+            n >>= 7;
+        }
+        v.push(n as u8);
+    }
+    v.extend_from_slice(&CFG_RATE_ADAPTATION);
+    v
+}
+
+/// The frequency Wi-Fi is currently associated on, in MHz, or 0 if unknown.
+///
+/// Read from a property for now so the value can be changed without a build while
+/// this is being characterised. Detecting it properly means asking nl80211, which
+/// barqd can do -- it already holds a netlink_generic socket for the vendor
+/// commands -- and that is the follow-up once the mechanism is confirmed.
+///
+/// 0 is the honest answer when we do not know, and reproduces the old behaviour
+/// rather than inventing a channel.
+/// Raw override for the whole StartMoseyConfig, as hex.
+///
+/// Exists to characterise coexistence without a build per hypothesis. Each
+/// build-push-test cycle is minutes; each hypothesis about a vendor blob's config is
+/// cheap and usually wrong, so the two should not be coupled. Unset in normal use.
+///
+///     setprop persist.barq.mosey_config 0801109 02b28013001
+fn config_override() -> Option<Vec<u8>> {
+    let hex = read_property("persist.barq.mosey_config")?;
+    let hex: String = hex.chars().filter(|c| !c.is_whitespace()).collect();
+    if hex.is_empty() || hex.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    for i in (0..hex.len()).step_by(2) {
+        out.push(u8::from_str_radix(&hex[i..i + 2], 16).ok()?);
+    }
+    log::warn!("using persist.barq.mosey_config override: {hex}");
+    Some(out)
+}
+
+/// Override for which channels to offer, e.g. `6` or `44,149`.
+///
+/// Same reason as the config override: the channel is a coexistence variable and
+/// should be testable without a rebuild. Empty means pick by band.
+fn channel_override() -> Option<Vec<u8>> {
+    let v = read_property("persist.barq.channels")?;
+    let list: Vec<u8> = v
+        .split(',')
+        .filter_map(|c| c.trim().parse::<u8>().ok())
+        .collect();
+    if list.is_empty() {
+        return None;
+    }
+    log::warn!("using persist.barq.channels override: {list:?}");
+    Some(list)
+}
+
+fn sta_frequency() -> u32 {
+    // barq.awdl.sta_freq is what barqsharingd publishes from the client, which is the
+    // only component that can see the Wi-Fi state at all -- barqd and barqsharingd are
+    // native daemons with no framework access, and nothing exposes the association
+    // frequency as a readable file. persist.barq.sta_freq stays as a manual override
+    // for bench work.
+    read_property("barq.awdl.sta_freq")
+        .or_else(|| read_property("persist.barq.sta_freq"))
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|f| (2000..=7200).contains(f))
+        .unwrap_or(0)
+}
 
 const MAX_MDNS: u32 = 0x7fff_ffff;
 
@@ -251,12 +389,28 @@ impl Link {
         // Mode is the outer loop because it is a property of the hardware and does not
         // change; channel is inner because it is a regulatory question the library
         // answers differently in different countries.
+        let sta = sta_frequency();
+        if sta > 0 {
+            log::info!(
+                "Wi-Fi is on {sta} MHz — putting AWDL in the other band, {:?}",
+                channels_for(sta).first().unwrap_or(&CHANNELS_5)
+            );
+        } else {
+            log::info!("no Wi-Fi association — no band to avoid, preferring 5 GHz");
+        }
+        let config = config_override().unwrap_or_else(|| mosey_config(sta));
+        let forced = channel_override();
+
         let mut session = None;
         let mut chosen = None;
         let mut last = String::new();
         'search: for mode in radio_modes() {
-            for channels in CHANNEL_CANDIDATES {
-                match mosey::Session::start(channels, &country, MAX_MDNS, mode, CONFIG) {
+            let candidates: Vec<&[u8]> = match &forced {
+                Some(c) => vec![c.as_slice()],
+                None => channels_for(sta),
+            };
+            for channels in candidates {
+                match mosey::Session::start(channels, &country, MAX_MDNS, mode, &config) {
                     Ok(s) => {
                         session = Some(s);
                         chosen = Some((mode, channels));
@@ -273,8 +427,9 @@ impl Link {
         let session = session.ok_or_else(|| {
             format!(
                 "no combination of radio mode and channel was accepted in {country}. \
-                 Tried {:?} against channels {CHANNEL_CANDIDATES:?}. Last error: {last}",
-                radio_modes()
+                 Tried {:?} against channels {:?}. Last error: {last}",
+                radio_modes(),
+                channels_for(sta)
             )
         })?;
         let (mode, channels) = chosen.expect("set with session");

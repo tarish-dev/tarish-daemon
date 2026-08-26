@@ -46,6 +46,9 @@ const IFACE: &str = "mosey0";
 /// battery cost rather than to a device that cannot share at all.
 const WANT_PROP: &str = "barq.awdl.wanted";
 
+/// The Wi-Fi frequency, published for barqd so it can choose the opposite band.
+const STA_FREQ_PROP: &str = "barq.awdl.sta_freq";
+
 /// Peers found by the discovery thread. Shared rather than owned by the service
 /// so discovery keeps running whether or not a client is bound — a device must
 /// stay discoverable with the app closed.
@@ -276,7 +279,16 @@ fn start_radio_gate(active: Arc<AtomicBool>, transfers: Transfers, discoverable:
                 since.elapsed() < LINGER
             };
 
-            if applied != Some(want) && next_try.map_or(true, |t| std::time::Instant::now() >= t) {
+            // Compare against what the property ACTUALLY says, not only against our own
+            // last write. Tracking just our own writes means that if the value is
+            // changed by anything else -- or if a write we believed succeeded did not
+            // land -- the gate sits there convinced it is already correct and never
+            // corrects it. The radio then stays in whatever state that left, which on
+            // a bench looks exactly like the gate being broken.
+            let live = read_property(WANT_PROP).map(|v| v.trim() != "0");
+            let needs_write = live != Some(want) || applied != Some(want);
+
+            if needs_write && next_try.map_or(true, |t| std::time::Instant::now() >= t) {
                 if write_property(WANT_PROP, if want { "1" } else { "0" }) {
                     log::info!("radio {} ({WANT_PROP}={})",
                                if want { "wanted" } else { "released" },
@@ -333,6 +345,8 @@ struct BarqService {
     discoverable: Discoverable,
     /// Whether a client is in the foreground. Governs the radio, not visibility.
     active: Arc<AtomicBool>,
+    /// Last Wi-Fi frequency the client reported, so we only write on a change.
+    sta_freq: Arc<std::sync::atomic::AtomicI32>,
     peers: PeerTable,
 }
 
@@ -346,6 +360,7 @@ impl BarqService {
             visibility_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             discoverable,
             active: Arc::new(AtomicBool::new(false)),
+            sta_freq: Arc::new(std::sync::atomic::AtomicI32::new(-1)),
             peers,
         }
     }
@@ -431,7 +446,20 @@ impl IBarqService for BarqService {
         Ok(())
     }
 
-    fn setActive(&self, active: bool) -> BinderResult<()> {
+    fn setActive(&self, active: bool, sta_frequency_mhz: i32) -> BinderResult<()> {
+        // Publish the Wi-Fi frequency for barqd BEFORE flipping the active flag, so
+        // the gate can never ask for the radio while the band is still unknown --
+        // barqd would then pick 5 GHz and take the association down, which is the
+        // exact bug this exists to prevent.
+        let f = if (2000..=7200).contains(&sta_frequency_mhz) { sta_frequency_mhz } else { 0 };
+        if self.sta_freq.swap(f, Ordering::SeqCst) != f {
+            if write_property(STA_FREQ_PROP, &f.to_string()) {
+                log::info!("Wi-Fi is on {f} MHz");
+            } else {
+                log::warn!("could not publish {STA_FREQ_PROP} — barqd will guess the band");
+            }
+        }
+
         // Idempotent and deliberately quiet: this is called on every onResume and
         // onPause, which on a real device means several times a second while a file
         // picker is opening. The gate thread decides what to do about it.
