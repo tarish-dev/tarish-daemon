@@ -544,8 +544,19 @@ impl IBarqService for BarqService {
                     }
                 }
             };
-            announce(&|cb| cb.onTransferOffered(id, "", &[], 0));
-
+            // NO onTransferOffered HERE.
+            //
+            // This used to raise it with empty arguments, back when the callback meant
+            // "a transfer has begun" and the client used it to put a progress bar up.
+            // Adding the consent prompt changed what it MEANS -- it is now "someone
+            // wants to send you a file, accept or decline" -- and this call was left
+            // behind, so starting a send told the SENDER'S OWN app that an offer had
+            // arrived. Tapping a peer raised an Accept/Decline card on the phone doing
+            // the sending, with no name and no filenames because the arguments here are
+            // empty.
+            //
+            // The client needs nothing from us to start a send: sendFiles returns the
+            // transfer id, and progress arrives through onTransferProgress below.
             let result = send::send(
                 &target,
                 items,
