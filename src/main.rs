@@ -58,6 +58,20 @@ const CHANNELS_5: &[u8] = &[149, 44];
 /// With no association there is nothing to avoid, so prefer 5 GHz for the
 /// throughput. The list is still tried in order and the vendor library refuses a
 /// channel it may not use, so regulatory domains remain its decision, not ours.
+/// Would AWDL on these channels land in the same band as the association?
+///
+/// The split matches channels_for() exactly and deliberately: if the two disagreed,
+/// one of them would pick a candidate the other considers fatal. 6 GHz counts with 5
+/// -- we have not measured whether a 6 GHz STA can hold a 5 GHz AWDL session, and
+/// guessing wrong costs the user their Wi-Fi.
+fn same_band_as_sta(channels: &[u8], sta_freq_mhz: u32) -> bool {
+    if sta_freq_mhz == 0 {
+        return false;
+    }
+    let sta_is_24 = sta_freq_mhz < 5000;
+    channels.iter().all(|&c| (c <= 14) == sta_is_24)
+}
+
 fn channels_for(sta_freq_mhz: u32) -> Vec<&'static [u8]> {
     match sta_freq_mhz {
         // UNKNOWN IS NOT "NOTHING TO AVOID". Taking 5 GHz here stops Wi-Fi from
@@ -429,12 +443,38 @@ impl Link {
         let mut session = None;
         let mut chosen = None;
         let mut last = String::new();
+        // WHAT WE WILL NOT DO IS TAKE THE STA'S BAND.
+        //
+        // channels_for() puts the opposite band first, but it is a PREFERENCE: when the
+        // first candidate is refused the loop used to walk straight into the band the
+        // phone is associated on, and this chip cannot hold two channels there. Measured:
+        // AWDL on 149 against a 5520 MHz STA kills the association, and it still kills it
+        // with sta_channel_freq set and with channel_hopping forced true. So the fallback
+        // was not a degraded mode, it was a Wi-Fi outage.
+        //
+        // Losing AWDL is recoverable and visible -- the user retries the share. Losing
+        // Wi-Fi on a phone is neither. Refuse instead.
+        //
+        // An explicit channel override still wins: it exists for bench work, and the
+        // whole point is to be able to ask for the arrangement that breaks.
+        let offered: Vec<&[u8]> = match &forced {
+            Some(c) => vec![c.as_slice()],
+            None => {
+                let (keep, refused): (Vec<&[u8]>, Vec<&[u8]>) = channels_for(sta)
+                    .into_iter()
+                    .partition(|c| !same_band_as_sta(c, sta));
+                if !refused.is_empty() {
+                    log::info!(
+                        "not offering {refused:?} — same band as the {sta} MHz association; \
+                         losing AWDL beats losing Wi-Fi"
+                    );
+                }
+                keep
+            }
+        };
+
         'search: for mode in radio_modes() {
-            let candidates: Vec<&[u8]> = match &forced {
-                Some(c) => vec![c.as_slice()],
-                None => channels_for(sta),
-            };
-            for channels in candidates {
+            for channels in offered.iter().copied() {
                 match mosey::Session::start(channels, &country, MAX_MDNS, mode, &config) {
                     Ok(s) => {
                         session = Some(s);
@@ -457,9 +497,14 @@ impl Link {
         let session = session.ok_or_else(|| {
             format!(
                 "no combination of radio mode and channel was accepted in {country}. \
-                 Tried {:?} against channels {:?}. Last error: {last}",
+                 Tried {:?} against channels {:?}{}. Last error: {last}",
                 radio_modes(),
-                channels_for(sta)
+                offered,
+                if sta > 0 {
+                    format!(" (the {sta} MHz band was withheld to protect the association)")
+                } else {
+                    String::new()
+                }
             )
         })?;
         let (mode, channels) = chosen.expect("set with session");
