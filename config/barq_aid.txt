@@ -1,0 +1,47 @@
+# Barq's own uid.
+#
+# WHY NOT `nobody`, WHICH IS WHAT THIS USED TO BE
+#
+# `nobody` looks like the minimal choice and is not. It is SHARED, so file ownership
+# and per-uid accounting say nothing about who did what -- "what does nobody need?"
+# has no answer.
+#
+# A dedicated AID grants NOTHING extra. No capabilities, no groups beyond `inet`, no
+# system privileges. It is strictly more restrictive than `nobody` in the one way
+# that matters -- /data/misc/barq stops being readable by every other `nobody`
+# process -- and it makes the daemon nameable in ps, netstat, per-uid network stats,
+# battery attribution and file ownership.
+#
+# WHY 7500
+#
+# 7500..7999 is AID_SYSTEM_EXT_RESERVED, and both daemons ship in system_ext, so this
+# is the range the platform set aside for exactly this case. The 1000s are AOSP's
+# (1001 is radio, 1002 bluetooth), and 2900/5000 are the OEM ranges, which we are not.
+# The name MUST carry the partition prefix. The build refuses otherwise:
+#
+#     AID "barq" must be prefixed with a partition name
+#
+# which is the platform keeping provenance visible -- an AID in the system_ext
+# reserved range has to say it belongs to system_ext. The user and group are
+# therefore `system_ext_barq`, not `barq`.
+
+# THIS AID ALONE DOES NOT GET THE DAEMON ONTO wlan0.
+#
+# Since Android B, local network access is gated by a BPF map, and
+# is_local_network_access_blocked() exempts only uid 0 and uid 1000. Every other uid
+# needs PERMISSION_BIT_ACCESS_LOCAL_NETWORK in sUidPermissionChunkMap, which
+# PermissionMonitor derives from PACKAGES -- so a native daemon can never earn it and
+# mDNS sendto() to 224.0.0.251 fails with EPERM. Measured: identical code sends as uid
+# 1000, and gets EPERM as BOTH 9999 and 7500. The AID is not what fixed it.
+#
+# The grant is a framework patch carried by the integrator, not by Barq:
+# grapheneos/patches/packages_modules_Connectivity/0001-grant-barq-daemon-local-network-access.patch
+# It hardcodes the number below. gos-barq.sh refuses to install if the two disagree,
+# because the failure is silent -- the daemon starts, advertises, and never sends.
+#
+# On a build without that patch, run barqsharingd as `system` and accept that its
+# traffic is attributed to uid 1000. AirDrop is unaffected either way: it rides mosey0,
+# which is not a managed network and is not gated.
+
+[AID_SYSTEM_EXT_BARQ]
+value: 7500

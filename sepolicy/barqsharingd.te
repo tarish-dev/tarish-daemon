@@ -117,3 +117,17 @@ allow barqsharingd barq_data_file:file unlink;
 # missing rule here shows up as battery life, not as a broken transfer, which is
 # exactly the failure mode to prefer but also an easy one to miss.
 set_prop(barqsharingd, barq_awdl_prop)
+
+# set_prop() alone is NOT enough on this release. The macro grants
+# `barq_awdl_prop:property_service set` and `init:unix_stream_socket connectto`, but
+# libc still writes to /dev/socket/property_service first, and that write is checked
+# against the SOCKET's label, not the property's:
+#
+#   avc: denied { write } for name="property_service" scontext=u:r:barqsharingd:s0
+#        tcontext=u:object_r:property_socket:s0 tclass=sock_file permissive=0
+#
+# Without this the radio gate fails exactly as the note above predicted: every flip is
+# refused, barq.awdl.wanted never changes, barqd holds the radio forever, and the only
+# symptom is battery. Measured on mustang under enforcing -- barqsharingd had never
+# once logged a successful flip.
+allow barqsharingd property_socket:sock_file write;

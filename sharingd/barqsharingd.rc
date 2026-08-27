@@ -1,8 +1,13 @@
 # barqsharingd — the unprivileged half of Barq.
 #
-# No capabilities at all. `inet` is a supplementary GROUP, not a capability:
-# Android gates socket creation on group membership, so this is the minimum
-# needed to talk to a peer and nothing more.
+# No capabilities at all. `inet` is a supplementary GROUP, not a capability: it is
+# what lets the process CREATE a socket, and nothing more.
+#
+# Creating one is not the same as being allowed to send on it. Since Android B,
+# reaching the LOCAL network additionally needs a per-uid bit in a BPF map that only
+# uid 0 and uid 1000 get for free -- see config/barq_aid.txt. Without it this daemon
+# starts, advertises, and every mDNS send fails with EPERM. `inet` alone is enough for
+# AirDrop, which rides mosey0 and is not gated; it is not enough for Quick Share.
 #
 # Started after barqd, though it does not require it: with no link up it simply
 # reports linkUp=false rather than failing.
@@ -11,15 +16,19 @@
 # ownership and mode are set by something that has the standing to set them, and so
 # the directory exists before the first transfer rather than on the first write.
 #
-# 0700 nobody: only this daemon can read what a peer sent until the app collects it.
+# 0700 system_ext_barq: only this daemon can read what a peer sent until the app collects it.
+# It was 0700 nobody, which is weaker than it looks -- `nobody` is shared, so every
+# other process running as it could read a received file before the app collected it.
+# The ownership MUST move with the uid: miss it and the daemon boots cleanly and then
+# cannot write its own inbox, which fails at the first transfer rather than at boot.
 on post-fs-data
-    mkdir /data/misc/barq 0700 nobody nobody
-    mkdir /data/misc/barq/inbox 0700 nobody nobody
+    mkdir /data/misc/barq 0700 system_ext_barq system_ext_barq
+    mkdir /data/misc/barq/inbox 0700 system_ext_barq system_ext_barq
 
 service barqsharingd /system_ext/bin/barqsharingd
     class late_start
-    user nobody
-    group nobody inet
+    user system_ext_barq
+    group system_ext_barq inet
     disabled
     oneshot false
     restart_period 10

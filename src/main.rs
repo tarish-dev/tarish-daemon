@@ -13,12 +13,15 @@
 //! app that is closed most of the time.
 
 mod mosey;
+mod nl80211;
 mod route;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 const IFACE: &str = "mosey0";
+/// The infrastructure interface whose channel AWDL has to schedule around.
+const STA_IFACE: &str = "wlan0";
 
 /// AWDL channels to try, in order of preference.
 ///
@@ -117,13 +120,18 @@ fn mosey_config(sta_freq_mhz: u32) -> Vec<u8> {
 
 /// The frequency Wi-Fi is currently associated on, in MHz, or 0 if unknown.
 ///
-/// Read from a property for now so the value can be changed without a build while
-/// this is being characterised. Detecting it properly means asking nl80211, which
-/// barqd can do -- it already holds a netlink_generic socket for the vendor
-/// commands -- and that is the follow-up once the mechanism is confirmed.
+/// This is not just an input to our own band choice. It is `sta_channel_freq` in
+/// StartMoseyConfig, which is how AWDL schedules slots on the AP's channel -- see
+/// nl80211.rs for the protocol reference. Reporting 0 means the radio never goes
+/// back to the AP.
 ///
-/// 0 is the honest answer when we do not know, and reproduces the old behaviour
-/// rather than inventing a channel.
+/// It used to come only from a property that barqsharingd publishes on behalf of the
+/// client, which meant it was 0 whenever the app was closed -- i.e. nearly always,
+/// since closing it is what the radio gate is for. Measured on mustang: every single
+/// start logged `sta_channel_freq=0` while the phone sat associated at 5520 MHz, and
+/// the band-avoidance branch never once executed.
+///
+/// 0 is still the honest answer when there is genuinely no association.
 /// Raw override for the whole StartMoseyConfig, as hex.
 ///
 /// Exists to characterise coexistence without a build per hypothesis. Each
@@ -168,8 +176,25 @@ fn sta_frequency() -> u32 {
     // native daemons with no framework access, and nothing exposes the association
     // frequency as a readable file. persist.barq.sta_freq stays as a manual override
     // for bench work.
+    // An explicit bench override wins, so a frequency can be forced without a build.
+    if let Some(f) = read_property("persist.barq.sta_freq")
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|f| (2000..=7200).contains(f))
+    {
+        log::warn!("using persist.barq.sta_freq override: {f} MHz");
+        return f;
+    }
+
+    // Then ask the kernel directly. This is the path that actually runs: the property
+    // below is published by barqsharingd from the client, and the client is closed for
+    // almost all of the device's life by design.
+    match nl80211::frequency_of(STA_IFACE) {
+        Ok(f) if (2000..=7200).contains(&f) => return f,
+        Ok(_) => {}  // up but not associated -- no channel to avoid, 0 is correct
+        Err(e) => log::warn!("nl80211 could not report {STA_IFACE} frequency: {e}"),
+    }
+
     read_property("barq.awdl.sta_freq")
-        .or_else(|| read_property("persist.barq.sta_freq"))
         .and_then(|v| v.trim().parse::<u32>().ok())
         .filter(|f| (2000..=7200).contains(f))
         .unwrap_or(0)
@@ -417,7 +442,12 @@ impl Link {
                         break 'search;
                     }
                     Err(e) => {
-                        log::debug!("{mode:?} + channel {channels:?} refused: {e}");
+                        // NOT debug. Refusing the preferred channel is how a phone
+                        // loses Wi-Fi: the next candidate is the other band, which on
+                        // a 5 GHz STA is the STA's own band, and DBS cannot hold two
+                        // 5 GHz channels. The fallback used to be silent, so the only
+                        // trace was `channel=149` in the success line.
+                        log::warn!("{mode:?} + channel {channels:?} refused: {e}");
                         last = e;
                     }
                 }
@@ -482,11 +512,31 @@ impl Drop for Link {
     }
 }
 
+/// Log verbosity, from `persist.barq.loglevel` (error|warn|info|debug|trace).
+///
+/// Hardcoding Info meant the one line explaining a Wi-Fi-killing channel fallback was
+/// compiled out on every shipped device, and recovering it needed a rebuild and a
+/// reflash. Info stays the default; this only makes the level answerable in the field.
+fn log_level() -> log::LevelFilter {
+    match read_property("persist.barq.loglevel")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "error" => log::LevelFilter::Error,
+        "warn" => log::LevelFilter::Warn,
+        "debug" => log::LevelFilter::Debug,
+        "trace" => log::LevelFilter::Trace,
+        _ => log::LevelFilter::Info,
+    }
+}
+
 fn main() {
     android_logger::init_once(
         android_logger::Config::default()
             .with_tag("barqd")
-            .with_max_level(log::LevelFilter::Info),
+            .with_max_level(log_level()),
     );
 
     install_signal_handlers();
