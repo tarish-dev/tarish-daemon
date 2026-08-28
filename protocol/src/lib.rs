@@ -15,7 +15,7 @@
 //! | layer | state |
 //! |---|---|
 //! | `hkdf` — RFC 5869 key derivation | **done**, RFC vectors |
-//! | D2D key derivation | not started |
+//! | `d2d` — post-handshake traffic keys | **done**, Bada vectors |
 //! | SecureMessage codec | not started |
 //! | UKEY2 handshake | not started |
 //! | wire framing, offline frames | not started |
@@ -26,4 +26,5 @@
 //! interface name. It is done and verified against Google's Quick Share for Windows --
 //! see `docs/QUICKSHARE-VECTORS.md`.
 
+pub mod d2d;
 pub mod hkdf;
