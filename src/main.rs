@@ -55,23 +55,9 @@ const CHANNELS_5: &[u8] = &[149, 44];
 /// the radio interleave, and that telling the scheduler `sta_channel_freq` would be
 /// enough -- the library decoded 5520 correctly and the association still dropped.
 ///
-/// With no association there is nothing to avoid, so prefer 5 GHz for the
-/// throughput. The list is still tried in order and the vendor library refuses a
+/// With no association we prefer 2.4 GHz, NOT 5 GHz -- see the comment on the `0`
+/// arm below. The list is still tried in order and the vendor library refuses a
 /// channel it may not use, so regulatory domains remain its decision, not ours.
-/// Would AWDL on these channels land in the same band as the association?
-///
-/// The split matches channels_for() exactly and deliberately: if the two disagreed,
-/// one of them would pick a candidate the other considers fatal. 6 GHz counts with 5
-/// -- we have not measured whether a 6 GHz STA can hold a 5 GHz AWDL session, and
-/// guessing wrong costs the user their Wi-Fi.
-fn same_band_as_sta(channels: &[u8], sta_freq_mhz: u32) -> bool {
-    if sta_freq_mhz == 0 {
-        return false;
-    }
-    let sta_is_24 = sta_freq_mhz < 5000;
-    channels.iter().all(|&c| (c <= 14) == sta_is_24)
-}
-
 fn channels_for(sta_freq_mhz: u32) -> Vec<&'static [u8]> {
     match sta_freq_mhz {
         // UNKNOWN IS NOT "NOTHING TO AVOID". Taking 5 GHz here stops Wi-Fi from
@@ -84,6 +70,20 @@ fn channels_for(sta_freq_mhz: u32) -> Vec<&'static [u8]> {
         f if f >= 5000 => vec![CHANNELS_24, CHANNELS_5], // Wi-Fi on 5 GHz -> AWDL on 2.4
         _ => vec![CHANNELS_5, CHANNELS_24],              // Wi-Fi on 2.4 -> AWDL on 5
     }
+}
+
+/// Would AWDL on these channels land in the same band as the association?
+///
+/// The split matches channels_for() exactly and deliberately: if the two disagreed,
+/// one of them would pick a candidate the other considers fatal. 6 GHz counts with 5
+/// -- we have not measured whether a 6 GHz STA can hold a 5 GHz AWDL session, and
+/// guessing wrong costs the user their Wi-Fi.
+fn same_band_as_sta(channels: &[u8], sta_freq_mhz: u32) -> bool {
+    if sta_freq_mhz == 0 {
+        return false;
+    }
+    let sta_is_24 = sta_freq_mhz < 5000;
+    channels.iter().all(|&c| (c <= 14) == sta_is_24)
 }
 
 /// Serialised `StartMoseyConfig`: field 1 = is_dbs_supported, field 6 =
@@ -435,7 +435,10 @@ impl Link {
                 channels_for(sta).first().unwrap_or(&CHANNELS_5)
             );
         } else {
-            log::info!("no Wi-Fi association — no band to avoid, preferring 5 GHz");
+            log::info!(
+                "no Wi-Fi association — nothing to avoid, trying {:?} first",
+                channels_for(0).first().unwrap_or(&CHANNELS_24)
+            );
         }
         let config = config_override().unwrap_or_else(|| mosey_config(sta));
         let forced = channel_override();

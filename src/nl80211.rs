@@ -168,12 +168,34 @@ fn nl80211_family() -> io::Result<u16> {
     Ok(u16::from_ne_bytes([id[0], id[1]]))
 }
 
-/// The frequency `iface` is currently operating on, in MHz.
+/// The frequency `iface` is ASSOCIATED on, in MHz, or 0 if it is not associated.
 ///
-/// An interface that is up but not associated has no channel, so the attribute is
-/// simply absent and this reports 0 -- which is the honest answer and the one the
-/// caller already handles.
+/// NL80211_ATTR_WIPHY_FREQ ALONE IS NOT AN ANSWER. It reports the channel the
+/// interface is tuned to, which an unassociated interface still has and which drifts
+/// while it scans. Measured on frankel with `iw` reporting "Not connected":
+///
+///     nl80211 said 2412 MHz, and `iw dev wlan0 info` said channel 44 (5220 MHz)
+///     moments later -- two different bands, neither of them an association
+///
+/// Acting on that is worse than knowing nothing: barqd would withhold a band to
+/// protect an association that does not exist, and could refuse every candidate.
+///
+/// operstate is the discriminator. Linux reports `dormant` for a wireless interface
+/// that is up but not associated, and `up` once it is. carrier is NOT usable -- it
+/// reads 1 in both states on this hardware.
 pub fn frequency_of(iface: &str) -> io::Result<u32> {
+    match std::fs::read_to_string(format!("/sys/class/net/{iface}/operstate")) {
+        Ok(v) if v.trim() == "up" => {}
+        Ok(_) => return Ok(0), // dormant/down -- tuned to something, associated to nothing
+        Err(e) => return Err(e),
+    }
+    frequency_of_tuned(iface)
+}
+
+/// The channel `iface` is tuned to, associated or not. Callers almost always want
+/// `frequency_of` instead; this is split out so the association check is impossible
+/// to skip by accident.
+fn frequency_of_tuned(iface: &str) -> io::Result<u32> {
     let cname =
         std::ffi::CString::new(iface).map_err(|_| io::Error::other("bad interface name"))?;
     // SAFETY: cname is a valid NUL-terminated string.
