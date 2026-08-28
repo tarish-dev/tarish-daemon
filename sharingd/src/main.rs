@@ -962,6 +962,9 @@ fn start_airdrop_server(discoverable: Discoverable, callbacks: Callbacks, transf
 fn start_quickshare_discovery() {
     std::thread::spawn(|| {
         const IFACE: &str = "wlan0";
+        // Instances already reported, so a peer is announced when it appears rather than
+        // every half second for as long as it stays.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         loop {
             let mut browser = match quickshare::discovery::QsBrowser::new(IFACE) {
                 Ok(b) => {
@@ -990,6 +993,27 @@ fn start_quickshare_discovery() {
                 }
                 browser.poll();
                 browser.expire(Duration::from_secs(60));
+
+                // Report what we found. Until now the browser maintained a peer table
+                // that nothing ever read, so a working discovery and a broken one looked
+                // identical from outside -- silence either way.
+                //
+                // Logged once per instance rather than per poll: the peer table is
+                // refreshed every 500ms and the interesting event is a peer appearing,
+                // not it continuing to exist.
+                for p in browser.peers() {
+                    if seen.insert(p.instance.clone()) {
+                        log::info!(
+                            "quickshare: peer {} \"{}\" at {}:{} ({})",
+                            p.endpoint_id,
+                            p.name.as_deref().unwrap_or("<no name>"),
+                            p.addr.map(|a| a.to_string()).unwrap_or_else(|| p.host.clone()),
+                            p.port,
+                            p.instance,
+                        );
+                    }
+                }
+
                 std::thread::sleep(Duration::from_millis(500));
                 since_query += Duration::from_millis(500);
             }
