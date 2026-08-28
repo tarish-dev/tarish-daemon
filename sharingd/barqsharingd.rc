@@ -24,6 +24,21 @@
 on post-fs-data
     mkdir /data/misc/barq 0700 system_ext_barq system_ext_barq
     mkdir /data/misc/barq/inbox 0700 system_ext_barq system_ext_barq
+    # mkdir SETS OWNERSHIP ONLY WHEN IT CREATES THE DIRECTORY.
+    #
+    # On a device upgrading from a build where this daemon ran as `nobody`, both
+    # directories already exist owned by 9999 and the mkdir lines above are no-ops.
+    # The daemon then starts, advertises, discovers peers, and fails on the first
+    # write -- so the symptom appears at the first transfer, not at boot, and looks
+    # like a transfer bug rather than an upgrade one.
+    #
+    # chown is idempotent and costs nothing on a fresh device, so it runs always.
+    # Files left inside inbox by the old uid are fine: deleting them is governed by
+    # write permission on the directory, which we now own.
+    chown system_ext_barq system_ext_barq /data/misc/barq
+    chown system_ext_barq system_ext_barq /data/misc/barq/inbox
+    chmod 0700 /data/misc/barq
+    chmod 0700 /data/misc/barq/inbox
 
 service barqsharingd /system_ext/bin/barqsharingd
     class late_start
