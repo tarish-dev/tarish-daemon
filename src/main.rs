@@ -75,9 +75,18 @@ fn channels_for(sta_freq_mhz: u32) -> Vec<&'static [u8]> {
 /// Would AWDL on these channels land in the same band as the association?
 ///
 /// The split matches channels_for() exactly and deliberately: if the two disagreed,
-/// one of them would pick a candidate the other considers fatal. 6 GHz counts with 5
-/// -- we have not measured whether a 6 GHz STA can hold a 5 GHz AWDL session, and
-/// guessing wrong costs the user their Wi-Fi.
+/// one of them would pick a candidate the other considers fatal.
+///
+/// 6 GHz COUNTS WITH 5, AND THIS IS NOW MEASURED rather than assumed. On mustang
+/// (BCM4390, the chip that coexists at all), associated at 6215 MHz:
+///
+///     AWDL on channel 6   (2.4 GHz)  -> both alive, 45s soak
+///     AWDL on channel 149 (5 GHz)    -> Wi-Fi gone in under 20s, still gone at 60s
+///
+/// So 6 GHz is not a third independent band here: it shares a radio chain with 5 GHz,
+/// and `is_dbs_supported` means 2.4 plus ONE of the upper bands, not all three. A 6 GHz
+/// association therefore has to be protected from 5 GHz AWDL exactly as a 5 GHz one is,
+/// which is what this grouping does.
 fn same_band_as_sta(channels: &[u8], sta_freq_mhz: u32) -> bool {
     if sta_freq_mhz == 0 {
         return false;

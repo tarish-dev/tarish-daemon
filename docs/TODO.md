@@ -213,39 +213,6 @@ specific transfer, just now", the transfer does not happen.
   two clients would fight over it. There is one client today and the AIDL is ours.
 
 
-### Is 6 GHz its own band for AWDL coexistence, or does it share 5 GHz's radio?
-
-`same_band_as_sta` groups 6 GHz with 5 GHz, so a 6 GHz association makes barqd
-withhold channels 149 and 44 and fall back to channel 6. The comment on that function
-admits the grouping is a guess:
-
-> 6 GHz counts with 5 -- we have not measured whether a 6 GHz STA can hold a 5 GHz
-> AWDL session, and guessing wrong costs the user their Wi-Fi.
-
-If the guess is wrong we discard the better AWDL channel on every 6 GHz network for
-nothing. If it is right, we keep the user's Wi-Fi. Either way it should be measured
-rather than assumed, and it is cheap.
-
-**The test, on mustang** (BCM4390, the chip that coexists at all -- there is no point
-running this on frankel, where the radio is exclusive in any band):
-
-1. associate to a **6 GHz** network. Band steering on a single SSID will happily put
-   the phone on 5 GHz, which turns this into a test we have already run, so confirm
-   the frequency is >= 5925 MHz before believing the result.
-2. default behaviour: expect `not offering [[149, 44]]` and a session on channel 6,
-   with both alive through a soak. Confirms coexistence on a band pair never tried.
-3. force `persist.barq.channels 149` -- 5 GHz AWDL against a 6 GHz association. **This
-   is the measurement.** Wi-Fi surviving means the grouping is wrong and 6 GHz should
-   be split out from 5.
-
-Blocked only on hardware being in range of a 6 GHz AP. Verified so far: mustang
-coexists with a 5 GHz STA (5660 MHz, AWDL ch 6, 45s clean), and frankel does not
-coexist even with a 6 GHz STA and AWDL in a different band (BUILD-NOTES 44).
-
-## Still to understand
-
-Research questions, not blocked work. Neither has been answered.
-
 ### Understand before implementing: how a peer lists a dual-protocol device ONCE
 
 **Observed**, on two Android phones that both support AirDrop and Quick Share: the
@@ -335,6 +302,34 @@ listing a device that will refuse.
       See [REVERSE-ENGINEERING.md](REVERSE-ENGINEERING.md).
 
 ## Done
+
+### 6 GHz shares 5 GHz's radio chain — ANSWERED, the grouping was right
+
+`same_band_as_sta` groups 6 GHz with 5 GHz, and the function's comment admitted that
+was a guess. Measured on mustang (BCM4390), pinned to a 6 GHz BSSID at 6215 MHz:
+
+```
+AWDL channel 6   (2.4 GHz)  ->  both alive, 45s soak
+AWDL channel 149 (5 GHz)    ->  Wi-Fi gone in under 20s, still gone at 60s
+```
+
+So 6 GHz is not a third independent band on this chip: `is_dbs_supported` means 2.4
+plus ONE upper band, not all three. Withholding 5 GHz from a 6 GHz association is
+correct and costs nothing that was available anyway.
+
+Getting the phone onto 6 GHz needed the BSSID pinned — the SSID is broadcast on both
+bands under one name and steering puts it on 5 GHz every time:
+
+```
+cmd wifi connect-network '<ssid>' wpa2 '<pass>' -b <6GHz-bssid>
+```
+
+One trap worth keeping: `iw phy phy0 info` reports nothing on these devices because
+the Wi-Fi phy is **phy1** (phy0 does not exist; the other phy is `wonder`). A grep
+against it returns zero matches and reads exactly like "no 6 GHz support", which
+briefly looked like a regulatory restriction. The real check showed 50 channels at
+20 dBm and country QA.
+
 
 ### barqsharingd could not send on wlan0 — SOLVED, and not by the uid alone
 
