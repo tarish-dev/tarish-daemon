@@ -212,6 +212,36 @@ specific transfer, just now", the transfer does not happen.
 - **Single-client `setActive`.** The foreground flag is one boolean, not per-client, so
   two clients would fight over it. There is one client today and the AIDL is ours.
 
+
+### Is 6 GHz its own band for AWDL coexistence, or does it share 5 GHz's radio?
+
+`same_band_as_sta` groups 6 GHz with 5 GHz, so a 6 GHz association makes barqd
+withhold channels 149 and 44 and fall back to channel 6. The comment on that function
+admits the grouping is a guess:
+
+> 6 GHz counts with 5 -- we have not measured whether a 6 GHz STA can hold a 5 GHz
+> AWDL session, and guessing wrong costs the user their Wi-Fi.
+
+If the guess is wrong we discard the better AWDL channel on every 6 GHz network for
+nothing. If it is right, we keep the user's Wi-Fi. Either way it should be measured
+rather than assumed, and it is cheap.
+
+**The test, on mustang** (BCM4390, the chip that coexists at all -- there is no point
+running this on frankel, where the radio is exclusive in any band):
+
+1. associate to a **6 GHz** network. Band steering on a single SSID will happily put
+   the phone on 5 GHz, which turns this into a test we have already run, so confirm
+   the frequency is >= 5925 MHz before believing the result.
+2. default behaviour: expect `not offering [[149, 44]]` and a session on channel 6,
+   with both alive through a soak. Confirms coexistence on a band pair never tried.
+3. force `persist.barq.channels 149` -- 5 GHz AWDL against a 6 GHz association. **This
+   is the measurement.** Wi-Fi surviving means the grouping is wrong and 6 GHz should
+   be split out from 5.
+
+Blocked only on hardware being in range of a 6 GHz AP. Verified so far: mustang
+coexists with a 5 GHz STA (5660 MHz, AWDL ch 6, 45s clean), and frankel does not
+coexist even with a 6 GHz STA and AWDL in a different band (BUILD-NOTES 44).
+
 ## Still to understand
 
 Research questions, not blocked work. Neither has been answered.
