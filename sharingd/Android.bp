@@ -1,6 +1,7 @@
 // barqsharingd — the unprivileged half.
 //
-// Runs as `nobody` with no capabilities, in its own SELinux domain. Everything
+// Runs as its own AID -- system_ext_barq (7500) -- with no capabilities, in its own
+// SELinux domain. Everything
 // that parses remote input lives here so that code is never in the same process
 // as CAP_NET_ADMIN. See ../docs/ARCHITECTURE.md.
 rust_binary {

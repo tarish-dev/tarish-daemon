@@ -29,7 +29,7 @@ shows a real device name, and an incoming transfer has to be accepted by a perso
 
 ```
 init.svc.barqd        = running     u:r:barqd:s0        user system
-init.svc.barqsharingd = running     u:r:barqsharingd:s0 user nobody
+init.svc.barqsharingd = running     u:r:barqsharingd:s0 user system_ext_barq
 
 barqd:        AWDL session up, handle=0xc00c19599c6bc80, channel=149, country=QA
 barqd:        rule: oif mosey0 lookup 54

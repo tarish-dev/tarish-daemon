@@ -9,71 +9,6 @@ did not exist, and the live work was two hundred lines down.
 
 ## Open
 
-### barqsharingd cannot send on wlan0 as `nobody` — the uid is the variable, PROVEN
-
-Quick Share LAN discovery is written and compiles; the socket binds, joins
-224.0.0.251 and receives. **Every send returns EPERM.**
-
-Three explanations tested and eliminated, on mustang:
-
-| tried | result |
-|---|---|
-| routing — no `oif`, falls to `32000: from all unreachable` | `ip route get 224.0.0.251 uid 9999` resolves to wlan0. Also with `mark 0` and with the wlan0 netid `0x65`. Not routing. |
-| `IP_MULTICAST_IF` to name the egress interface (rule `17000: oif wlan0` has no uid range, needs no capability) | still EPERM |
-| separate send socket bound to wlan0's own IPv4 rather than INADDR_ANY | still EPERM |
-
-What is left is **per-uid network access**. barqsharingd runs as uid 9999
-(`nobody`) with group 3003 (`inet`) and no capabilities. It sends fine on `mosey0`
-— because that interface is outside Android's network management: barqd creates it
-and installs its own fib rule, so nothing enforces per-uid access there. `wlan0` is
-a managed network and is enforced.
-
-So this is not a socket problem and no socket option will fix it. It is a question
-about **what uid the unprivileged half runs as**, which is an architectural decision
-and deliberately not one to make while chasing a bug.
-
-Options, and none is obviously right:
-
-1. **Run barqsharingd as a uid permitted on managed networks** (`system`, or a
-   dedicated AID). Simplest, and directly weakens the thing the split exists for:
-   this process parses hostile input from the network and holds nothing.
-2. **Have barqd open and mark the socket, and pass the fd over binder.** Keeps the
-   privilege split intact and reuses a mechanism already in the design — file
-   transfer already passes fds. Costs a new AIDL call and makes the privileged half
-   responsible for one more thing.
-3. **`android_setsocknetwork()` from libnetd_client**, which is the supported way to
-   bind a socket to a network. Needs checking whether it grants permission or merely
-   requests a network the uid must already be permitted on -- if the latter, it
-   changes nothing.
-
-**Measured, and the uid is the cause.** Changed only `user nobody` -> `user system`
-in the .rc on device, nothing else, rebooted:
-
-    as nobody (9999)  quickshare: query failed (Operation not permitted) — every time
-    as system (1000)  quickshare: browsing on wlan0 — sends, no error
-
-So no capability is needed and no socket option helps. It is purely which uid the
-process runs as.
-
-**And the framing above was wrong.** Option 1 was described as "directly weakens the
-thing the split exists for". It does not. Bada does exactly this as an ORDINARY
-ANDROID APP -- app uid, INTERNET permission, no privilege of any kind. A
-network-capable uid is the *normal* state; `nobody` is an unusually restricted one
-that happens to break managed-network access. The split exists to keep CAP_NET_ADMIN
-and CAP_NET_RAW out of the process that parses hostile input, and a uid that can open
-a socket on wlan0 grants neither.
-
-`system` (1000) is not the answer either -- it is far more powerful than needed and
-was used here only because it was a one-line diagnostic. What this wants is a
-**dedicated AID** with group `inet`: no capabilities, no system privileges, just a
-uid Android will route for. That is what an app gets, and it is all this needs.
-
-Remaining work: define the AID (system_ext can use an OEM AID range), update
-barqsharingd.rc, and move the /data/misc/barq ownership in the same change -- the
-inbox is 0700 nobody today and must follow the uid or the daemon loses its own
-storage. That last part is the easy thing to forget and it fails silently at the
-first transfer, not at boot.
-
 ### AWDL and Wi-Fi cannot run together on BCM4383, and the fallback hides it
 
 **Second priority, after VPN lockdown.**
@@ -116,6 +51,41 @@ gated behind properties a shell cannot set there, which is why the one-byte test
 not been run. Gate the overrides on `ro.debuggable` and it becomes seconds instead of
 a signed build per hypothesis — that plumbing already paid for itself once, finding
 the channel answer in two minutes rather than three build cycles.
+
+**UPDATE — measured on a userdebug frankel, and it narrows the problem sharply.**
+
+frankel does not have the Netlink AWDL path at all, and now we know why at module
+level rather than by inference:
+
+```
+wonder.physical_name = wondertap0     (module parameter, read-only)
+interfaces present:    wlan0, wlan1, aware_nmi0     <- no wondertap0
+/sys/class/ieee80211:  phy0 only                    <- no AWDL wiphy
+driver:                bcmdhd4383
+```
+
+`wonder.ko` loads, asks for an interface `bcmdhd4383` never creates, and registers
+nothing. So AWDL there is radiotap-only, which takes the whole radio — matching OWL's
+own documented limitation exactly.
+
+**The config surface is exhausted.** `channel_hopping=true` IS honoured by the library
+— captured decode, no longer an assumption — and the association still dies same-band
+with `sta_channel_freq` correctly set. There is nothing left in StartMoseyConfig to
+try. So the one-byte `is_dbs_supported` test below is worth less than it looked: this
+is not a scheduler that needs better inputs, it is a radio path with no scheduler.
+
+**Google ships the same bug.** Quick Share's AirDrop support on Pixel 10, 10 Pro and
+10 Pro XL was widely reported (Nov 2025) to drop Wi-Fi the moment the share sheet
+opens, with the network list going empty and connectivity returning when it closes.
+Google closed the issue tracker report without a fix. That is our symptom, with their
+implementation, on the same hardware — so this is a property of the platform rather
+than of our stack, and "match stock behaviour" is not an available answer.
+
+What is still worth doing here is making the radiotap fallback REFUSE rather than
+wedge Wi-Fi, so the failure is a share that does not happen instead of a phone that
+loses its network. The band refusal already does this for same-band on 4390; the
+radiotap path needs the equivalent.
+
 
 ### Always-on VPN lockdown breaks peer-to-peer, and should not just fail silently
 
@@ -333,6 +303,37 @@ listing a device that will refuse.
       See [REVERSE-ENGINEERING.md](REVERSE-ENGINEERING.md).
 
 ## Done
+
+### barqsharingd could not send on wlan0 — SOLVED, and not by the uid alone
+
+The daemon advertised AirDrop happily and every Quick Share mDNS query died with
+EPERM at `sendto`, while `socket`, `bind` and `IP_MULTICAST_IF` all succeeded.
+
+The old entry here concluded "the uid is the variable, PROVEN", on the evidence that
+identical code sent as uid 1000 and failed as 9999. That was a true measurement and
+an incomplete diagnosis, and acting on it alone would not have fixed anything: a
+dedicated AID at 7500 failed *identically*.
+
+The actual gate is `is_local_network_access_blocked()` in Connectivity's
+`bpf/progs/netd.c`. Since Android B it exempts only uid 0 and uid 1000; every other
+uid needs `PERMISSION_BIT_ACCESS_LOCAL_NETWORK` in `sUidPermissionChunkMap`, which
+`PermissionMonitor` derives from PACKAGES. A native daemon has no package, so it can
+never earn the bit however it is numbered. The older kernel rule exempted everything
+below uid 10000, which would have covered 9999 and 7500 both — so this is a rule that
+recently got narrower, not one we had misread.
+
+Two parts, both shipped:
+
+- the daemon runs as its own AID, `system_ext_barq` (7500), declared through
+  `TARGET_FS_CONFIG_GEN`. This buys isolation and legibility, not network access.
+- the integrator grants the bit:
+  `grapheneos/patches/packages_modules_Connectivity/0001-grant-barq-daemon-local-network-access.patch`
+
+Why this never affected AirDrop, which had been doing mDNS for weeks: the access map
+is keyed by INTERFACE, and `mosey0` is not a managed network. The gate is wlan0-only.
+
+Full mechanism and the three rejected alternatives: grapheneos BUILD-NOTES 41.
+
 
 - **Per-transfer consent.** `/Ask` blocked on `respondToOffer` rather than answering 200
   unconditionally. No answer within 45 s is a refusal, and `/Upload` is refused outright
