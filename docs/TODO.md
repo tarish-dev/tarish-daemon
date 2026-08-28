@@ -81,9 +81,11 @@ Google closed the issue tracker report without a fix. That is our symptom, with 
 implementation, on the same hardware — so this is a property of the platform rather
 than of our stack, and "match stock behaviour" is not an available answer.
 
-What is still worth doing here is making the radiotap fallback REFUSE rather than
-wedge Wi-Fi, so the failure is a share that does not happen instead of a phone that
-loses its network. The band refusal already does this for same-band on 4390; the
+**Do NOT make the radiotap fallback refuse.** That was the plan until the operator
+tested stock Android on the same device: it drops Wi-Fi too. Refusing would trade a
+working feature for an interruption stock does not avoid either, leaving us strictly
+worse than the phone shipped. Make it explicit instead — tell the user the radio is
+exclusive while sharing and returns afterwards. The band refusal already does this for same-band on 4390; the
 radiotap path needs the equivalent.
 
 
