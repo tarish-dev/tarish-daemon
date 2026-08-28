@@ -1,0 +1,62 @@
+// libbarq_protocol — the Quick Share / Nearby Connections protocol, on its own.
+//
+// WHY A SEPARATE CRATE
+//
+// This is deliberately free of Android: no binder, no android_logger, no libc. That
+// buys two things.
+//
+// It can be TESTED WITHOUT A DEVICE. barqsharingd pulls in binder and the Android
+// logger, so anything living inside it can only be exercised on hardware. The crypto
+// here is exactly the code where that would hurt most: a wrong key derivation does
+// not crash, it surfaces three layers up as "the peer rejected us" with nothing
+// pointing at the cause. Known-answer vectors turn that into a red test.
+//
+// And it keeps the untrusted-input parsing separable. Everything that reads bytes
+// from a stranger lives here, in a crate with no capabilities of its own to abuse.
+//
+// Bada's core-protocol makes the same split for the same reason ("this module has NO
+// android.*"), which is what made it readable as a specification rather than as
+// Android code.
+//
+// rlib rather than dylib: statically linked into barqsharingd, so there is no
+// separate .so to install, label, or keep in step across partitions.
+
+rust_library_rlib {
+    name: "libbarq_protocol",
+    crate_name: "barq_protocol",
+    srcs: ["src/lib.rs"],
+    edition: "2021",
+    rustlibs: [
+        "libopenssl",
+    ],
+    host_supported: true,
+}
+
+// Runs the #[cfg(test)] modules. Host-side, so it needs no phone.
+//
+// From the grapheneos repo, which sets up the build environment correctly -- doing
+// it by hand gets you a soong bootstrap failure that has nothing to do with your
+// change:
+//
+//     scripts/gos-build.sh -d <device> -t permissive --skip-vendor -m barq_protocol_test
+//
+// Then run it. LD_LIBRARY_PATH is REQUIRED: the binary links host BoringSSL and
+// without it fails with
+//     error while loading shared libraries: libcrypto-host.so
+// which reads like a broken build rather than a missing search path.
+//
+//     O=/srv/build/grapheneos-userdebug
+//     export LD_LIBRARY_PATH=$O/host/linux-x86/lib64:$O/host/linux-x86/lib
+//     $O/soong/.intermediates/vendor/barq/protocol/barq_protocol_test/\
+//         linux_glibc_x86_64/barq_protocol_test --test-threads=1
+//
+rust_test_host {
+    name: "barq_protocol_test",
+    crate_name: "barq_protocol",
+    srcs: ["src/lib.rs"],
+    edition: "2021",
+    rustlibs: [
+        "libopenssl",
+    ],
+    test_suites: ["general-tests"],
+}
