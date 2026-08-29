@@ -17,7 +17,8 @@
 //! | `hkdf` — RFC 5869 key derivation | **done**, RFC vectors |
 //! | `d2d` — post-handshake traffic keys | **done**, Bada vectors |
 //! | `securemessage` — signed+encrypted envelope | **done** |
-//! | UKEY2 handshake | not started |
+//! | `ukey2::crypto` — P-256 ECDH, key encoding | **done** |
+//! | UKEY2 handshake messages and state machine | next |
 //! | `protobuf` — minimal wire codec | **done** |
 //! | wire framing, offline frames | not started |
 //! | connection state machines | not started |
@@ -31,3 +32,4 @@ pub mod d2d;
 pub mod hkdf;
 pub mod protobuf;
 pub mod securemessage;
+pub mod ukey2;
