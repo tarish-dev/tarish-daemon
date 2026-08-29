@@ -18,6 +18,7 @@
 //! | `d2d` — post-handshake traffic keys | **done**, Bada vectors |
 //! | SecureMessage codec | not started |
 //! | UKEY2 handshake | not started |
+//! | `protobuf` — minimal wire codec | **done** |
 //! | wire framing, offline frames | not started |
 //! | connection state machines | not started |
 //! | sharing FSM, payload | not started |
@@ -28,3 +29,4 @@
 
 pub mod d2d;
 pub mod hkdf;
+pub mod protobuf;
