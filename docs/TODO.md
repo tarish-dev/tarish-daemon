@@ -9,6 +9,63 @@ did not exist, and the live work was two hundred lines down.
 
 ## Open
 
+### Sending does not find peers: we hear their questions, never their answers
+
+**Top priority.** Reported by multiple users as "sending is unreliable, receiving is
+good", and reproduced on mustang against a MacBook in Everyone mode with awdl0 up.
+
+Reproduced with the radio verified up for the whole window, sampled every 15s, so
+this is NOT the radio gate and NOT the device dozing — both of which confounded
+earlier attempts and produced false negatives:
+
+```
+t+15s .. t+90s   wanted=1  mosey0=up  Awake     (every sample)
+result:          0 found, 2 lost, 64 _airdrop._tcp QUESTIONS received
+```
+
+**The asymmetry is the clue.** We receive the peer's browse questions continuously —
+so the AWDL link works, we are in its cluster, and we are on a channel it transmits
+on. It never sends an answer. It is browsing, not advertising to us.
+
+Ruled out by measurement:
+
+- not the chip: identical on mustang (Netlink, stable AWDL) and frankel (radiotap)
+- not the channel: same result frozen on 6 and on 44
+- not the Everyone timeout: the Mac stayed in Everyone throughout
+- not a static BLE payload: Apple's own beacon payload is static too (contact hashes
+  do not rotate); what rotates on a real sender is the BLE address, which Android
+  already randomises for us
+- not the BT adapter being wedged: cycling it did not restore discovery
+
+**Prime suspect: our BLE beacon is not being accepted.** Receivers advertise in
+RESPONSE to a sender's beacon — without one a correct mDNS responder stays invisible,
+which is exactly the shape of this. Either it is not reaching the Mac or macOS is
+rejecting it.
+
+Settling it needs the air, not more inference: capture our advertisement and compare
+it byte-for-byte against a real Apple sender's. The operator has done this before for
+GoOpenDrop and has the reference; the sniffing hardware was not to hand when this was
+found.
+
+### After a Bluetooth adapter cycle, the beacon never comes back
+
+Found while testing the above. With Bluetooth toggled off and on:
+
+- `settings get global bluetooth_on` returns 1, so the adapter is up
+- no `advertising AirDrop beacon` line appears again
+- an explicit `am startservice .../.BarqBleService` produces no line either, though
+  the same command logged one before the cycle
+
+So anything that cycles the adapter — airplane mode, a system event, the user
+toggling Bluetooth — appears to leave Barq silently not advertising, with no error
+and no recovery. That would break both directions, not just sending.
+
+Not yet isolated: whether the advertiser fails, throws, or is never re-issued. The
+service record still exists in dumpsys, so the service is alive. Worth a
+`onStartFailure` log and an adapter-state receiver that re-advertises on STATE_ON.
+
+
+
 ### AWDL and Wi-Fi cannot run together on BCM4383, and the fallback hides it
 
 **Second priority, after VPN lockdown.**
