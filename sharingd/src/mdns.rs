@@ -442,6 +442,17 @@ impl Browser {
         }
     }
 
+    /// Forget every peer, so the next query rebuilds the table from scratch.
+    ///
+    /// For an explicit user refresh. Expiry alone is not enough: a peer whose records
+    /// we still hold but which has become unreachable stays listed until its TTL runs
+    /// out, and on a link that flaps -- frankel, where AWDL owns the radio and Wi-Fi
+    /// scans contend with it -- that is exactly the state a user is looking at when
+    /// they reach for refresh.
+    pub fn forget_peers(&mut self) {
+        self.peers.clear();
+    }
+
     /// Drop peers not heard from recently. mDNS TTLs are advisory; a peer that
     /// walks away simply stops announcing.
     pub fn expire(&mut self, older_than: Duration) {

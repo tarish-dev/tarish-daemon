@@ -65,6 +65,16 @@ interface IBarqService {
     BarqPeer[] getPeers();
 
     /**
+     * Forget every discovered peer and browse again from scratch.
+     *
+     * getPeers() already asks for a fresh query, but it does not DISCARD what is
+     * already known -- so a peer that has gone away stays listed until its TTL
+     * expires, and one that was never fully resolved stays half-resolved. This drops
+     * the table, the resolved-name cache and the probe record, then re-queries.
+     */
+    void refreshPeers();
+
+    /**
      * Offer files to a peer. The client passes already-open descriptors so the
      * daemon never needs storage permissions or access to the client's files.
      * Returns a transfer id used by the callbacks.

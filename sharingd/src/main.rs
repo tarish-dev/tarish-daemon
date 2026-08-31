@@ -340,6 +340,7 @@ struct BarqService {
     transfers: Transfers,
     names: PeerNames,
     query_now: QueryNow,
+    refresh_now: QueryNow,
     /// Bumped by every setDiscoverable call so an older auto-off timer knows it has
     /// been superseded and must not switch visibility off under a newer request.
     visibility_generation: Arc<std::sync::atomic::AtomicU64>,
@@ -358,6 +359,7 @@ impl BarqService {
             transfers: Arc::new(TransferState::default()),
             names: Arc::new(Mutex::new(std::collections::HashMap::new())),
             query_now: Arc::new(AtomicBool::new(false)),
+            refresh_now: Arc::new(AtomicBool::new(false)),
             visibility_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             discoverable,
             active: Arc::new(AtomicBool::new(false)),
@@ -465,6 +467,23 @@ impl IBarqService for BarqService {
         // onPause, which on a real device means several times a second while a file
         // picker is opening. The gate thread decides what to do about it.
         self.active.store(active, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn refreshPeers(&self) -> BinderResult<()> {
+        // Clear the published snapshot here, and let the discovery loop clear what it
+        // owns -- its own table, the resolved-name cache and the probe record. Doing
+        // only this half would look like it worked for one poll and then repopulate
+        // from the browser's stale table.
+        if let Ok(mut p) = self.peers.lock() {
+            p.clear();
+        }
+        if let Ok(mut n) = self.names.lock() {
+            n.clear();
+        }
+        self.refresh_now.store(true, Ordering::SeqCst);
+        self.query_now.store(true, Ordering::SeqCst);
+        log::info!("refreshPeers: dropped the peer table, re-browsing");
         Ok(())
     }
 
@@ -716,6 +735,7 @@ fn start_discovery(
     names: PeerNames,
     discoverable: Discoverable,
     query_now: QueryNow,
+    refresh_now: QueryNow,
 ) {
     std::thread::spawn(move || {
         let mut browser = loop {
@@ -845,6 +865,17 @@ fn start_discovery(
             if was_advertising && since_announce >= Duration::from_secs(20) {
                 let _ = browser.announce();
                 since_announce = Duration::ZERO;
+            }
+
+            // An explicit refresh drops everything we think we know first, so the
+            // query that follows rebuilds rather than tops up.
+            if refresh_now.swap(false, Ordering::SeqCst) {
+                browser.forget_peers();
+                probed.clear();
+                if let Ok(mut shared) = peers.lock() {
+                    shared.clear();
+                }
+                log::info!("refresh: peer table cleared, re-browsing from scratch");
             }
 
             // Re-query periodically; peers answer, and new ones announce anyway.
@@ -1052,6 +1083,7 @@ fn main() {
         service.names.clone(),
         discoverable.clone(),
         service.query_now.clone(),
+        service.refresh_now.clone(),
     );
     // The HTTP server refuses transfers while invisible and announces finished ones,
     // so it needs both the flag and the callback list the service owns.
