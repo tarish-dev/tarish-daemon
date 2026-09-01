@@ -164,6 +164,23 @@ side:
 One architectural decision, opposite outcomes at two gates. Worth remembering before
 assuming anything about how a third gate treats us.
 
+### This is a gap OUR ARCHITECTURE opened, and it predates the AID
+
+Not caused by choosing uid 7500. In the same measurement uid **9999** (`nobody`) was
+also absent from the lockdown map, so the daemon was equally exempt before the AID
+existed. What creates the exemption is the decision that the untrusted half is a
+**native daemon rather than an app** — which has been true since the first commit.
+
+Stated plainly, because it is the reason this work matters: a person enables "Block
+connections without VPN", believes their device cannot move data off itself outside
+the tunnel, and Barq can still advertise, discover and transfer files to a device
+across the room. That is a data-exfiltration path under a control they deliberately
+switched on. Narrower than a rogue app phoning home, since it is local rather than
+internet-facing, but data still leaves on a path the user believes is closed.
+
+So the session model is **remediation, not a feature**. Its priority is not "make Barq
+usable under lockdown" but "stop Barq being the thing that undermines lockdown".
+
 ### So the work is to honour lockdown, not to bypass it
 
 There is no hole to open — we already have one, and we did not ask for it. A person
