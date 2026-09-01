@@ -109,31 +109,56 @@ So the same uid choice that cost us a Connectivity patch for local-network acces
 hand us lockdown exemption for nothing. Assuming symmetry between two gates in one file
 would be wrong in both directions.
 
-### THE MEASUREMENT THAT DECIDES THE DESIGN
+### ANSWERED: 7500 IS in scope, and only multicast is blocked
 
-**Does uid 7500 ever carry `LOCKDOWN_VPN_MATCH`?** That is computed Java-side in
-`Vpn.java`, which works out the uid ranges a VPN applies to. If native system uids are
-never included, the multicast rule never fires for us and lockdown does not reach Barq.
+Read from source rather than measured, because it is unambiguous. `Vpn.java` builds
+the lockdown block list from the whole per-user range and carves out only uid 0:
+
+```java
+// The UID range of the first user (0-99999) would block the IPSec traffic, which comes
+// directly from the kernel and is marked as uid=0. So we adjust the range to allow it
+// through (b/69873852).
+rangesThatShouldBeBlocked.add(new UidRangeParcel(1, range.getUpper()));
+```
+
+So uids **1..99999** carry `LOCKDOWN_VPN_MATCH`, and 7500 is one of them. An earlier
+draft of this document claimed we were probably exempt because `is_system_uid` covers
+uid < 10000. That was wrong: the exemption exists, but the multicast check runs FIRST.
+
+| traffic from uid 7500 under lockdown | outcome |
+|---|---|
+| multicast — mDNS, so AirDrop AND Quick Share discovery | **DROPPED** |
+| unicast — an established transfer | **PASSES** via `is_system_uid` |
+
+**Discovery dies; transfers survive.** That is the whole problem, and it is much
+narrower than "Barq does not work under lockdown".
+
+So the exemption we would need is not "let Barq talk" but **"let uid 7500 send mDNS
+multicast while a session is open"**. Unicast needs nothing. That is a far smaller
+thing to argue for, and it lines up exactly with the session model, since discovery is
+what a session exists to enable.
+
+Still worth confirming on hardware once a VPN app is installed — enable lockdown, read
+`dumpsys connectivity trafficcontroller`, and check that 7500 appears with the lockdown
+bit. Source says it must; measuring costs two minutes and this file has been wrong once.
+
+### The measurement, for the record
 
 Enable always-on VPN with lockdown, then read `dumpsys connectivity trafficcontroller`
-and look for 7500. Everything below depends on the answer.
+and confirm 7500 carries the lockdown bit. Needs a VPN app installed; mustang has only
+`com.android.vpndialogs`, which is not one.
 
-### If we are exempt, that is a hole to close, not a gift
+### This is a real hole, and it deserves its own argument
 
-A person enabling "Block connections without VPN" believes traffic is blocked. A daemon
-that keeps sending because its uid happens to be under 10000 is an unintended hole — we
-did not open it, but benefiting from it silently is not defensible.
+Since we ARE in scope, this is not "close a gap we inherited" — it is opening one that
+the platform deliberately closed, in a security control the user or their administrator
+switched on. That is categorically different from the local-network grant, which gave
+us a capability the platform already gives to packages and merely withholds from
+uid-only daemons.
 
-So the design is not "how do we bypass lockdown". It is **honour lockdown ourselves,
-and depart from it only with authentication**. That inverts the problem usefully:
-
-- no framework patch, because we are not opening anything
-- fail-closed for free, because the default is our own refusal
-
-If it turns out we are *not* exempt, this becomes a genuine exemption mechanism and a
-second Connectivity patch — one whose purpose is a hole in a security control the user
-chose, which is categorically different from the local-network grant and deserves a
-separate argument before anyone writes it.
+Nobody should write that patch until the narrow version is argued on its merits:
+multicast only, only while an authenticated session is open, revoked on every path that
+ends a session. Anything wider is not defensible.
 
 ### The session model
 
