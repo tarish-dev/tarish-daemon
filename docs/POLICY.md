@@ -98,16 +98,18 @@ if (is_system_uid(uid)) return PASS;
 mDNS is multicast, for AirDrop and Quick Share alike. So under lockdown *discovery*
 dies first, and independently of everything below.
 
-**The exempt sets of the two gates in this file are different**, which is a trap:
+**The exempt sets of the two gates in this file are different**, which is a trap in
+both directions:
 
 | gate | exempt set | uid 7500 |
 |---|---|---|
 | local network access | `is_system_or_root` — uid 0 and 1000 only | **caught** |
-| VPN lockdown | `is_system_uid` — uid < 10000 | **exempt** |
+| VPN lockdown, unicast | `is_system_uid` — uid < 10000 | **exempt** |
+| VPN lockdown, multicast | none — checked before the exemption | **caught** |
 
-So the same uid choice that cost us a Connectivity patch for local-network access may
-hand us lockdown exemption for nothing. Assuming symmetry between two gates in one file
-would be wrong in both directions.
+Reading only the first two rows is how this document came to claim, wrongly, that we
+escape lockdown. The multicast check runs above the exemption, so the exemption is real
+and irrelevant for discovery. See the next section.
 
 ### ANSWERED: 7500 IS in scope, and only multicast is blocked
 
