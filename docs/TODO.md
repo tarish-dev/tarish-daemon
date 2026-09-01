@@ -50,7 +50,20 @@ beacon: advertising   wanted=1   mosey0=up   bluetooth=1
 
 Unchanged. So the beacon being absent does not explain it.
 
-**Prime suspect remains that our beacon is not ACCEPTED,** Receivers advertise in
+**Our mDNS stack is proven good IN THE OTHER DIRECTION, on the same link.** With the
+phone in receive mode:
+
+```
+barqsharingd::mdns: answered 8 record(s) to ["_airdrop._tcp.local/12"]
+```
+
+So the peer's queries reach us, we answer them, and it finds us — that is why
+receiving works. The same link, the same interface, the same responder. Only the
+reverse direction fails, and it fails because the peer never advertises.
+
+Since a receiver advertises only after seeing and ACCEPTING a sender's BLE beacon,
+and ours is confirmed advertising, the surviving explanation is that macOS is not
+accepting our beacon, Receivers advertise in
 RESPONSE to a sender's beacon — without one a correct mDNS responder stays invisible,
 which is exactly the shape of this. Either it is not reaching the Mac or macOS is
 rejecting it.
