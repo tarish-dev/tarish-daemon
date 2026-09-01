@@ -64,15 +64,6 @@ interface IBarqService {
     /** Peers currently known. Fresh as of the last discovery round. */
     BarqPeer[] getPeers();
 
-    /**
-     * Forget every discovered peer and browse again from scratch.
-     *
-     * getPeers() already asks for a fresh query, but it does not DISCARD what is
-     * already known -- so a peer that has gone away stays listed until its TTL
-     * expires, and one that was never fully resolved stays half-resolved. This drops
-     * the table, the resolved-name cache and the probe record, then re-queries.
-     */
-    void refreshPeers();
 
     /**
      * Offer files to a peer. The client passes already-open descriptors so the
@@ -116,4 +107,20 @@ interface IBarqService {
      */
     void registerCallback(IBarqCallback cb);
     void unregisterCallback(IBarqCallback cb);
+
+    /**
+     * Forget every discovered peer and browse again from scratch.
+     *
+     * getPeers() already asks for a fresh query but does not DISCARD what is known,
+     * so a peer that has gone away stays listed until its TTL expires and one that
+     * never fully resolved stays half-resolved. This drops the table, the
+     * resolved-name cache and the probe record, then re-queries.
+     *
+     * DECLARED LAST, AND NEW METHODS MUST BE TOO. AIDL numbers transactions by
+     * position, so inserting one in the middle renumbers every method below it. This
+     * was originally added after getPeers(), which silently shifted sendFiles and
+     * everything after — the call then lands on the wrong method and the failure is a
+     * bare NullPointerException out of Parcel.createExceptionOrNull, naming nothing.
+     */
+    void refreshPeers();
 }
