@@ -132,13 +132,26 @@ mosey0: up      mdns rx: 11      answered: 6      EPERM: 0
 
 Discovery works. Multicast is neither dropped nor degraded.
 
-**Why, and it is not what either source reading suggested.** Not `is_system_uid`, and
-not the `UidRangeParcel(1, upper)` range either. The lockdown ranges are built by
-`createUserAndRestrictedProfilesRanges`, which resolves its arguments **through the
-package manager** — so only uids that HAVE PACKAGES ever enter the range. Note which
-system uids do carry the bit: 1002 (bluetooth), 1027 (nfc), 1068 — all of them uids
-with packages. `barqsharingd` is a native daemon with an AID and no package, so it is
-never in the set.
+**Why is NOT settled.** Three explanations have been tried and two are definitely
+wrong. It is not `is_system_uid` (that exemption sits below the multicast check), not
+the `UidRangeParcel(1, upper)` range (which would cover 7500), and not "only uids with
+packages" — measured:
+
+| uid | | lockdown |
+|---|---|---|
+| 1000 `system` | has packages | **no** |
+| 1001 `radio` | has packages | **no** |
+| 1002 `bluetooth` | has packages | **yes** |
+| 1027 `nfc` | has packages | **yes** |
+| 7500 `system_ext_barq` | no package | **no** |
+| 10000+ | apps | **yes** |
+
+1000 and 1001 have packages and escape; 1002 and 1027 have packages and are caught. So
+something distinguishes core system uids from the rest, and this document is not going
+to guess at it a fourth time. **The measurement is the fact; the mechanism is open.**
+
+Practical consequence of not knowing the mechanism: do not assume this survives an
+Android version bump. Re-measure.
 
 **This is the same fact that cost us the Connectivity patch**, seen from the other
 side:
