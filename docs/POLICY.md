@@ -111,56 +111,61 @@ Reading only the first two rows is how this document came to claim, wrongly, tha
 escape lockdown. The multicast check runs above the exemption, so the exemption is real
 and irrelevant for discovery. See the next section.
 
-### ANSWERED: 7500 IS in scope, and only multicast is blocked
+### MEASURED: uid 7500 is NOT subject to lockdown at all
 
-Read from source rather than measured, because it is unambiguous. `Vpn.java` builds
-the lockdown block list from the whole per-user range and carves out only uid 0:
+This section has now been wrong twice from source reading and is settled by
+measurement. WireGuard installed, a real profile imported, always-on with lockdown
+enabled, rebooted so `Vpn.loadAlwaysOnPackage()` picks it up:
 
-```java
-// The UID range of the first user (0-99999) would block the IPSec traffic, which comes
-// directly from the kernel and is marked as uid=0. So we adjust the range to allow it
-// through (b/69873852).
-rangesThatShouldBeBlocked.add(new UidRangeParcel(1, range.getUpper()));
+```
+7500   PERMISSION_ACCESS_LOCAL_NETWORK PERMISSION_INTERNET     <- permission map only
+                                                                  NO LOCKDOWN_VPN_MATCH
+lowest uids carrying lockdown:  1002, 1027, 1068, 10000
+total uids under lockdown:      200
 ```
 
-So uids **1..99999** carry `LOCKDOWN_VPN_MATCH`, and 7500 is one of them. An earlier
-draft of this document claimed we were probably exempt because `is_system_uid` covers
-uid < 10000. That was wrong: the exemption exists, but the multicast check runs FIRST.
+And behaviourally, with lockdown active and NO tunnel up at all:
 
-| traffic from uid 7500 under lockdown | outcome |
+```
+mosey0: up      mdns rx: 11      answered: 6      EPERM: 0
+```
+
+Discovery works. Multicast is neither dropped nor degraded.
+
+**Why, and it is not what either source reading suggested.** Not `is_system_uid`, and
+not the `UidRangeParcel(1, upper)` range either. The lockdown ranges are built by
+`createUserAndRestrictedProfilesRanges`, which resolves its arguments **through the
+package manager** — so only uids that HAVE PACKAGES ever enter the range. Note which
+system uids do carry the bit: 1002 (bluetooth), 1027 (nfc), 1068 — all of them uids
+with packages. `barqsharingd` is a native daemon with an AID and no package, so it is
+never in the set.
+
+**This is the same fact that cost us the Connectivity patch**, seen from the other
+side:
+
+| | consequence |
 |---|---|
-| multicast — mDNS, so AirDrop AND Quick Share discovery | **DROPPED** |
-| unicast — an established transfer | **PASSES** via `is_system_uid` |
+| no package -> `PermissionMonitor` never grants it the local-network bit | had to patch |
+| no package -> `Vpn` never puts it in a lockdown range | exempt for free |
 
-**Discovery dies; transfers survive.** That is the whole problem, and it is much
-narrower than "Barq does not work under lockdown".
+One architectural decision, opposite outcomes at two gates. Worth remembering before
+assuming anything about how a third gate treats us.
 
-So the exemption we would need is not "let Barq talk" but **"let uid 7500 send mDNS
-multicast while a session is open"**. Unicast needs nothing. That is a far smaller
-thing to argue for, and it lines up exactly with the session model, since discovery is
-what a session exists to enable.
+### So the work is to honour lockdown, not to bypass it
 
-Still worth confirming on hardware once a VPN app is installed — enable lockdown, read
-`dumpsys connectivity trafficcontroller`, and check that 7500 appears with the lockdown
-bit. Source says it must; measuring costs two minutes and this file has been wrong once.
+There is no hole to open — we already have one, and we did not ask for it. A person
+enabling "Block connections without VPN" believes traffic is blocked; a daemon that
+keeps advertising and answering mDNS because it happens to have no package is not
+something to quietly benefit from.
 
-### The measurement, for the record
+So: **no framework patch, and none should be written.** Barq detects lockdown and
+disables itself, and the session model below is what re-enables it after
+authentication. Everything is enforced in our own code, which also means it is
+fail-closed by construction rather than by asking netd nicely.
 
-Enable always-on VPN with lockdown, then read `dumpsys connectivity trafficcontroller`
-and confirm 7500 carries the lockdown bit. Needs a VPN app installed; mustang has only
-`com.android.vpndialogs`, which is not one.
-
-### This is a real hole, and it deserves its own argument
-
-Since we ARE in scope, this is not "close a gap we inherited" — it is opening one that
-the platform deliberately closed, in a security control the user or their administrator
-switched on. That is categorically different from the local-network grant, which gave
-us a capability the platform already gives to packages and merely withholds from
-uid-only daemons.
-
-Nobody should write that patch until the narrow version is argued on its merits:
-multicast only, only while an authenticated session is open, revoked on every path that
-ends a session. Anything wider is not defensible.
+Detecting lockdown: the app reads `Settings.Secure.always_on_vpn_lockdown` (and
+`always_on_vpn_app`), which is readable to a platform-signed app, and relays it to the
+daemon alongside the rest of the policy.
 
 ### The session model
 
