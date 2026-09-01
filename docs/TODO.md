@@ -174,7 +174,16 @@ radiotap path needs the equivalent.
 
 ### Always-on VPN lockdown breaks peer-to-peer, and should not just fail silently
 
-**Priority: first.** Operator requirement.
+**Priority: first.** Operator requirement. **The mechanism is now designed — see
+docs/POLICY.md.** Session-based rather than per-transfer, because discovery is
+continuous and cannot be authorised as an event.
+
+**Blocked on one measurement**, which decides whether any of it is needed: does uid
+7500 ever carry `LOCKDOWN_VPN_MATCH`? Enable lockdown, read `dumpsys connectivity
+trafficcontroller`. The bpf program exempts `is_system_uid` (uid < 10000) from the
+general lockdown rules — a WIDER exemption than the local-network gate's
+`is_system_or_root` — so we may be exempt already, in which case the work is to
+honour lockdown voluntarily rather than to bypass it.
 
 Android's *Block connections without VPN* (always-on VPN lockdown) is a good setting
 and enterprises rightly turn it on. It also breaks every peer-to-peer transfer that
