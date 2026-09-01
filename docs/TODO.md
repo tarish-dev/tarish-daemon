@@ -37,7 +37,20 @@ Ruled out by measurement:
   already randomises for us
 - not the BT adapter being wedged: cycling it did not restore discovery
 
-**Prime suspect: our BLE beacon is not being accepted.** Receivers advertise in
+**A dead beacon is NOT the cause — tested.** The service had a real bug (it never
+recovered after a Bluetooth cycle, and `am stopservice`/`startservice` killed
+advertising without restarting it, which invalidated several measurements taken
+during this investigation). That is fixed in barq-app 2d19065. With the beacon then
+verified advertising, the radio up and Bluetooth on:
+
+```
+beacon: advertising   wanted=1   mosey0=up   bluetooth=1
+60s:    found=0  lost=1  questions=15
+```
+
+Unchanged. So the beacon being absent does not explain it.
+
+**Prime suspect remains that our beacon is not ACCEPTED,** Receivers advertise in
 RESPONSE to a sender's beacon — without one a correct mDNS responder stays invisible,
 which is exactly the shape of this. Either it is not reaching the Mac or macOS is
 rejecting it.
