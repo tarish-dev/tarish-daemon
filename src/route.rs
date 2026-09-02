@@ -44,6 +44,7 @@ const RTA_TABLE: u16 = 15;
 const FRA_PRIORITY: u16 = 6;
 const FRA_TABLE: u16 = 15;
 const FRA_OIFNAME: u16 = 17;
+const FRA_UID_RANGE: u16 = 20;
 const FR_ACT_TO_TBL: u8 = 1;
 
 /// Rule priority. Must sit above Android's own rules and below the catch-all
@@ -121,6 +122,36 @@ pub fn add_link_local(iface: &str) -> io::Result<()> {
     send_nl(RTM_NEWROUTE, &body)
 }
 
+/// The one uid allowed to route over the AWDL link.
+///
+/// Resolved BY NAME rather than hardcoded, because the number already lives in two
+/// places — `config/barq_aid.txt` here and the integrator's Connectivity patch, which
+/// has to be kept in step with it. A third copy would be a third thing to forget, and
+/// getting it wrong here fails silently in the safe-looking direction: a rule scoped to
+/// the wrong uid still installs, and only the traffic stops.
+///
+/// Failing to resolve is fatal to the rule rather than falling back to "any uid". The
+/// whole point is that nothing else reaches this interface, so a fallback that quietly
+/// opened it up would be worse than no rule at all.
+fn sharing_uid() -> io::Result<u32> {
+    let name = CString::new("system_ext_barq").map_err(|_| io::Error::other("bad uid name"))?;
+    // SAFETY: name is a valid NUL-terminated string, and getpwnam returns a pointer
+    // into static storage that we only read synchronously before returning a copy.
+    let pw = unsafe { libc::getpwnam(name.as_ptr()) };
+    if pw.is_null() {
+        return Err(io::Error::other("system_ext_barq is not a known user"));
+    }
+    // SAFETY: checked non-null above; passwd is plain old data.
+    Ok(unsafe { (*pw).pw_uid })
+}
+
+/// `struct fib_rule_uid_range` from linux/fib_rules.h — two u32, inclusive.
+#[repr(C)]
+struct FibRuleUidRange {
+    start: u32,
+    end: u32,
+}
+
 /// Point traffic leaving `iface` at that interface's table.
 ///
 /// A route in a table nothing consults is invisible. Android selects tables with
@@ -132,6 +163,9 @@ pub fn add_link_local(iface: &str) -> io::Result<()> {
 /// which reads as a missing route rather than a missing rule; inbound is worse,
 /// because SYNs arrive, our replies have nowhere to go, and it looks exactly like
 /// nothing is listening on the port.
+///
+/// The rule is scoped to a single uid, so this is also the only thing standing
+/// between any other process on the device and the AWDL link. See `sharing_uid`.
 pub fn add_rule(iface: &str) -> io::Result<()> {
     let idx = index_of(iface)?;
 
@@ -176,6 +210,30 @@ pub fn add_rule(iface: &str) -> io::Result<()> {
     put_attr(&mut body, FRA_OIFNAME, &name);
     put_attr(&mut body, FRA_TABLE, &idx.to_ne_bytes());
     put_attr(&mut body, FRA_PRIORITY, &RULE_PRIORITY.to_ne_bytes());
+
+    // SCOPE THE RULE TO ONE UID.
+    //
+    // Without this, any process that knows the peer's link-local address and the
+    // interface scope id can route over the AWDL link. Nothing in Android stops it:
+    // there is no netifcon labelling for interfaces (the platform policy contains no
+    // netifcon statements at all), mosey0 is not a managed network so the local-network
+    // gate never sees it, and SO_BINDTODEVICE is not required when a scope id will do.
+    //
+    // With the rule scoped, a different uid matches no rule for mosey0, falls through
+    // to the unreachable default, and gets ENETUNREACH. No route, no traffic.
+    //
+    // This restricts ROUTING, not raw sockets: CAP_NET_RAW can still bind the interface
+    // and inject. That is accepted -- anything holding it is already root-equivalent.
+    let uid = sharing_uid()?;
+    let range = FibRuleUidRange { start: uid, end: uid };
+    // SAFETY: FibRuleUidRange is repr(C) and plain old data.
+    let range_bytes = unsafe {
+        std::slice::from_raw_parts(
+            &range as *const FibRuleUidRange as *const u8,
+            mem::size_of::<FibRuleUidRange>(),
+        )
+    };
+    put_attr(&mut body, FRA_UID_RANGE, range_bytes);
 
     send_nl(RTM_NEWRULE, &body)
 }
