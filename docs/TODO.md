@@ -9,6 +9,47 @@ did not exist, and the live work was two hundred lines down.
 
 ## Open
 
+### refreshPeers is not dispatched — the daemon exposes 10 transactions, not 11
+
+The refresh control is wired in the app and reaches the daemon without throwing, but
+the daemon method never executes: nothing logged, no peer dropped, no re-browse.
+
+Bisected past the app by calling the transaction directly:
+
+```
+service call dev.barq.IBarqService/default 3    -> real handler responds
+service call dev.barq.IBarqService/default 9    -> real handler responds
+service call dev.barq.IBarqService/default 10   -> real handler responds
+service call dev.barq.IBarqService/default 11   -> Unknown transaction
+```
+
+AIDL numbers transactions in declaration order from 1, and `refreshPeers` is the 11th
+method, so the running daemon was built against an interface without it.
+
+**Three facts that cannot all hold of one build, which is why this is unresolved:**
+
+1. the deployed binary CONTAINS the string `refreshPeers: dropped the peer table`
+2. `main.rs` has the method inside `impl IBarqService for BarqService` (line 473,
+   block opens at 414) — the right place, and an extra method there would not compile
+   against a trait lacking it
+3. the running daemon dispatches only 10 transactions
+
+So something in AIDL generation or the vendor/barq copy chain is serving a stale
+interface to one side. Suspect a cached `dev.barq-rust` in the soong intermediates
+surviving an aidl change, since the file itself is copied fresh by gos-barq.sh.
+
+Worth trying first: a clean build of `dev.barq-rust`, and comparing the generated
+transaction constants against the app's `dev.barq-java`.
+
+**Do not ship the button until this is understood.** A control that looks functional
+and silently does nothing teaches users that refresh does not help.
+
+Prior related mistake, already fixed: refreshPeers was originally declared in the
+MIDDLE of the interface, which renumbered every method after it. That is an ABI break
+across two independently-deployed artifacts and presented as a bare
+NullPointerException from Parcel.createExceptionOrNull. New methods go at the end.
+
+
 ### Sending does not find peers: we hear their questions, never their answers
 
 **Top priority.** Reported by multiple users as "sending is unreliable, receiving is
