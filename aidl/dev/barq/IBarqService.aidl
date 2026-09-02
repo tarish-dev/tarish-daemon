@@ -2,6 +2,7 @@ package dev.barq;
 
 import dev.barq.IBarqCallback;
 import dev.barq.BarqPeer;
+import dev.barq.BarqPolicy;
 import dev.barq.BarqStatus;
 
 /**
@@ -123,4 +124,46 @@ interface IBarqService {
      * bare NullPointerException out of Parcel.createExceptionOrNull, naming nothing.
      */
     void refreshPeers();
+
+    /** Neither direction is permitted. */
+    const int MODE_OFF = 0;
+    /** May be discovered and may accept incoming transfers; may not send. */
+    const int MODE_RECEIVE = 1;
+    /** May discover peers and send; is not discoverable and refuses incoming. */
+    const int MODE_SEND = 2;
+    const int MODE_BOTH = 3;
+
+    /**
+     * Install the policy this device is to enforce.
+     *
+     * ENFORCEMENT LIVES HERE, NOT IN THE APP. barqsharingd is what advertises, browses,
+     * accepts connections and writes files, so it has to be the thing that refuses. An
+     * app that merely hides the affordance is bypassed by killing the app and talking to
+     * the daemon directly, which is not a policy control at all.
+     *
+     * The daemon starts DENIED and opens only on being told, so a daemon that has never
+     * heard from the app shares nothing. That is the opposite of the radio gate, where an
+     * unset property means radio-ON — right there, because a missing property should not
+     * silently disable sharing, and wrong here, where a missing policy must not silently
+     * permit it. Do not copy the pattern across.
+     *
+     * The app calls this on every bind, not only on change: the daemon holds policy in
+     * memory and a restart must not leave it running on a stale grant.
+     */
+    void setPolicy(in BarqPolicy policy);
+
+    /** What the daemon is currently enforcing, for the settings screen to render. */
+    BarqPolicy getPolicy();
+
+    /**
+     * Change the advertised name, persisting it across reboots.
+     *
+     * The app cannot write this itself: the name lives in `persist.barq.name`, and
+     * setting a persist property needs a policy grant the app does not have and should
+     * not be given. Passing empty restores the device-model default.
+     */
+    void setDeviceName(String name);
+
+    /** The name currently advertised, resolved through the same fallbacks the daemon uses. */
+    String getDeviceName();
 }

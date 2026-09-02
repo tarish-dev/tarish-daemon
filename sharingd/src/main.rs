@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use dev_barq::aidl::dev::barq::{
     BarqPeer::BarqPeer,
+    BarqPolicy::BarqPolicy,
     BarqStatus::BarqStatus,
     IBarqCallback::IBarqCallback,
     IBarqService::{BnBarqService, IBarqService},
@@ -179,6 +180,33 @@ fn device_name() -> String {
     read_property("persist.barq.name")
         .or_else(|| read_property("ro.product.model"))
         .unwrap_or_else(|| "Barq".to_string())
+}
+
+/// Persist the advertised name, or clear it back to the device-model default.
+///
+/// A `persist.` property survives reboot, which is what makes the name stick without
+/// this daemon keeping a file of its own. The app cannot write it -- setting a persist
+/// property needs a policy grant an app should not have -- so it comes through binder.
+///
+/// PROP_VALUE_MAX is 92 bytes and __system_property_set silently fails past it, so the
+/// name is truncated on a CHARACTER boundary first; cutting mid-UTF-8 would advertise
+/// invalid bytes in an mDNS TXT record.
+fn set_device_name(name: &str) {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        write_property("persist.barq.name", "");
+        log::info!("device name cleared — falling back to {:?}", device_name());
+        return;
+    }
+    let mut cut = trimmed;
+    while cut.len() > 90 {
+        cut = &cut[..cut.char_indices().last().map(|(i, _)| i).unwrap_or(0)];
+    }
+    if write_property("persist.barq.name", cut) {
+        log::info!("device name set to {cut:?}");
+    } else {
+        log::warn!("could not write persist.barq.name");
+    }
 }
 
 /// Take an owned File from a descriptor the client passed over binder.
@@ -350,6 +378,40 @@ struct BarqService {
     /// Last Wi-Fi frequency the client reported, so we only write on a change.
     sta_freq: Arc<std::sync::atomic::AtomicI32>,
     peers: PeerTable,
+    /// What this device is permitted to do. Starts DENIED -- see setPolicy in the AIDL.
+    policy: Arc<Mutex<BarqPolicy>>,
+    /// Mirrors policy.requireConfirmation for the accept loop, which runs on the httpd
+    /// threads and must not take the policy lock on every offer.
+    auto_accept: Arc<AtomicBool>,
+}
+
+/// Deny everything. A daemon that has never heard from the app shares nothing.
+fn denied_policy() -> BarqPolicy {
+    BarqPolicy {
+        airdrop: MODE_OFF,
+        quickshare: MODE_OFF,
+        requireConfirmation: true,
+        deviceName: String::new(),
+        airdropManaged: false,
+        quickshareManaged: false,
+        requireConfirmationManaged: false,
+        deviceNameManaged: false,
+    }
+}
+
+// Mirrors the constants in IBarqService.aidl. Kept as plain consts because the Rust
+// backend does not expose interface constants in a form that can be matched on.
+const MODE_OFF: i32 = 0;
+const MODE_RECEIVE: i32 = 1;
+const MODE_SEND: i32 = 2;
+const MODE_BOTH: i32 = 3;
+
+fn allows_receive(mode: i32) -> bool {
+    mode == MODE_RECEIVE || mode == MODE_BOTH
+}
+
+fn allows_send(mode: i32) -> bool {
+    mode == MODE_SEND || mode == MODE_BOTH
 }
 
 impl BarqService {
@@ -365,7 +427,20 @@ impl BarqService {
             active: Arc::new(AtomicBool::new(false)),
             sta_freq: Arc::new(std::sync::atomic::AtomicI32::new(-1)),
             peers,
+            policy: Arc::new(Mutex::new(denied_policy())),
+            auto_accept: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// The AirDrop mode currently enforced. Denied if the lock is poisoned: a policy
+    /// we cannot read is not a policy we may act on.
+    fn airdrop_mode(&self) -> i32 {
+        self.policy.lock().map(|p| p.airdrop).unwrap_or(MODE_OFF)
+    }
+
+    #[allow(dead_code)]
+    fn quickshare_mode(&self) -> i32 {
+        self.policy.lock().map(|p| p.quickshare).unwrap_or(MODE_OFF)
     }
 
     /// Is the AWDL link up? Asked of the kernel rather than of barqd, so this
@@ -423,6 +498,17 @@ impl IBarqService for BarqService {
     }
 
     fn setDiscoverable(&self, discoverable: bool, duration_seconds: i32) -> BinderResult<()> {
+        // Policy gate for the whole RECEIVE direction.
+        //
+        // Visibility is the entire consent model on the receiving side -- httpd refuses
+        // /Discover, /Ask and HEAD / whenever `visible()` is false -- so refusing to
+        // become visible is sufficient, and there is no second place to forget. Turning
+        // visibility OFF is always allowed: policy restricts sharing, never the ability
+        // to stop.
+        if discoverable && !allows_receive(self.airdrop_mode()) {
+            log::warn!("setDiscoverable refused — policy does not permit AirDrop receive");
+            return Err(Status::from(StatusCode::PERMISSION_DENIED));
+        }
         // Every call supersedes any pending auto-off, so a user who reopens the app
         // does not get switched off by a timer started the previous time.
         let gen = self
@@ -468,6 +554,70 @@ impl IBarqService for BarqService {
         // picker is opening. The gate thread decides what to do about it.
         self.active.store(active, Ordering::SeqCst);
         Ok(())
+    }
+
+    fn setPolicy(&self, policy: &BarqPolicy) -> BinderResult<()> {
+        log::info!(
+            "policy: airdrop={} quickshare={} confirm={} name={:?} (managed: a={} q={} c={} n={})",
+            policy.airdrop,
+            policy.quickshare,
+            policy.requireConfirmation,
+            policy.deviceName,
+            policy.airdropManaged,
+            policy.quickshareManaged,
+            policy.requireConfirmationManaged,
+            policy.deviceNameManaged,
+        );
+        self.auto_accept
+            .store(!policy.requireConfirmation, Ordering::SeqCst);
+
+        // A name that is no longer permitted must stop being advertised, so apply it
+        // here rather than only in setDeviceName -- an admin pinning a name should take
+        // effect on the next policy push without the app having to notice and call a
+        // second method.
+        if !policy.deviceName.is_empty() {
+            set_device_name(&policy.deviceName);
+        }
+
+        // Withdraw immediately if receiving is no longer allowed. Without this a device
+        // that was already discoverable stays on the air until its timer expires, which
+        // is exactly the window an administrator just closed.
+        if !allows_receive(policy.airdrop) && self.discoverable.load(Ordering::SeqCst) {
+            log::info!("policy withdrew AirDrop receive — going invisible now");
+            self.discoverable.store(false, Ordering::SeqCst);
+        }
+
+        match self.policy.lock() {
+            Ok(mut p) => *p = policy.clone(),
+            Err(_) => return Err(Status::from(StatusCode::UNKNOWN_ERROR)),
+        }
+        Ok(())
+    }
+
+    fn getPolicy(&self) -> BinderResult<BarqPolicy> {
+        let p = self
+            .policy
+            .lock()
+            .map_err(|_| Status::from(StatusCode::UNKNOWN_ERROR))?;
+        // Deref first: `p.clone()` would resolve to cloning the GUARD, not the policy.
+        Ok((*p).clone())
+    }
+
+    fn setDeviceName(&self, name: &str) -> BinderResult<()> {
+        if let Ok(p) = self.policy.lock() {
+            // An administrator pinned the name. Refuse rather than accept-and-revert:
+            // silently ignoring a write makes the settings screen look broken.
+            if p.deviceNameManaged {
+                log::warn!("setDeviceName refused — the name is managed");
+                return Err(Status::from(StatusCode::PERMISSION_DENIED));
+            }
+        }
+        set_device_name(name);
+        Ok(())
+    }
+
+    fn getDeviceName(&self) -> BinderResult<String> {
+        Ok(device_name())
     }
 
     fn refreshPeers(&self) -> BinderResult<()> {
@@ -569,6 +719,13 @@ impl IBarqService for BarqService {
         files: &[binder::ParcelFileDescriptor],
         names: &[String],
     ) -> BinderResult<i64> {
+        // Policy gate for the SEND direction. Checked here rather than in the app
+        // because this is the method that moves bytes: an app that hides its send
+        // button is bypassed by calling this directly.
+        if !allows_send(self.airdrop_mode()) {
+            log::warn!("sendFiles refused — policy does not permit AirDrop send");
+            return Err(Status::from(StatusCode::PERMISSION_DENIED));
+        }
         if files.len() != names.len() {
             log::warn!("sendFiles: {} descriptors but {} names", files.len(), names.len());
             return Err(Status::new_exception(binder::ExceptionCode::ILLEGAL_ARGUMENT, None));
@@ -969,7 +1126,12 @@ fn start_discovery(
 /// mosey0 may not exist or may have no address yet when we start, since barqd brings
 /// the link up independently. Retry rather than give up: failing here permanently
 /// would mean a daemon that is running, looks healthy, and can never be discovered.
-fn start_airdrop_server(discoverable: Discoverable, callbacks: Callbacks, transfers: Transfers) {
+fn start_airdrop_server(
+    discoverable: Discoverable,
+    callbacks: Callbacks,
+    transfers: Transfers,
+    auto_accept: Arc<AtomicBool>,
+) {
     std::thread::spawn(move || {
         let name = read_property("persist.barq.name")
             .or_else(|| read_property("ro.product.model"))
@@ -985,6 +1147,7 @@ fn start_airdrop_server(discoverable: Discoverable, callbacks: Callbacks, transf
                 discoverable.clone(),
                 callbacks.clone(),
                 transfers.clone(),
+                auto_accept.clone(),
             ) {
                 Ok(server) => {
                     log::info!("AirDrop server up as \"{name}\"");
@@ -1086,7 +1249,10 @@ fn main() {
             .with_tag("barqsharingd")
             .with_max_level(log::LevelFilter::Debug),
     );
-    log::info!("starting");
+    // Build marker. The AIDL surface has grown twice without the device appearing to
+    // gain the new transactions, so the running code has to be identifiable from the log
+    // rather than inferred from a file hash.
+    log::info!("starting (aidl: policy+devicename, 17 transactions)");
 
     let peers: PeerTable = Arc::new(Mutex::new(Vec::new()));
 
@@ -1119,6 +1285,7 @@ fn main() {
         discoverable.clone(),
         service.callbacks.clone(),
         service.transfers.clone(),
+        service.auto_accept.clone(),
     );
     start_radio_gate(
         service.active.clone(),

@@ -1,0 +1,35 @@
+package dev.barq;
+
+/**
+ * What this device is permitted to do, per protocol and per direction.
+ *
+ * One type carries BOTH sources of policy: what the user chose in the app, and what an
+ * administrator pinned through managed configuration. The admin value always wins, and
+ * the matching `*Managed` flag says so — the app shows a pinned control disabled and
+ * labelled rather than hiding it, because a control that silently refuses to move reads
+ * as a broken app rather than as an enforced policy.
+ *
+ * Modes are a single value per protocol rather than a pair of booleans. An admin console
+ * renders one dropdown from a choice field, and two booleans per protocol would invite
+ * the combination that means nothing. The APP still draws two switches, because per
+ * direction is how a person thinks about it; the mapping is in one place.
+ */
+// The Rust backend derives nothing by default, and the daemon holds this behind a
+// Mutex and hands copies out of getPolicy.
+@RustDerive(Clone=true, PartialEq=true)
+parcelable BarqPolicy {
+    /** One of IBarqService.MODE_*. */
+    int airdrop;
+    /** One of IBarqService.MODE_*. */
+    int quickshare;
+    /** Ask before accepting an incoming transfer. Defaults on; an admin may turn it off. */
+    boolean requireConfirmation;
+    /** What peers see. Empty means fall back to the device model. */
+    String deviceName;
+
+    /** Pinned by an administrator; the user cannot change it. */
+    boolean airdropManaged;
+    boolean quickshareManaged;
+    boolean requireConfirmationManaged;
+    boolean deviceNameManaged;
+}

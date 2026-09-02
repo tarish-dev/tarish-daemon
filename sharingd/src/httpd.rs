@@ -87,6 +87,8 @@ pub struct Httpd {
     discoverable: crate::Discoverable,
     callbacks: crate::Callbacks,
     transfers: crate::Transfers,
+    /// Policy said confirmation is not required, so accept without asking.
+    auto_accept: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Who is offering, and what.
@@ -134,6 +136,7 @@ impl Httpd {
         discoverable: crate::Discoverable,
         callbacks: crate::Callbacks,
         transfers: crate::Transfers,
+        auto_accept: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> std::io::Result<Self> {
         let addr = crate::mdns::link_local_of(iface).ok_or_else(|| {
             std::io::Error::new(
@@ -180,6 +183,7 @@ impl Httpd {
             discoverable,
             callbacks,
             transfers,
+            auto_accept,
         })
     }
 
@@ -422,7 +426,17 @@ impl Httpd {
                 // This blocks the accept loop for up to ASK_TIMEOUT. That is deliberate
                 // and matches the protocol: the peer is holding this connection open
                 // waiting for exactly this answer, and will send /Upload on it.
-                match self.transfers.await_answer(id, ASK_TIMEOUT) {
+                // An administrator may turn the prompt off. The transfer is still
+                // registered and still shown, so it appears in the UI and in the
+                // received list -- what is skipped is the QUESTION, not the record.
+                let answer = if self.auto_accept.load(std::sync::atomic::Ordering::SeqCst) {
+                    info!("offer {id} auto-accepted — policy does not require confirmation");
+                    self.transfers.answer(id, true);
+                    Some(true)
+                } else {
+                    self.transfers.await_answer(id, ASK_TIMEOUT)
+                };
+                match answer {
                     Some(true) => {
                         info!("offer {id} accepted");
                         respond(tls, 200, Some(&self.ask_body), keep_alive)?
