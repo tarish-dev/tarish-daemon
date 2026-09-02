@@ -517,8 +517,36 @@ impl IBarqService for BarqService {
                 .or_insert(p);
         }
 
-        Ok(newest
-            .values()
+        // Deterministic order, because a HashMap has none.
+        //
+        // Rust seeds its hasher randomly, so `values()` yields a DIFFERENT order on
+        // every call. The app polls this, rebuilds its tiles when the list changes, and
+        // compares an order-sensitive signature to decide whether it changed -- so an
+        // unstable order made every poll look like a change. The tiles were torn down
+        // and rebuilt several times a second: peers visibly juggled, and a tile could be
+        // replaced between a finger going down and the tap landing, sending to a device
+        // the user had not aimed at.
+        //
+        // Sorted by display name, with the instance as tiebreak. Name rather than
+        // instance because Apple ROTATES its instance name, so ordering on it would
+        // reshuffle the list every rotation -- the exact thing being fixed. A name does
+        // change once, when /Discover answers and the hex identifier is replaced by a
+        // real name, and that reorder is correct: the row genuinely became something
+        // else.
+        let mut out: Vec<&mdns::Peer> = newest.values().copied().collect();
+        out.sort_by(|a, b| {
+            let name_of = |p: &mdns::Peer| {
+                p.addr
+                    .and_then(|x| names.get(&x.to_string()).cloned())
+                    .unwrap_or_else(|| p.short_id().to_string())
+            };
+            name_of(a)
+                .cmp(&name_of(b))
+                .then_with(|| a.instance.cmp(&b.instance))
+        });
+
+        Ok(out
+            .into_iter()
             .map(|p| BarqPeer {
                 id: p.instance.clone(),
                 // Apple advertises a 12-hex-character identifier, never a name -- its
