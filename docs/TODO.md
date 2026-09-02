@@ -9,46 +9,41 @@ did not exist, and the live work was two hundred lines down.
 
 ## Open
 
-### refreshPeers is not dispatched — the daemon exposes 10 transactions, not 11
+### refreshPeers: the button does nothing, and the first diagnosis was wrong
 
-The refresh control is wired in the app and reaches the daemon without throwing, but
-the daemon method never executes: nothing logged, no peer dropped, no re-browse.
+The control is wired, the app's call returns without throwing, and the daemon appears
+not to act — nothing logged, no peer dropped.
 
-Bisected past the app by calling the transaction directly:
+**A previous version of this entry claimed the daemon exposed only 10 transactions and
+did not dispatch refreshPeers. That was wrong**, and the mistake is worth keeping:
+
+The AIDL method count was taken with a grep that missed two methods — `getStatus`
+(custom return type, so the pattern did not match) and `openReceivedFile`. The real
+map, read from the generated binding rather than counted by hand:
 
 ```
-service call dev.barq.IBarqService/default 3    -> real handler responds
-service call dev.barq.IBarqService/default 9    -> real handler responds
-service call dev.barq.IBarqService/default 10   -> real handler responds
-service call dev.barq.IBarqService/default 11   -> Unknown transaction
+getStatus=+0  setDiscoverable=+1  setActive=+2  getPeers=+3  sendFiles=+4
+respondToOffer=+5  cancelTransfer=+6  getReceivedFiles=+7  openReceivedFile=+8
+deleteReceivedFile=+9  registerCallback=+10  unregisterCallback=+11  refreshPeers=+12
 ```
 
-AIDL numbers transactions in declaration order from 1, and `refreshPeers` is the 11th
-method, so the running daemon was built against an interface without it.
+So `refreshPeers` is FIRST_CALL_TRANSACTION+12, i.e. **code 13**. The probe that
+"proved" it missing called codes 11 and 12 — `registerCallback` and
+`unregisterCallback` — with no arguments, which fail for an unrelated reason. Never
+count AIDL methods by hand; read `transactions` in the generated source.
 
-**Three facts that cannot all hold of one build, which is why this is unresolved:**
+**So the cause is unknown again.** What is now established: the binding contains the
+method at the right index, and the app's call returns without an exception, which means
+the transaction was accepted rather than rejected.
 
-1. the deployed binary CONTAINS the string `refreshPeers: dropped the peer table`
-2. `main.rs` has the method inside `impl IBarqService for BarqService` (line 473,
-   block opens at 414) — the right place, and an extra method there would not compile
-   against a trait lacking it
-3. the running daemon dispatches only 10 transactions
+Next, and untested because the device on the cable is a prod build without this code:
 
-So something in AIDL generation or the vendor/barq copy chain is serving a stale
-interface to one side. Suspect a cached `dev.barq-rust` in the soong intermediates
-surviving an aidl change, since the file itself is copied fresh by gos-barq.sh.
+```
+service call dev.barq.IBarqService/default 13
+```
 
-Worth trying first: a clean build of `dev.barq-rust`, and comparing the generated
-transaction constants against the app's `dev.barq-java`.
-
-**Do not ship the button until this is understood.** A control that looks functional
-and silently does nothing teaches users that refresh does not help.
-
-Prior related mistake, already fixed: refreshPeers was originally declared in the
-MIDDLE of the interface, which renumbered every method after it. That is an ABI break
-across two independently-deployed artifacts and presented as a bare
-NullPointerException from Parcel.createExceptionOrNull. New methods go at the end.
-
+If the daemon logs on that, the daemon is fine and the app is sending something else.
+If it does not, the fault is in the daemon's handler.
 
 ### Sending does not find peers: we hear their questions, never their answers
 
