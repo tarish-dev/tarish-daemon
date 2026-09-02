@@ -19,3 +19,4 @@
 //! it once the real message arrives.
 
 pub mod crypto;
+pub mod handshake;

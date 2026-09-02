@@ -18,9 +18,9 @@
 //! | `d2d` — post-handshake traffic keys | **done**, Bada vectors |
 //! | `securemessage` — signed+encrypted envelope | **done** |
 //! | `ukey2::crypto` — P-256 ECDH, key encoding | **done** |
-//! | UKEY2 handshake messages and state machine | next |
+//! | UKEY2 handshake messages and state machine | **done**, both sides round-trip |
 //! | `protobuf` — minimal wire codec | **done** |
-//! | wire framing, offline frames | not started |
+//! | wire framing, offline frames | next |
 //! | connection state machines | not started |
 //! | sharing FSM, payload | not started |
 //!
