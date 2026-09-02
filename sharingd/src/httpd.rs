@@ -33,7 +33,17 @@ use std::time::Duration;
 const MAX_HEAD: usize = 16 * 1024;
 
 /// Cap on a request body we will buffer. Content-Length is attacker-controlled.
-const MAX_BODY: usize = 64 * 1024;
+///
+/// **8 MiB, not 64 KiB.** An `/Ask` for a PHOTO carries a `FileIcon` preview per file,
+/// so its body is orders of magnitude larger than one for a document, which carries
+/// none. At 64 KiB every photo from an iPhone 17 was refused while every document went
+/// through -- a failure that looked device-specific because preview size tracks camera
+/// resolution, not iOS version. Measured: `/Discover` is ~3.8 KB, a single-photo `/Ask`
+/// exceeds 64 KiB.
+///
+/// `/Upload` is streamed and never counted against this; only `/Discover` and `/Ask`
+/// are buffered, and both are answered and closed before any file data moves.
+const MAX_BODY: usize = 8 * 1024 * 1024;
 
 /// Where received archives land. Private to this daemon, which cannot reach shared
 /// storage: the app moves them to Downloads/Barq, where Quick Share puts its own.
@@ -324,9 +334,29 @@ impl Httpd {
         let body = if path == "/Upload" {
             Vec::new()
         } else {
-            let b = read_body(tls, &head);
+            let (b, desynced) = read_body(tls, &head);
+            if desynced {
+                // Unread bytes remain in the socket, so this connection cannot carry
+                // another request. Say so and close: a peer that gets 413 reports a
+                // failure, whereas one that gets silence waits forever.
+                warn!("{path}: body too large — answering 413 and closing");
+                respond(tls, 413, None, false)?;
+                return Ok(Disposition::Close);
+            }
             if !b.is_empty() {
-                debug!("{path} request body ({} bytes): {}", b.len(), hex(&b));
+                // Bounded dump. A photo /Ask runs to megabytes of preview data, and
+                // hexing all of it costs twice that in logcat for no extra insight --
+                // the interesting keys are at the front of the plist.
+                const DUMP: usize = 2048;
+                if b.len() <= DUMP {
+                    debug!("{path} request body ({} bytes): {}", b.len(), hex(&b));
+                } else {
+                    debug!(
+                        "{path} request body ({} bytes, first {DUMP}): {}",
+                        b.len(),
+                        hex(&b[..DUMP])
+                    );
+                }
             }
             b
         };
@@ -701,18 +731,28 @@ fn read_head<S: Read>(s: &mut S) -> std::io::Result<String> {
 ///
 /// Bounded by MAX_BODY throughout: both the declared length and the chunk sizes are
 /// attacker-controlled, and allocating on either is the obvious way to be exhausted.
-fn read_body<S: Read>(s: &mut S, head: &str) -> Vec<u8> {
+///
+/// Returns `(body, desynced)`. `desynced` means the body was larger than we would
+/// buffer and unread bytes remain in the socket, so the connection can no longer be
+/// reused -- the caller must answer and close rather than loop. Silently truncating
+/// instead is what left an iPhone waiting forever on a photo: the leftover body bytes
+/// were read as the next request head ("request head too large or truncated"), the
+/// `/Ask` was never answered, and the sender's UI hung with nothing to cancel.
+fn read_body<S: Read>(s: &mut S, head: &str) -> (Vec<u8>, bool) {
     if header(head, "transfer-encoding")
         .map(|v| v.to_ascii_lowercase().contains("chunked"))
         .unwrap_or(false)
     {
         return read_chunked(s);
     }
-    let len = header(head, "content-length")
+    let declared = header(head, "content-length")
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0)
-        .min(MAX_BODY);
-    read_exact_bounded(s, len)
+        .unwrap_or(0);
+    if declared > MAX_BODY {
+        warn!("body of {declared} bytes exceeds {MAX_BODY} — refusing");
+        return (Vec::new(), true);
+    }
+    (read_exact_bounded(s, declared), false)
 }
 
 /// Case-insensitive header lookup.
@@ -745,7 +785,7 @@ fn read_exact_bounded<S: Read>(s: &mut S, len: usize) -> Vec<u8> {
 /// Each chunk is a hex length, CRLF, that many bytes, CRLF; a zero length ends the
 /// body, optionally followed by trailers we skip. Deliberately small and strict --
 /// this parses input from any device on the link.
-fn read_chunked<S: Read>(s: &mut S) -> Vec<u8> {
+fn read_chunked<S: Read>(s: &mut S) -> (Vec<u8>, bool) {
     let mut out = Vec::new();
     loop {
         let line = match read_line(s) {
@@ -769,7 +809,7 @@ fn read_chunked<S: Read>(s: &mut S) -> Vec<u8> {
         }
         if out.len() + size > MAX_BODY {
             warn!("chunked body exceeds {MAX_BODY} bytes — refusing");
-            break;
+            return (out, true);
         }
         let chunk = read_exact_bounded(s, size);
         let short = chunk.len() < size;
@@ -779,7 +819,7 @@ fn read_chunked<S: Read>(s: &mut S) -> Vec<u8> {
         }
         let _ = read_line(s); // trailing CRLF after the chunk data
     }
-    out
+    (out, false)
 }
 
 /// One CRLF-terminated line, bounded so a peer cannot make us grow forever.
@@ -1049,7 +1089,11 @@ fn respond<S: Write>(
     body: Option<&[u8]>,
     keep_alive: bool,
 ) -> std::io::Result<()> {
-    let reason = if status == 200 { "OK" } else { "Unauthorized" };
+    let reason = match status {
+        200 => "OK",
+        413 => "Payload Too Large",
+        _ => "Unauthorized",
+    };
     let body = body.unwrap_or(&[]);
     let conn = if keep_alive { "keep-alive" } else { "close" };
     let mut head = format!(
