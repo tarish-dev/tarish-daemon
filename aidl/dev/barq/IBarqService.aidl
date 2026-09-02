@@ -125,6 +125,11 @@ interface IBarqService {
      */
     void refreshPeers();
 
+    /** AirDrop — Apple devices. */
+    const int PROTOCOL_AIRDROP = 0;
+    /** Quick Share — Android and Windows. */
+    const int PROTOCOL_QUICKSHARE = 1;
+
     /** Neither direction is permitted. */
     const int MODE_OFF = 0;
     /** May be discovered and may accept incoming transfers; may not send. */

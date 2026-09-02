@@ -401,6 +401,8 @@ fn denied_policy() -> BarqPolicy {
 
 // Mirrors the constants in IBarqService.aidl. Kept as plain consts because the Rust
 // backend does not expose interface constants in a form that can be matched on.
+const PROTOCOL_AIRDROP: i32 = 0;
+
 const MODE_OFF: i32 = 0;
 const MODE_RECEIVE: i32 = 1;
 const MODE_SEND: i32 = 2;
@@ -709,6 +711,10 @@ impl IBarqService for BarqService {
                     .unwrap_or_else(|| p.short_id().to_string()),
                 model: String::new(),
                 rssi: 0,
+                // Everything getPeers returns today came from the AirDrop browser.
+                // Quick Share discovery runs on wlan0 and is not folded into this
+                // table yet; when it is, this is the field that keeps the two apart.
+                protocol: PROTOCOL_AIRDROP,
             })
             .collect())
     }

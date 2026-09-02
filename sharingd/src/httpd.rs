@@ -519,7 +519,9 @@ impl Httpd {
     fn offered(&self, id: i64, from: &str, names: &[String]) {
         // totalBytes is 0: Apple's /Ask carries file names and types but no sizes, so
         // reporting anything else would be inventing it.
-        self.each_callback(|cb| cb.onTransferOffered(id, from, names, 0));
+        // AirDrop: this server only ever speaks it. Quick Share offers will arrive
+        // through their own path and name themselves.
+        self.each_callback(|cb| cb.onTransferOffered(id, from, names, 0, 0));
     }
 
     fn progress(&self, id: i64, done: u64, total: u64) {

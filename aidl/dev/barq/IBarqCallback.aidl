@@ -8,8 +8,15 @@ oneway interface IBarqCallback {
     void onPeerFound(in BarqPeer peer);
     void onPeerLost(String peerId);
 
-    /** An incoming transfer is being offered. Answer with respondToOffer(). */
-    void onTransferOffered(long transferId, String peerId, in String[] names, long totalBytes);
+    /**
+     * An incoming transfer is being offered. Answer with respondToOffer().
+     *
+     * `protocol` is one of IBarqService.PROTOCOL_*. The prompt names it, because
+     * "someone wants to send you a file" is a different decision depending on whether
+     * it arrived over AirDrop or Quick Share, and the sender's name alone does not say.
+     */
+    void onTransferOffered(long transferId, String peerId, in String[] names,
+            long totalBytes, int protocol);
 
     void onTransferProgress(long transferId, long bytesDone, long bytesTotal);
 
