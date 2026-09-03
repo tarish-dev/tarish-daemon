@@ -26,7 +26,7 @@
 //! | connection state machines | next |
 //! | `sharing` — introduction, response, paired key | **done** |
 //! | `payload` — chunk reassembly and its bounds | **done** |
-//! | sharing FSM | not started |
+//! | `fsm` — what may happen when | **done** |
 //!
 //! Discovery is NOT here: it is in barqsharingd, because it needs sockets and an
 //! interface name. It is done and verified against Google's Quick Share for Windows --
@@ -38,6 +38,7 @@ mod end_to_end;
 pub mod channel;
 pub mod d2d;
 pub mod frames;
+pub mod fsm;
 pub mod framing;
 pub mod hkdf;
 pub mod payload;
