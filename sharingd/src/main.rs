@@ -176,7 +176,7 @@ impl TransferState {
 ///
 /// This is the one place a person actually reads our identity, so it prefers something
 /// they set over something the vendor did.
-fn device_name() -> String {
+pub(crate) fn device_name() -> String {
     read_property("persist.barq.name")
         .or_else(|| read_property("ro.product.model"))
         .unwrap_or_else(|| "Barq".to_string())

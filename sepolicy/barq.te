@@ -6,3 +6,9 @@
 
 # Whether the AWDL radio is wanted. barqsharingd sets it, barqd reads it.
 type barq_awdl_prop, property_type;
+
+# The advertised device name, set from the settings screen.
+#
+# A `persist.` property so the name survives a reboot without this daemon keeping a
+# file of its own, and so init restores it before anything advertises.
+type barq_name_prop, property_type;

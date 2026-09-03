@@ -118,6 +118,10 @@ allow barqsharingd barq_data_file:file unlink;
 # exactly the failure mode to prefer but also an easy one to miss.
 set_prop(barqsharingd, barq_awdl_prop)
 
+# The device name. The app cannot write this itself -- a persist property needs a
+# grant an app should not have -- so it arrives over binder and is written here.
+set_prop(barqsharingd, barq_name_prop)
+
 # set_prop() alone is NOT enough on this release. The macro grants
 # `barq_awdl_prop:property_service set` and `init:unix_stream_socket connectto`, but
 # libc still writes to /dev/socket/property_service first, and that write is checked

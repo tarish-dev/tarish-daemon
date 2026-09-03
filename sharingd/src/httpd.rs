@@ -82,8 +82,13 @@ pub struct Httpd {
     iface: String,
     addr: Ipv6Addr,
     scope: u32,
-    discover_body: Vec<u8>,
-    ask_body: Vec<u8>,
+    /// Rebuilt per request from the CURRENT name, not cached.
+    ///
+    /// It was precomputed once, which meant renaming the device in settings changed
+    /// nothing peers could see until barqsharingd restarted -- the name is what a
+    /// person picks it for. These are two small plists; building them per request costs
+    /// nothing next to the TLS handshake that just happened.
+    model: String,
     discoverable: crate::Discoverable,
     callbacks: crate::Callbacks,
     transfers: crate::Transfers,
@@ -155,22 +160,7 @@ impl Httpd {
             std::io::Error::other(format!("TLS setup failed: {e}"))
         })?;
 
-        // Precomputed: being listed needs no dynamic logic, so the body is built once.
-        // ReceiverRecordData is deliberately absent -- see the module comment.
-        let discover_body = plist::dict(&[
-            ("ReceiverComputerName", Value::Str(name.to_string())),
-            ("ReceiverModelName", Value::Str(model.to_string())),
-            (
-                "ReceiverMediaCapabilities",
-                Value::Data(br#"{"Version":1}"#.to_vec()),
-            ),
-        ]);
-
-        // /Ask answers with the same identity, minus the media capabilities.
-        let ask_body = plist::dict(&[
-            ("ReceiverModelName", Value::Str(model.to_string())),
-            ("ReceiverComputerName", Value::Str(name.to_string())),
-        ]);
+        let _ = name; // the live value is read per request; see `identity`
 
         Ok(Self {
             acceptor,
@@ -178,8 +168,7 @@ impl Httpd {
             iface: iface.to_string(),
             addr,
             scope,
-            discover_body,
-            ask_body,
+            model: model.to_string(),
             discoverable,
             callbacks,
             transfers,
@@ -394,7 +383,9 @@ impl Httpd {
             }
 
             ("HEAD", "/") => respond(tls, 200, None, keep_alive)?,
-            ("POST", "/Discover") => respond(tls, 200, Some(&self.discover_body), keep_alive)?,
+            ("POST", "/Discover") => {
+                respond(tls, 200, Some(&self.discover_body()), keep_alive)?
+            }
 
             // "May I send you this?" Accepting is what turns the sender's UI into a
             // transfer. We accept unconditionally for now: there is no client to ask,
@@ -439,7 +430,7 @@ impl Httpd {
                 match answer {
                     Some(true) => {
                         info!("offer {id} accepted");
-                        respond(tls, 200, Some(&self.ask_body), keep_alive)?
+                        respond(tls, 200, Some(&self.ask_body()), keep_alive)?
                     }
                     Some(false) => {
                         info!("offer {id} declined");
@@ -516,6 +507,28 @@ impl Httpd {
     /// The file names are not known yet: they live in the /Ask plist, and Barq has a
     /// plist writer but no reader. Sending an empty list is honest -- the UI shows
     /// "receiving" without inventing names it does not have.
+    /// What a peer is told when it asks who we are.
+    ///
+    /// ReceiverRecordData is deliberately absent -- see the module comment.
+    fn discover_body(&self) -> Vec<u8> {
+        plist::dict(&[
+            ("ReceiverComputerName", Value::Str(crate::device_name())),
+            ("ReceiverModelName", Value::Str(self.model.clone())),
+            (
+                "ReceiverMediaCapabilities",
+                Value::Data(br#"{"Version":1}"#.to_vec()),
+            ),
+        ])
+    }
+
+    /// /Ask answers with the same identity, minus the media capabilities.
+    fn ask_body(&self) -> Vec<u8> {
+        plist::dict(&[
+            ("ReceiverModelName", Value::Str(self.model.clone())),
+            ("ReceiverComputerName", Value::Str(crate::device_name())),
+        ])
+    }
+
     fn offered(&self, id: i64, from: &str, names: &[String]) {
         // totalBytes is 0: Apple's /Ask carries file names and types but no sizes, so
         // reporting anything else would be inventing it.

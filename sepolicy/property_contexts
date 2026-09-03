@@ -8,3 +8,9 @@
 # as the wanted flag, and an exact rule for one leaves the other on default_prop --
 # where set_prop on our own type is still denied, which fails silently.
 barq.awdl.          u:object_r:barq_awdl_prop:s0
+
+# The advertised device name. Prefix for the same reason as above: an exact rule for
+# one key leaves any sibling on default_prop, where set_prop on our own type is still
+# denied and fails silently -- which is exactly how this one was found, with the
+# settings screen appearing to accept a name that never reached the property.
+persist.barq.       u:object_r:barq_name_prop:s0
