@@ -32,6 +32,9 @@
 //! interface name. It is done and verified against Google's Quick Share for Windows --
 //! see `docs/QUICKSHARE-VECTORS.md`.
 
+#[cfg(test)]
+mod end_to_end;
+
 pub mod channel;
 pub mod d2d;
 pub mod frames;
