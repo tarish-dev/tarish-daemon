@@ -12,25 +12,37 @@
 //! Layering, bottom up. Each layer is finished and verified before the one above it
 //! starts, because a fault low down presents as a failure high up:
 //!
-//! | layer | state |
-//! |---|---|
-//! | `hkdf` — RFC 5869 key derivation | **done**, RFC vectors |
-//! | `d2d` — post-handshake traffic keys | **done**, Bada vectors |
-//! | `securemessage` — signed+encrypted envelope | **done** |
-//! | `ukey2::crypto` — P-256 ECDH, key encoding | **done** |
-//! | UKEY2 handshake messages and state machine | **done**, both sides round-trip |
-//! | `protobuf` — minimal wire codec | **done** |
-//! | `framing` — 4-byte length prefix | **done** |
-//! | `frames` — offline frames | **done** |
-//! | `channel` — keys, sequence numbers, direction | **done** |
-//! | connection state machines | next |
-//! | `sharing` — introduction, response, paired key | **done** |
-//! | `payload` — chunk reassembly and its bounds | **done** |
-//! | `fsm` — what may happen when | **done** |
+//! | layer | module | state |
+//! |---|---|---|
+//! | minimal protobuf wire codec | `protobuf` | **done** |
+//! | RFC 5869 key derivation | `hkdf` | **done**, RFC vectors |
+//! | P-256 ECDH and key encoding | `ukey2::crypto` | **done** |
+//! | the UKEY2 handshake, both sides | `ukey2::handshake` | **done**, round-trips |
+//! | post-handshake traffic keys | `d2d` | **done**, Bada vectors |
+//! | signed + encrypted envelope | `securemessage` | **done** |
+//! | keys, sequence numbers, direction | `channel` | **done** |
+//! | 4-byte length prefix | `framing` | **done** |
+//! | Nearby Connections messages | `frames` | **done** |
+//! | chunk reassembly and its bounds | `payload` | **done** |
+//! | Nearby Sharing messages | `sharing` | **done** |
+//! | what may happen when | `fsm` | **done** |
+//! | the whole stack, two peers | `end_to_end` | **done**, one share start to finish |
 //!
-//! Discovery is NOT here: it is in barqsharingd, because it needs sockets and an
-//! interface name. It is done and verified against Google's Quick Share for Windows --
-//! see `docs/QUICKSHARE-VECTORS.md`.
+//! What is NOT here, and where it belongs instead:
+//!
+//! - **the socket, and discovery** — barqsharingd, which needs an interface name and a
+//!   multicast group. This crate never reads or writes a socket, which is why every
+//!   awkward case above is a unit test rather than something to reproduce with two
+//!   phones. mDNS discovery is done and verified against Google's Quick Share for
+//!   Windows; the captured vectors are in `docs/QUICKSHARE-VECTORS.md`.
+//! - **the filesystem** — barqsharingd. `payload` validates offsets and lengths but does
+//!   not sanitise names, because a path-traversal check belongs where the file is
+//!   actually opened; anywhere else it reads as protection while the real write happens
+//!   elsewhere.
+//! - **BLE advertising and scanning** — the app. A native daemon cannot reach framework
+//!   Bluetooth.
+//! - **the bandwidth-upgrade ladder** — not started. Quick Share over a Wi-Fi LAN does
+//!   not need it, which is the case that works on the hardware where AirDrop cannot.
 
 #[cfg(test)]
 mod end_to_end;
