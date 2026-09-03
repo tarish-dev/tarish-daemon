@@ -186,27 +186,80 @@ pub(crate) fn device_name() -> String {
 ///
 /// A `persist.` property survives reboot, which is what makes the name stick without
 /// this daemon keeping a file of its own. The app cannot write it -- setting a persist
-/// property needs a policy grant an app should not have -- so it comes through binder.
+/// property needs a policy grant an app should not have -- so it comes through binder,
+/// and so THIS is the only place a name is checked. An administrator's name arrives the
+/// same way, through setPolicy, and gets the same treatment.
 ///
-/// PROP_VALUE_MAX is 92 bytes and __system_property_set silently fails past it, so the
-/// name is truncated on a CHARACTER boundary first; cutting mid-UTF-8 would advertise
-/// invalid bytes in an mDNS TXT record.
+/// A NAME THAT IS NOT A NAME FALLS BACK TO THE DEVICE MODEL. Empty, blank, "   ", "...",
+/// "---", a string of zero-width characters: all of them clear the property instead of
+/// being advertised. The test is whether anything alphanumeric survives cleaning -- a
+/// device that appears to a room of strangers as "..." is worse than one that appears as
+/// its model, and there is no legitimate name made entirely of punctuation.
+///
+/// Cleaning, in order:
+///   1. control and formatting characters removed -- a newline in an mDNS TXT record or
+///      an AirDrop plist is at best ignored and at worst a parse failure on the peer
+///   2. runs of whitespace collapsed to one space, so "A     B" does not advertise as
+///      a name with a hole in it
+///   3. trimmed
+///   4. truncated on a CHARACTER boundary -- PROP_VALUE_MAX is 92 bytes and cutting
+///      mid-UTF-8 would advertise invalid bytes
 fn set_device_name(name: &str) {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
+    let cleaned = clean_name(name);
+    if cleaned.is_empty() {
         write_property("persist.barq.name", "");
         log::info!("device name cleared — falling back to {:?}", device_name());
         return;
     }
-    let mut cut = trimmed;
-    while cut.len() > 90 {
-        cut = &cut[..cut.char_indices().last().map(|(i, _)| i).unwrap_or(0)];
-    }
-    if write_property("persist.barq.name", cut) {
-        log::info!("device name set to {cut:?}");
+    if write_property("persist.barq.name", &cleaned) {
+        log::info!("device name set to {cleaned:?}");
     } else {
         log::warn!("could not write persist.barq.name");
     }
+}
+
+/// Reduce a name to something safe to advertise, or to empty if nothing is left.
+fn clean_name(name: &str) -> String {
+    // Strip anything that is not printable text. `char::is_control` covers C0 and C1;
+    // the explicit range is the zero-width and bidirectional formatting block, which is
+    // invisible and is exactly what someone reaches for to make a name that looks empty
+    // to a reader and is not empty to a parser.
+    let stripped: String = name
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(*c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}'))
+        .collect();
+
+    // Collapse whitespace runs, then trim.
+    let mut out = String::with_capacity(stripped.len());
+    let mut in_space = false;
+    for c in stripped.chars() {
+        if c.is_whitespace() {
+            in_space = true;
+        } else {
+            if in_space && !out.is_empty() {
+                out.push(' ');
+            }
+            in_space = false;
+            out.push(c);
+        }
+    }
+    let out = out.trim().to_string();
+
+    // Nothing alphanumeric means it is not a name. "..." and "---" land here.
+    if !out.chars().any(char::is_alphanumeric) {
+        return String::new();
+    }
+
+    // PROP_VALUE_MAX is 92 bytes; leave room and cut on a character boundary.
+    let mut cut: &str = &out;
+    while cut.len() > 90 {
+        cut = &cut[..cut
+            .char_indices()
+            .last()
+            .map(|(i, _)| i)
+            .unwrap_or(0)];
+    }
+    cut.trim().to_string()
 }
 
 /// Take an owned File from a descriptor the client passed over binder.
