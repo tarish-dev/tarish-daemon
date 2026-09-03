@@ -79,14 +79,14 @@ where
 }
 
 /// Reads length-prefixed frames off a stream.
-struct Frames<S> {
+pub(crate) struct Frames<S> {
     stream: S,
     decoder: framing::Decoder,
     buf: [u8; 16 * 1024],
 }
 
 impl<S: Read> Frames<S> {
-    fn new(stream: S) -> Self {
+    pub(crate) fn new(stream: S) -> Self {
         Self {
             stream,
             decoder: framing::Decoder::new(),
@@ -95,7 +95,7 @@ impl<S: Read> Frames<S> {
     }
 
     /// The next whole frame, reading more from the stream until there is one.
-    fn next(&mut self) -> io::Result<Vec<u8>> {
+    pub(crate) fn next(&mut self) -> io::Result<Vec<u8>> {
         loop {
             if let Some(f) = self
                 .decoder
@@ -370,7 +370,7 @@ where
 }
 
 /// Wrap a sharing frame in a single-chunk BYTES payload.
-fn wrap_bytes(next_id: &mut i64, frame: &[u8]) -> Vec<u8> {
+pub(crate) fn wrap_bytes(next_id: &mut i64, frame: &[u8]) -> Vec<u8> {
     *next_id += 1;
     let header = PayloadHeader {
         id: *next_id,
@@ -386,15 +386,15 @@ fn wrap_bytes(next_id: &mut i64, frame: &[u8]) -> Vec<u8> {
     frames::payload_data(&header, &chunk)
 }
 
-fn write_frame(out: &mut impl Write, payload: &[u8]) -> io::Result<()> {
+pub(crate) fn write_frame(out: &mut impl Write, payload: &[u8]) -> io::Result<()> {
     out.write_all(&framing::encode(payload))?;
     out.flush()
 }
 
-fn bad(e: impl std::fmt::Display) -> io::Error {
+pub(crate) fn bad(e: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
 }
 
-fn chan(e: barq_protocol::channel::Error) -> io::Error {
+pub(crate) fn chan(e: barq_protocol::channel::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
 }

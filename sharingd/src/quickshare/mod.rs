@@ -34,6 +34,7 @@
 
 pub mod connection;
 pub mod discovery;
+pub mod outbound;
 pub mod endpoint;
 
 /// One line describing what this device would advertise as a Quick Share endpoint.
