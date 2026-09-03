@@ -27,6 +27,7 @@
 //! | Nearby Sharing messages | `sharing` | **done** |
 //! | what may happen when | `fsm` | **done** |
 //! | moving onto a faster medium | `upgrade` | **done** |
+//! | the BLE wake-up pulse | `ble` | **done** |
 //! | the whole stack, two peers | `end_to_end` | **done**, one share start to finish |
 //!
 //! What is NOT here, and where it belongs instead:
@@ -49,6 +50,7 @@
 #[cfg(test)]
 mod end_to_end;
 
+pub mod ble;
 pub mod channel;
 pub mod d2d;
 pub mod frames;
