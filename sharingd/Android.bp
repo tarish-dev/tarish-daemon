@@ -18,6 +18,10 @@ rust_binary {
         "libcpio_archive_barq",
         "libflate2",
         "dev.barq-rust",
+        // A dylib, so it MUST be deployed alongside this binary -- scripts/gos-push.sh
+        // in the integrator repo carries it. See BUILD-NOTES 45 for what a device
+        // answering against a stale interface library costs.
+        "libbarq_protocol",
     ],
     init_rc: ["barqsharingd.rc"],
     system_ext_specific: true,

@@ -30,7 +30,6 @@
 
 use crate::hkdf;
 use openssl::error::ErrorStack;
-use openssl::hash::{hash, MessageDigest};
 
 /// AES-256 / HMAC-SHA256. Every key in the chain is this size.
 pub const KEY_SIZE: usize = 32;
@@ -143,7 +142,12 @@ pub fn derive_all(
     Ok((secrets, keys))
 }
 
+/// Only the tests use this: it exists to prove the two salt constants really are the
+/// hashes they claim to be, rather than numbers someone transcribed. Compiled out of the
+/// library so it is not dead code in a build that has no tests.
+#[cfg(test)]
 fn sha256(data: &[u8]) -> Result<Vec<u8>, ErrorStack> {
+    use openssl::hash::{hash, MessageDigest};
     Ok(hash(MessageDigest::sha256(), data)?.to_vec())
 }
 

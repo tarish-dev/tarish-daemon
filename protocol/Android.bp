@@ -18,10 +18,22 @@
 // android.*"), which is what made it readable as a specification rather than as
 // Android code.
 //
-// rlib rather than dylib: statically linked into barqsharingd, so there is no
-// separate .so to install, label, or keep in step across partitions.
+// A DYLIB, like every other Rust dependency in this tree.
+//
+// It was declared rust_library_rlib first, on the reasoning that static linkage leaves
+// no separate .so to install or keep in step. Soong emitted a correct-looking
+// `--extern barq_protocol=<path>` to a valid rlib and rustc still reported "can't find
+// crate", and the linkage variant was not worth more time than it had already taken.
+// Every other dependency here -- binder, openssl, cpio_archive, dev.barq -- is a dylib
+// and links without argument, so this matches them.
+//
+// The staleness that shape invites is real and has already cost this project days
+// (integrator BUILD-NOTES 45: a device kept answering against an AIDL library eight days
+// old). It is handled where it belongs, in the deploy step: scripts/gos-push.sh carries
+// every Barq library, verifies each against the build by hash, and refuses a partial
+// deploy. That is a better answer than picking a link mode to dodge the problem.
 
-rust_library_rlib {
+rust_library {
     name: "libbarq_protocol",
     crate_name: "barq_protocol",
     srcs: ["src/lib.rs"],
@@ -30,6 +42,7 @@ rust_library_rlib {
         "libopenssl",
     ],
     host_supported: true,
+    system_ext_specific: true,
 }
 
 // Runs the #[cfg(test)] modules. Host-side, so it needs no phone.

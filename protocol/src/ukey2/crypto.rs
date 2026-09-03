@@ -25,7 +25,7 @@
 use crate::protobuf::{self, Writer};
 use openssl::bn::{BigNum, BigNumContext};
 use openssl::derive::Deriver;
-use openssl::ec::{EcGroup, EcKey, EcPoint, PointConversionForm};
+use openssl::ec::{EcGroup, EcKey, EcPoint};
 use openssl::error::ErrorStack;
 use openssl::hash::{hash, MessageDigest};
 use openssl::nid::Nid;
@@ -171,6 +171,9 @@ pub fn decode_public_key(bytes: &[u8]) -> Result<EcKey<Public>, Error> {
 /// Uncompressed SEC1 point, for tests that need to corrupt a coordinate.
 #[cfg(test)]
 fn point_bytes(key: &EcKey<Private>) -> Result<Vec<u8>, Error> {
+    // Imported here rather than at the top: its only use is in this test-only helper,
+    // and a top-level import would be dead in a build without tests.
+    use openssl::ec::PointConversionForm;
     let group = p256()?;
     let mut ctx = BigNumContext::new()?;
     Ok(key

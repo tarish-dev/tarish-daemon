@@ -32,6 +32,7 @@
 // the list shrinks visibly as discovery lands.
 #![allow(dead_code)]
 
+pub mod connection;
 pub mod discovery;
 pub mod endpoint;
 
