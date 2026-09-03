@@ -35,6 +35,7 @@ const V1_TYPE: u32 = 1;
 const V1_CONNECTION_REQUEST: u32 = 2;
 const V1_CONNECTION_RESPONSE: u32 = 3;
 const V1_PAYLOAD_TRANSFER: u32 = 4;
+const V1_BANDWIDTH_UPGRADE: u32 = 5;
 const V1_KEEP_ALIVE: u32 = 6;
 const V1_DISCONNECTION: u32 = 7;
 
@@ -381,6 +382,25 @@ pub fn payload_control(header: &PayloadHeader, event: u64, offset: i64) -> Vec<u
         .bytes(PT_PAYLOAD_HEADER, &h.finish())
         .bytes(PT_CONTROL_MESSAGE, &cm.finish());
     offline(T_PAYLOAD_TRANSFER, V1_PAYLOAD_TRANSFER, &w.finish())
+}
+
+/// Wrap a bandwidth-upgrade body in an offline frame.
+///
+/// The body itself is built by `crate::upgrade`, which owns that schema. This is only
+/// the envelope, so the two layers do not have to know each other's field numbers.
+pub fn bandwidth_upgrade(body: &[u8]) -> Vec<u8> {
+    offline(T_BANDWIDTH_UPGRADE, V1_BANDWIDTH_UPGRADE, body)
+}
+
+/// The inner bytes of a bandwidth-upgrade frame, or None if it is not one.
+///
+/// Saves every caller writing the same match, and keeps `Frame::BandwidthUpgrade`
+/// carrying raw bytes rather than making this module depend on the upgrade schema.
+pub fn upgrade_body(bytes: &[u8]) -> Option<Vec<u8>> {
+    match parse(bytes).ok()? {
+        Frame::BandwidthUpgrade(b) => Some(b),
+        _ => None,
+    }
 }
 
 pub fn keep_alive(ack: bool, seq_num: u64) -> Vec<u8> {

@@ -26,6 +26,7 @@
 //! | chunk reassembly and its bounds | `payload` | **done** |
 //! | Nearby Sharing messages | `sharing` | **done** |
 //! | what may happen when | `fsm` | **done** |
+//! | moving onto a faster medium | `upgrade` | **done** |
 //! | the whole stack, two peers | `end_to_end` | **done**, one share start to finish |
 //!
 //! What is NOT here, and where it belongs instead:
@@ -41,8 +42,9 @@
 //!   elsewhere.
 //! - **BLE advertising and scanning** — the app. A native daemon cannot reach framework
 //!   Bluetooth.
-//! - **the bandwidth-upgrade ladder** — not started. Quick Share over a Wi-Fi LAN does
-//!   not need it, which is the case that works on the hardware where AirDrop cannot.
+//! - **the radios for an upgrade** — the app. `upgrade` decides what to say and when;
+//!   standing up a Wi-Fi Direct group or a hotspot, and BLE discovery before any of it,
+//!   need framework APIs a native daemon cannot reach.
 
 #[cfg(test)]
 mod end_to_end;
@@ -58,3 +60,4 @@ pub mod protobuf;
 pub mod sharing;
 pub mod securemessage;
 pub mod ukey2;
+pub mod upgrade;
