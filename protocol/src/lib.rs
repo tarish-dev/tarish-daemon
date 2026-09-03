@@ -23,6 +23,7 @@
 //! | `framing` — 4-byte length prefix | **done** |
 //! | `frames` — offline frames | **done** |
 //! | connection state machines | next |
+//! | `sharing` — introduction, response, paired key | **done** |
 //! | sharing FSM, payload | not started |
 //!
 //! Discovery is NOT here: it is in barqsharingd, because it needs sockets and an
@@ -34,5 +35,6 @@ pub mod frames;
 pub mod framing;
 pub mod hkdf;
 pub mod protobuf;
+pub mod sharing;
 pub mod securemessage;
 pub mod ukey2;
