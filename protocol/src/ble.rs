@@ -294,10 +294,54 @@ const ADVERT_MIN_LEN: usize = ADVERT_INFO_LEN_AT + 1;
 pub struct Advertisement {
     /// Four ASCII characters identifying the endpoint.
     pub endpoint_id: String,
-    /// Opaque here. For Quick Share it is flags, a 2-byte salt, and a 14-byte encrypted
-    /// metadata key -- decrypting the name needs a contact certificate we do not have
-    /// and do not want, so it is carried rather than interpreted.
+    /// Flags, a 2-byte salt, a 14-byte encrypted metadata key, and -- when the peer is
+    /// visible to everyone -- a length-prefixed device name after them.
     pub endpoint_info: Vec<u8>,
+    /// The name, when the peer published one in the clear. `None` for a contacts-only
+    /// peer, whose name is inside the encrypted key and needs a certificate rooted in a
+    /// Google account to read. That is not a gap to close: a device that will not tell
+    /// us its name in the clear is one we cannot identify, and saying so is honest.
+    pub device_name: Option<String>,
+    /// True when the advertisement carried the NearbySharing service-id hash. A `false`
+    /// here means some other Nearby Connections service, which is not ours to talk to.
+    pub is_quick_share: bool,
+}
+
+/// `sha256("NearbySharing")[..3]` — marks an advertisement as Quick Share rather than
+/// some other Nearby Connections service.
+pub const SERVICE_ID_HASH: [u8; 3] = [0xFC, 0x9F, 0x5E];
+
+/// Pull the device name out of endpoint info, if it is there in the clear.
+///
+/// Layout, from a captured visible-to-everyone advertisement:
+///
+/// ```text
+///   06      flags
+///   23 34   salt
+///   29 .. a6  encrypted metadata key, 14 bytes
+///   08      name length
+///   "K-ProArt"
+/// ```
+///
+/// 1 + 2 + 14 = 17, so anything at or below that length carries no name -- which is the
+/// contacts-only form, where the name is inside the encrypted key and needs a
+/// certificate we do not have. A peer visible to everyone puts it in the clear, and
+/// that is the case Barq can actually use.
+fn name_from_info(info: &[u8]) -> Option<String> {
+    const NAME_LEN_AT: usize = 17;
+    let len = *info.get(NAME_LEN_AT)? as usize;
+    let start = NAME_LEN_AT + 1;
+    let end = start.checked_add(len)?;
+    if len == 0 || end > info.len() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&info[start..end]).into_owned();
+    // A name of control characters is not a name. Refusing keeps a peer list honest
+    // rather than filling it with squares.
+    if name.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    Some(name)
 }
 
 /// Parse a Nearby Connections BLE advertisement.
@@ -311,20 +355,43 @@ pub fn parse_advertisement(data: &[u8]) -> Option<Advertisement> {
     if data.len() < ADVERT_MIN_LEN + ENDPOINT_ID_LEN {
         return None;
     }
-    let id = &data[ADVERT_ENDPOINT_ID_AT..ADVERT_ENDPOINT_ID_AT + ENDPOINT_ID_LEN];
+
+    // TWO SHAPES, told apart by where the endpoint id sits.
+    //
+    // A non-fast advertisement carries the service-id hash, and the endpoint id follows
+    // it. Captured from a Windows machine visible to everyone, the hash appears TWICE --
+    // at offset 1 and again just before the endpoint id -- and the reason is not
+    // established, so this locates the id by the LAST hash rather than assuming a fixed
+    // offset. A fast advertisement omits the hash entirely and the id is at a fixed
+    // offset, which is the form the captured Android devices used.
+    let hash_at = data
+        .windows(SERVICE_ID_HASH.len())
+        .rposition(|w| w == SERVICE_ID_HASH);
+    let (id_at, is_quick_share) = match hash_at {
+        Some(i) => (i + SERVICE_ID_HASH.len(), true),
+        None => (ADVERT_ENDPOINT_ID_AT, false),
+    };
+    if id_at + ENDPOINT_ID_LEN >= data.len() {
+        return None;
+    }
+    let id = &data[id_at..id_at + ENDPOINT_ID_LEN];
     // Every endpoint id seen on the wire is printable ASCII, and ours is generated that
     // way too. Anything else means this is not the advertisement shape we decoded.
     if !id.iter().all(|c| c.is_ascii_graphic()) {
         return None;
     }
-    let info_len = data[ADVERT_INFO_LEN_AT] as usize;
-    let start = ADVERT_INFO_LEN_AT + 1;
+    let len_at = id_at + ENDPOINT_ID_LEN;
+    let info_len = data[len_at] as usize;
+    let start = len_at + 1;
     if info_len == 0 || start + info_len > data.len() {
         return None;
     }
+    let info = data[start..start + info_len].to_vec();
     Some(Advertisement {
         endpoint_id: String::from_utf8_lossy(id).into_owned(),
-        endpoint_info: data[start..start + info_len].to_vec(),
+        device_name: name_from_info(&info),
+        endpoint_info: info,
+        is_quick_share,
     })
 }
 
@@ -347,6 +414,11 @@ mod advertisement_tests {
             .collect()
     }
 
+    /// A Windows machine running Quick Share, visible to everyone. Captured 2026-09-03
+    /// on 0xFEF3 -- and ONLY visible once the scanner asked for extended advertisements.
+    const WINDOWS: &str = "48fc9f5e0000002b23fc9f5e425146551a06233429a1567e52933345\
+fc86671defa6084b2d50726f4172749cc7d3e40de9000056ce";
+
     /// The whole point: real bytes from real devices, decoded.
     #[test]
     fn the_captured_advertisements_decode() {
@@ -357,7 +429,32 @@ mod advertisement_tests {
             // 1 flags + 2 salt + 14 key. That this is exactly 17 across three samples
             // from two devices is what makes the layout credible.
             assert_eq!(a.endpoint_info.len(), 17);
+            // No name in the clear: these are the contacts-only form.
+            assert_eq!(a.device_name, None);
         }
+    }
+
+    /// The one that matters: a real peer, identified by name, with no network and no
+    /// Google account anywhere in the picture.
+    #[test]
+    fn the_windows_machine_decodes_with_its_name() {
+        let a = parse_advertisement(&unhex(WINDOWS)).expect("should parse");
+        assert!(a.is_quick_share, "carries the NearbySharing service-id hash");
+        assert_eq!(a.endpoint_id, "BQFU");
+        // 1 flags + 2 salt + 14 key + 1 length + 8 name.
+        assert_eq!(a.endpoint_info.len(), 26);
+        assert_eq!(a.device_name.as_deref(), Some("K-ProArt"));
+    }
+
+    /// A name length running past the buffer must yield no name rather than a panic or
+    /// a slice of whatever followed.
+    #[test]
+    fn an_overlong_name_length_yields_no_name() {
+        let mut b = unhex(WINDOWS);
+        // The name-length byte sits 17 into the endpoint info, which starts at 17.
+        b[17 + 17] = 0xFF;
+        let a = parse_advertisement(&b).expect("still parses");
+        assert_eq!(a.device_name, None);
     }
 
     #[test]

@@ -130,3 +130,46 @@ different shape, and must not be read as peers:
 512210001002040803200082db0adb0000
 5128000010024020231000158513940000    (K-PROART, the Windows machine, while idle)
 ```
+
+### The one that only appeared with extended advertising
+
+The capture above missed the Windows machine entirely. The cause was not the filter and
+not the peer: **Android's BLE scanner reports only legacy advertisements unless
+`setLegacy(false)` is set**, and a device using BLE 5 extended advertising is then
+completely invisible — no error, no callback, nothing to notice — while being plainly
+discoverable to any other scanner. A stock Android phone could see the machine the whole
+time.
+
+With extended advertising enabled, 614 sightings in 30 seconds:
+
+```
+48fc9f5e0000002b23fc9f5e425146551a06233429a1567e52933345fc86671defa6084b2d50726f4172749cc7d3e40de9000056ce
+```
+
+| offset | bytes | meaning |
+|---|---|---|
+| 0 | `48` | version 2, socket 2, **fast = 0**, so the service-id hash is present |
+| 1–3 | `fc 9f 5e` | `sha256("NearbySharing")[..3]` |
+| 4–8 | `00 00 00 2b 23` | **not established** |
+| 9–11 | `fc 9f 5e` | the hash **again** — reason not established |
+| 12–15 | `42 51 46 55` | endpoint id, `"BQFU"` |
+| 16 | `1a` | endpoint-info length, 26 |
+| 17 | `06` | flags |
+| 18–19 | `23 34` | salt |
+| 20–33 | `29 a1 … a6` | encrypted metadata key, 14 bytes |
+| 34 | `08` | name length |
+| 35–42 | `4b 2d 50 …` | **`"K-ProArt"`** |
+| 43– | | trailing; Bluetooth MAC and UWB fields, not parsed |
+
+1 + 2 + 14 + 1 + 8 = 26 exactly, which is what makes the reading solid rather than
+plausible.
+
+**A peer visible to everyone publishes its name in the clear.** The contacts-only form
+does not — the name is inside the encrypted metadata key, which needs a certificate
+rooted in a Google account to read. Barq has none and wants none, so a contacts-only peer
+is reported without a name rather than guessed at. Everyone-mode is the case Barq can
+use, and it is also the case a person chooses deliberately.
+
+Because the hash appears twice, the parser locates the endpoint id from the **last**
+occurrence rather than a fixed offset. That is a workaround for something not understood,
+and is marked as such in the code.
