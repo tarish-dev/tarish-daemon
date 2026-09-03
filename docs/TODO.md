@@ -9,6 +9,43 @@ did not exist, and the live work was two hundred lines down.
 
 ## Open
 
+### Quick Share: what is left is the socket, not the protocol
+
+`libbarq_protocol` is complete and covered by 127 tests, including one that runs a whole
+share between two peers in-process — UKEY2 handshake, key derivation, encrypted channel,
+paired-key exchange, introduction, acceptance, a 300 KB file in 64 KiB chunks,
+reassembled and compared byte for byte. `quickshare::connection::serve` is the I/O loop
+around it and compiles into the daemon.
+
+Three things stand between that and receiving a file on hardware:
+
+1. **A `Host` implementation.** `serve` needs four methods. `ask` should reuse the
+   existing `Transfers::await_answer`, which is what already makes the AirDrop prompt
+   work — the app needs no change, and `onTransferOffered` already carries
+   `PROTOCOL_QUICKSHARE` so the prompt badges itself correctly. `create` must sanitise
+   the peer's filename: `httpd::safe_leaf` and `httpd::non_clobbering` already do exactly
+   this for AirDrop and should be made `pub(crate)` and reused rather than reimplemented.
+
+2. **A TCP listener on wlan0**, on the port the mDNS record advertises, spawning a thread
+   per connection into `serve`. Gate it on the Quick Share policy — the daemon already
+   holds `policy.quickshare`, and `allows_receive` is the check.
+
+3. **mDNS advertising.** Discovery today only BROWSES. Nothing can find this device as a
+   Quick Share endpoint until it publishes an SRV, TXT and A record for
+   `_FC9F5ED42C8A._tcp` on wlan0. The identity layer for it is done (`quickshare::mod`
+   has the instance encoding, endpoint id and TXT keys, verified against Windows Quick
+   Share); what is missing is the responder.
+
+Only (3) is real protocol work; (1) and (2) are plumbing. Sending — the outbound
+direction — needs the same three plus `fsm::Outbound`, which is written and tested.
+
+**Not blocking, but worth knowing:** `libbarq_protocol` is a dylib rather than an rlib.
+It was declared `rust_library_rlib` first and Soong emitted a correct-looking
+`--extern barq_protocol=<valid rlib>` that rustc still could not resolve. Worth another
+look if someone wants the static link; it is not worth blocking on, and `gos-push.sh`
+carries the .so and verifies it.
+
+
 ### refreshPeers: the button does nothing, and the first diagnosis was wrong
 
 The control is wired, the app's call returns without throwing, and the daemon appears
