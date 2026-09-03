@@ -20,8 +20,9 @@
 //! | `ukey2::crypto` — P-256 ECDH, key encoding | **done** |
 //! | UKEY2 handshake messages and state machine | **done**, both sides round-trip |
 //! | `protobuf` — minimal wire codec | **done** |
-//! | wire framing, offline frames | next |
-//! | connection state machines | not started |
+//! | `framing` — 4-byte length prefix | **done** |
+//! | `frames` — offline frames | **done** |
+//! | connection state machines | next |
 //! | sharing FSM, payload | not started |
 //!
 //! Discovery is NOT here: it is in barqsharingd, because it needs sockets and an
@@ -29,6 +30,8 @@
 //! see `docs/QUICKSHARE-VECTORS.md`.
 
 pub mod d2d;
+pub mod frames;
+pub mod framing;
 pub mod hkdf;
 pub mod protobuf;
 pub mod securemessage;
