@@ -85,3 +85,48 @@ The name is length-prefixed UTF-8 with no terminator and no trailing bytes, whic
 The instance name and port change per session, so these exact values are a snapshot. The
 structure is what is being asserted, not the bytes. Re-run the two `dns-sd` commands above
 against any Windows or Android peer with Quick Share visible to everyone.
+
+## BLE endpoint advertisements, captured 2026-09-03
+
+Taken on mustang with an unfiltered BLE scan (`persist.barq.ble_debug 1`), in a room with
+a Windows machine running Quick Share and an Android device actively sharing.
+
+**The headline result is a negative one.** Over several minutes there were **zero**
+`0xFE2C` FastInitiation pulses and hundreds of `0xFEF3` advertisements. Discovery happens
+on `0xFEF3`; the `0xFE2C` pulse is a sender waking an idle receiver, not the mechanism by
+which peers are found. `protocol/src/ble.rs` said otherwise until this capture.
+
+Three advertisements, from two devices with randomised addresses:
+
+```
+4a17233932584d1132b3480eb85b8b562fcefb2077e73494e5f264    endpoint "92XM"
+4a172357444b4811320f75aa376a6c91683c1583cf24accd3c2536    endpoint "WDKH"
+4a172342524a361132e88e4a78a8c8399b84fcc5a2404ee85f2d94    endpoint "BRJ6"
+```
+
+Structure, agreed by all three:
+
+| offset | bytes | meaning |
+|---|---|---|
+| 0 | `4a` | version and flags; bit 1 set marks a fast advertisement |
+| 1–2 | `17 23` | constant in every sample; **meaning not established**. `0x17` = 23 = length − 4 |
+| 3–6 | varies | endpoint id, four printable ASCII characters |
+| 7 | `11` | endpoint-info length, 17 |
+| 8–24 | varies | endpoint info: flags byte, 2-byte salt, 14-byte encrypted metadata key |
+| 25–26 | varies | two trailing bytes, **purpose unknown** |
+
+The endpoint-info length being exactly 17 across three samples from two devices is what
+makes the reading credible: 1 + 2 + 14 is Quick Share's own endpoint-info shape.
+
+Decrypting the device name from the metadata key needs a contact certificate rooted in a
+Google account. Barq has none and wants none, so the field is carried and not
+interpreted — the name arrives later over the connection, as it does for AirDrop.
+
+For contrast, the idle background advertisements on the same service are 17 bytes and a
+different shape, and must not be read as peers:
+
+```
+5120001111020000232000557834460000
+512210001002040803200082db0adb0000
+5128000010024020231000158513940000    (K-PROART, the Windows machine, while idle)
+```

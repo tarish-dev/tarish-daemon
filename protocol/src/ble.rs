@@ -1,11 +1,20 @@
-//! The Quick Share BLE beacon — how devices notice each other with no network.
+//! Quick Share over BLE: the wake-up pulse, and the advertisement that finds peers.
 //!
-//! This is the **FastInitiation** pulse: a sender with an active share intent broadcasts
-//! it on service `0xFE2C`, and nearby receivers wake up and start advertising themselves
-//! properly. It is a doorbell, not a directory — it carries no name, no address and no
-//! endpoint to connect to. What it does is get a receiver that was idle to become
-//! discoverable, which is the step that makes discovery possible without a network for
-//! anything to be discovered *on*.
+//! Two separate things live here, and this module originally conflated them.
+//!
+//! **The FastInitiation pulse** (`0xFE2C`, below) is a doorbell: a sender with an active
+//! share intent broadcasts it to wake idle receivers. It carries no name, no address and
+//! no endpoint to connect to.
+//!
+//! **The endpoint advertisement** (`0xFEF3`, at the bottom) is the directory, and it is
+//! what discovery actually uses. It carries the endpoint id and endpoint info.
+//!
+//! That distinction was established by measurement, not by reading. In a capture taken
+//! beside an actively-sharing Android device and a Windows machine running Quick Share,
+//! there were **zero** `0xFE2C` pulses over several minutes and hundreds of `0xFEF3`
+//! advertisements. An earlier version of this file said the pulse was "how devices notice
+//! each other with no network", which is wrong: it is how a sender wakes a receiver that
+//! is already able to be found.
 //!
 //! ```text
 //!   fc 12 8e VV PP UU AA AA AA AA AA AA AA AA SS HH HH HH HH HH HH HH HH
@@ -239,5 +248,155 @@ mod tests {
         let a = build_random("ABCD").unwrap();
         assert!(is_fast_init(&a));
         assert_eq!(parse(&a).unwrap().secret_id_hash, secret_id_hash("ABCD"));
+    }
+}
+
+// --------------------------------------------------- the endpoint advertisement ---
+//
+// The FastInit pulse above is a doorbell. THIS is the directory: the Nearby Connections
+// BLE advertisement, on service 0xFEF3, is what actually carries a peer's identity and
+// is how a Quick Share device is found with no network.
+//
+// Worth stating plainly, because this module originally claimed otherwise: in a capture
+// taken next to an actively-sharing Android device and a Windows machine running Quick
+// Share, there were ZERO 0xFE2C pulses over several minutes, and hundreds of 0xFEF3
+// advertisements. Discovery happens here.
+//
+// The layout below is READ FROM CAPTURED TRAFFIC, not from a specification, and the
+// parts that are guesses are marked as such. Three independent samples from two devices
+// agreed on every field asserted here.
+//
+//     4a 17 23 | 39 32 58 4d | 11 | 32 <16 more> | xx xx
+//     |  |  |    |             |    |              |
+//     |  |  |    |             |    |              two trailing bytes, purpose unknown
+//     |  |  |    |             |    endpoint info: flags, 2-byte salt, 14-byte key
+//     |  |  |    |             endpoint info length, 0x11 = 17
+//     |  |  |    endpoint id, four ASCII characters ("92XM", "WDKH", "BRJ6")
+//     |  |  constant across every sample; meaning not established
+//     |  constant across every sample; 0x17 = 23 = payload length minus four
+//     version and flags; bit 1 set marks a fast advertisement
+
+/// Nearby Connections' assigned service. Quick Share advertises its endpoints here.
+pub const NEARBY_SERVICE_UUID_16: u16 = 0xFEF3;
+
+/// Where the endpoint id starts, and how long it is.
+const ADVERT_ENDPOINT_ID_AT: usize = 3;
+/// Four ASCII characters, the same identifier that appears in a ConnectionRequest and
+/// in the mDNS instance name.
+pub const ENDPOINT_ID_LEN: usize = 4;
+/// The byte holding the endpoint-info length.
+const ADVERT_INFO_LEN_AT: usize = 7;
+/// Shortest thing that can still contain an endpoint id and an info length.
+const ADVERT_MIN_LEN: usize = ADVERT_INFO_LEN_AT + 1;
+
+/// A peer found over BLE.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Advertisement {
+    /// Four ASCII characters identifying the endpoint.
+    pub endpoint_id: String,
+    /// Opaque here. For Quick Share it is flags, a 2-byte salt, and a 14-byte encrypted
+    /// metadata key -- decrypting the name needs a contact certificate we do not have
+    /// and do not want, so it is carried rather than interpreted.
+    pub endpoint_info: Vec<u8>,
+}
+
+/// Parse a Nearby Connections BLE advertisement.
+///
+/// Conservative on purpose: the layout came from captures, so this validates what it can
+/// (the endpoint id is printable ASCII, the declared info length fits) and refuses
+/// anything else rather than returning fields it is not confident in. A wrong endpoint id
+/// is worse than no peer -- it produces a connection attempt to something that will not
+/// answer.
+pub fn parse_advertisement(data: &[u8]) -> Option<Advertisement> {
+    if data.len() < ADVERT_MIN_LEN + ENDPOINT_ID_LEN {
+        return None;
+    }
+    let id = &data[ADVERT_ENDPOINT_ID_AT..ADVERT_ENDPOINT_ID_AT + ENDPOINT_ID_LEN];
+    // Every endpoint id seen on the wire is printable ASCII, and ours is generated that
+    // way too. Anything else means this is not the advertisement shape we decoded.
+    if !id.iter().all(|c| c.is_ascii_graphic()) {
+        return None;
+    }
+    let info_len = data[ADVERT_INFO_LEN_AT] as usize;
+    let start = ADVERT_INFO_LEN_AT + 1;
+    if info_len == 0 || start + info_len > data.len() {
+        return None;
+    }
+    Some(Advertisement {
+        endpoint_id: String::from_utf8_lossy(id).into_owned(),
+        endpoint_info: data[start..start + info_len].to_vec(),
+    })
+}
+
+#[cfg(test)]
+mod advertisement_tests {
+    use super::*;
+
+    /// Captured 2026-09-03 from two devices running stock Quick Share, on 0xFEF3.
+    /// See docs/QUICKSHARE-VECTORS.md.
+    const CAPTURED: [&str; 3] = [
+        "4a17233932584d1132b3480eb85b8b562fcefb2077e73494e5f264",
+        "4a172357444b4811320f75aa376a6c91683c1583cf24accd3c2536",
+        "4a172342524a361132e88e4a78a8c8399b84fcc5a2404ee85f2d94",
+    ];
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// The whole point: real bytes from real devices, decoded.
+    #[test]
+    fn the_captured_advertisements_decode() {
+        let want = ["92XM", "WDKH", "BRJ6"];
+        for (hex, id) in CAPTURED.iter().zip(want) {
+            let a = parse_advertisement(&unhex(hex)).expect("should parse");
+            assert_eq!(a.endpoint_id, id);
+            // 1 flags + 2 salt + 14 key. That this is exactly 17 across three samples
+            // from two devices is what makes the layout credible.
+            assert_eq!(a.endpoint_info.len(), 17);
+        }
+    }
+
+    #[test]
+    fn an_endpoint_id_that_is_not_ascii_is_refused() {
+        let mut b = unhex(CAPTURED[0]);
+        b[ADVERT_ENDPOINT_ID_AT] = 0x00;
+        assert!(parse_advertisement(&b).is_none());
+    }
+
+    /// A declared length running past the buffer must be refused, not truncated into
+    /// something that looks like a peer.
+    #[test]
+    fn an_overlong_info_length_is_refused() {
+        let mut b = unhex(CAPTURED[0]);
+        b[ADVERT_INFO_LEN_AT] = 0xFF;
+        assert!(parse_advertisement(&b).is_none());
+    }
+
+    /// The idle background advertisements seen in the same capture are 17 bytes and a
+    /// different shape. They must not be mistaken for peers.
+    #[test]
+    fn the_idle_background_advertisements_are_not_peers() {
+        for hex in [
+            "5120001111020000232000557834460000",
+            "512210001002040803200082db0adb0000",
+            "5128000010024020231000158513940000",
+        ] {
+            let b = unhex(hex);
+            if let Some(a) = parse_advertisement(&b) {
+                panic!("idle advertisement parsed as peer {a:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn truncation_does_not_panic() {
+        let b = unhex(CAPTURED[0]);
+        for cut in 0..b.len() {
+            let _ = parse_advertisement(&b[..cut]);
+        }
     }
 }
