@@ -9,8 +9,15 @@
 # where set_prop on our own type is still denied, which fails silently.
 barq.awdl.          u:object_r:barq_awdl_prop:s0
 
-# The advertised device name. Prefix for the same reason as above: an exact rule for
-# one key leaves any sibling on default_prop, where set_prop on our own type is still
-# denied and fails silently -- which is exactly how this one was found, with the
-# settings screen appearing to accept a name that never reached the property.
-persist.barq.       u:object_r:barq_name_prop:s0
+# The advertised device name. EXACT KEY, not the `persist.barq.` prefix.
+#
+# The prefix argument above is right for `barq.awdl.`, where one process owns every key
+# in the namespace. It is wrong here: `persist.barq.` is SHARED. barqd reads
+# persist.barq.mosey_config, .channels, .sta_freq and .country as operator overrides,
+# and labelling the prefix pulled all four onto a type barqd has no grant for -- so
+# every one of them silently stopped working, including the regulatory country
+# override, while the log filled with barqd read denials.
+#
+# One key needs a label because one process must SET it. The rest are read-only knobs
+# that were working on the default label; leave them there.
+persist.barq.name   u:object_r:barq_name_prop:s0
