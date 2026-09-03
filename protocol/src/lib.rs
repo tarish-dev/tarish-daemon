@@ -22,6 +22,7 @@
 //! | `protobuf` — minimal wire codec | **done** |
 //! | `framing` — 4-byte length prefix | **done** |
 //! | `frames` — offline frames | **done** |
+//! | `channel` — keys, sequence numbers, direction | **done** |
 //! | connection state machines | next |
 //! | `sharing` — introduction, response, paired key | **done** |
 //! | sharing FSM, payload | not started |
@@ -30,6 +31,7 @@
 //! interface name. It is done and verified against Google's Quick Share for Windows --
 //! see `docs/QUICKSHARE-VECTORS.md`.
 
+pub mod channel;
 pub mod d2d;
 pub mod frames;
 pub mod framing;
