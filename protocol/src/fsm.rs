@@ -10,13 +10,16 @@
 //! ```text
 //! sender                                   receiver
 //!   PairedKeyEncryption      ------------>
-//!                            <------------  PairedKeyEncryption
-//!   PairedKeyResult          ------------>
-//!                            <------------  PairedKeyResult
+//!   PairedKeyResult          ------------>   all three, without waiting
 //!   Introduction             ------------>
 //!                                           (a human decides)
 //!                            <------------  Response(ACCEPT | REJECT)
 //!   file payloads            ------------>
+//!
+//! The sender does NOT wait between those three. It was written that way first and hung
+//! against a real peer: the receiver had nothing to say until it knew what was on offer,
+//! and we would not offer until it had spoken. The receiver is the side that waits,
+//! because it is the side with a decision to make.
 //! ```
 //!
 //! Sans-IO, like everything else here: events in, effects out, no sockets and no clock.
@@ -271,18 +274,34 @@ impl Outbound {
         self.state
     }
 
+    /// Open the exchange: identity claim, our verdict, and the file list, ALL AT ONCE.
+    ///
+    /// A sender does not wait for the receiver between these. It was written that way
+    /// first -- send the paired key, wait for theirs, then answer, then introduce -- and
+    /// against a real Windows peer it hung forever with the channel up and both sides
+    /// healthy: the peer had nothing to say until it had been told what was on offer, and
+    /// we would not offer until it had spoken. Neither side was wrong on the wire and
+    /// nothing timed out.
+    ///
+    /// The receiver is the one that waits, because it is the one with a decision to make.
     pub fn start(&mut self) -> Vec<Effect> {
         if self.sent_paired_key {
             return Vec::new();
         }
         self.sent_paired_key = true;
-        match sharing::paired_key_encryption() {
-            Ok(f) => vec![Effect::Send(f)],
+        let pke = match sharing::paired_key_encryption() {
+            Ok(f) => f,
             Err(_) => {
                 self.state = State::Failed;
-                vec![Effect::Failed("could not build the paired-key frame")]
+                return vec![Effect::Failed("could not build the paired-key frame")];
             }
-        }
+        };
+        self.state = State::Introduction;
+        vec![
+            Effect::Send(pke),
+            Effect::Send(sharing::paired_key_result(PairedKeyResult::Unable)),
+            Effect::Send(sharing::introduction(&self.introduction)),
+        ]
     }
 
     pub fn on(&mut self, event: Event) -> Vec<Effect> {
@@ -314,16 +333,6 @@ impl Outbound {
             (_, Frame::Cancel) => {
                 self.state = State::Cancelled;
                 vec![Effect::Cancelled]
-            }
-
-            (State::PairedKey, Frame::PairedKeyEncryption { .. }) => {
-                vec![Effect::Send(sharing::paired_key_result(
-                    PairedKeyResult::Unable,
-                ))]
-            }
-            (State::PairedKey, Frame::PairedKeyResult(_)) => {
-                self.state = State::Introduction;
-                vec![Effect::Send(sharing::introduction(&self.introduction))]
             }
 
             (State::Introduction, Frame::Response(Status::Accept)) => {
@@ -407,22 +416,40 @@ mod tests {
         assert_eq!(r.state(), State::Done);
     }
 
-    /// The happy path, sending.
+    /// The happy path, sending. All three frames go out at once.
     #[test]
     fn a_sender_walks_the_whole_exchange() {
         let mut s = Outbound::new(intro());
-        assert!(matches!(s.start()[..], [Effect::Send(_)]));
-        assert!(matches!(s.on(Event::Frame(pke()))[..], [Effect::Send(_)]));
-        assert!(matches!(
-            s.on(Event::Frame(Frame::PairedKeyResult(PairedKeyResult::Unable)))[..],
-            [Effect::Send(_)]
-        ));
+        assert!(
+            matches!(s.start()[..], [Effect::Send(_), Effect::Send(_), Effect::Send(_)]),
+            "sender must offer without waiting"
+        );
         assert_eq!(s.state(), State::Introduction);
         assert!(matches!(
             s.on(Event::Frame(Frame::Response(Status::Accept)))[..],
             [Effect::BeginSending(_)]
         ));
         assert_eq!(s.state(), State::Transferring);
+    }
+
+    /// THE REGRESSION. A peer that says nothing until it has been told what is on offer
+    /// must still receive the offer -- this hung forever against real Windows Quick
+    /// Share, with the encrypted channel up and neither side wrong on the wire.
+    #[test]
+    fn a_sender_offers_without_the_peer_speaking_first() {
+        let mut s = Outbound::new(intro());
+        let effects = s.start();
+        // The third frame is the introduction; without it the peer has no reason to
+        // reply and both sides wait.
+        assert_eq!(effects.len(), 3, "paired key, result, introduction");
+        let intro_bytes = match &effects[2] {
+            Effect::Send(b) => b.clone(),
+            other => panic!("third effect should be the introduction: {other:?}"),
+        };
+        assert!(matches!(
+            sharing::parse(&intro_bytes).unwrap(),
+            Frame::Introduction(_)
+        ));
     }
 
     /// THE property. No sequence of peer frames may produce an acceptance -- only a
@@ -519,8 +546,6 @@ mod tests {
     fn a_refused_send_finishes_rather_than_failing() {
         let mut s = Outbound::new(intro());
         s.start();
-        s.on(Event::Frame(pke()));
-        s.on(Event::Frame(Frame::PairedKeyResult(PairedKeyResult::Unable)));
         assert_eq!(
             s.on(Event::Frame(Frame::Response(Status::Reject))),
             vec![Effect::Done]
@@ -563,6 +588,7 @@ mod tests {
     fn a_sender_refuses_an_introduction_from_the_peer() {
         let mut s = Outbound::new(intro());
         s.start();
+        // A sender never receives a file list; the peer it dialled is the receiver.
         assert!(matches!(
             s.on(Event::Frame(Frame::Introduction(intro())))[..],
             [Effect::Failed(_)]

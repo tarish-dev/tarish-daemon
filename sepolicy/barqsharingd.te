@@ -122,6 +122,20 @@ set_prop(barqsharingd, barq_awdl_prop)
 # grant an app should not have -- so it arrives over binder and is written here.
 set_prop(barqsharingd, barq_name_prop)
 
+# Use a socket the APP connected and passed over binder.
+#
+# Reaching a Quick Share peer with no network means Bluetooth, and framework Bluetooth is
+# unreachable from a native service. So the app opens the connection and hands the
+# descriptor across; this daemon runs the protocol on it. Without this rule the binder
+# transaction fails and the app sees DeadObjectException -- "remote process probably
+# died" -- while the daemon is alive and well and never hears about the call. The denial
+# names sockfs and gives no hint that a policy line is missing.
+#
+# read/write only. NOT create, connect or bind: this daemon must never be able to open a
+# socket of its own from a descriptor someone else handed it, and it has no reason to --
+# the app already connected it.
+allow barqsharingd system_app:unix_stream_socket { read write getattr };
+
 # set_prop() alone is NOT enough on this release. The macro grants
 # `barq_awdl_prop:property_service set` and `init:unix_stream_socket connectto`, but
 # libc still writes to /dev/socket/property_service first, and that write is checked
