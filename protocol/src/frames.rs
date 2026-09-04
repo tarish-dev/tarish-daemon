@@ -54,14 +54,55 @@ const CR_HANDSHAKE_DATA: u32 = 3;
 const CR_NONCE: u32 = 4;
 const CR_MEDIUMS: u32 = 5;
 const CR_ENDPOINT_INFO: u32 = 6;
+const CR_MEDIUM_METADATA: u32 = 7;
 const CR_KEEPALIVE_INTERVAL: u32 = 8;
 const CR_KEEPALIVE_TIMEOUT: u32 = 9;
+const CR_CONNECTIONS_DEVICE: u32 = 12;
+
+// MediumMetadata
+const MM_SUPPORTS_5GHZ: u32 = 1;
+const MM_SUPPORTS_6GHZ: u32 = 4;
+const MM_MOBILE_RADIO: u32 = 5;
+const MM_AP_FREQUENCY: u32 = 6;
+
+/// `ap_frequency` when we are not associated with an AP. Signed, so it is written as a
+/// ten-byte varint -- protobuf sign-extends a negative int32 to 64 bits.
+const AP_FREQUENCY_NONE: u64 = -1i32 as i64 as u64;
+
+// ConnectionsDevice
+const CD_ENDPOINT_ID: u32 = 1;
+const CD_ENDPOINT_TYPE: u32 = 2;
+const CD_ENDPOINT_INFO: u32 = 4;
+
+/// `EndpointType.CONNECTIONS_ENDPOINT`. The other values describe Presence devices,
+/// which is a different discovery stack.
+const ENDPOINT_TYPE_CONNECTIONS: u64 = 1;
 
 // ConnectionResponseFrame
 const RSP_STATUS: u32 = 1;
 const RSP_HANDSHAKE_DATA: u32 = 2;
 const RSP_RESPONSE: u32 = 3;
 const RSP_OS_INFO: u32 = 4;
+const RSP_MULTIPLEX_BITMASK: u32 = 5;
+const RSP_SAFE_TO_DISCONNECT: u32 = 7;
+const RSP_KEEPALIVE_TIMEOUT: u32 = 9;
+
+/// "No medium supports multiplexing", which is true of us: one socket, one stream.
+///
+/// Absence and zero are different things here. The field must be PRESENT and zero --
+/// see `connection_response`.
+const MULTIPLEX_SOCKET_BITMASK_NONE: u64 = 0;
+
+/// The version of the safe-to-disconnect handshake we claim. Anything below 1 reads as
+/// "this peer cannot disconnect safely".
+const SAFE_TO_DISCONNECT_VERSION: u64 = 1;
+
+/// Ten minutes. Both sides of the handshake advertise it, and it is what a stock peer
+/// schedules its own KEEP_ALIVE cadence against.
+pub const KEEP_ALIVE_TIMEOUT_MILLIS: u64 = 600_000;
+
+/// Ten seconds, which is what stock Android emits.
+pub const KEEP_ALIVE_INTERVAL_MILLIS: u64 = 10_000;
 
 // OsInfo
 const OS_TYPE: u32 = 1;
@@ -301,6 +342,47 @@ fn offline(frame_type: u64, field: u32, body: &[u8]) -> Vec<u8> {
 /// `endpoint_info` is the advertisement blob the peer already saw over mDNS or BLE; it
 /// carries the display name. Sending it again here is not redundant -- a peer that
 /// connected from a BLE advertisement has only a truncated form of it.
+/// `MediumMetadata`, describing this device's radios.
+///
+/// Every value is a truthful "no": we do not offer a Wi-Fi upgrade path of our own, so
+/// claiming 5 GHz or 6 GHz support would invite a peer to negotiate onto one. The fields
+/// are written explicitly rather than left absent because absence and false are different
+/// things to the peer that reads them -- see `connection_request`.
+fn medium_metadata() -> Vec<u8> {
+    let mut w = Writer::new();
+    w.varint(MM_SUPPORTS_5GHZ, 0)
+        .varint(MM_SUPPORTS_6GHZ, 0)
+        .varint(MM_MOBILE_RADIO, 0)
+        .varint(MM_AP_FREQUENCY, AP_FREQUENCY_NONE);
+    w.finish()
+}
+
+/// `ConnectionsDevice`, which repeats the endpoint id and info inside a `Device` oneof.
+///
+/// It is genuinely redundant -- both values are already fields 1 and 6 of the request --
+/// but a stock receiver reads the oneof, not the flat fields. See `connection_request`.
+fn connections_device(endpoint_id: &str, endpoint_info: &[u8]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.bytes(CD_ENDPOINT_ID, endpoint_id.as_bytes())
+        .varint(CD_ENDPOINT_TYPE, ENDPOINT_TYPE_CONNECTIONS)
+        .bytes(CD_ENDPOINT_INFO, endpoint_info);
+    w.finish()
+}
+
+/// Build a ConnectionRequest.
+///
+/// **Two fields here are derived rather than taken from `req`, and both are required by
+/// stock Quick Share on Android.** `medium_metadata` and `connections_device` carry no
+/// information a caller could get wrong, and forgetting them is not a visible mistake:
+/// the receiver accepts the socket, reads a request it will not dispatch, and says
+/// nothing at all. Deriving them here means no caller can omit them.
+///
+/// That failure is what "RFCOMM connects to an Android peer and then nothing happens"
+/// was. Windows Quick Share is laxer -- it completed the whole handshake against a
+/// request missing both, took the introduction, and only then reported that it could not
+/// complete the transfer. Credit: Bada's `OutboundFrames.connectionRequest`, whose
+/// comment records that endpoint_id and endpoint_info alone stopped being enough on
+/// Android 14.
 pub fn connection_request(req: &ConnectionRequest) -> Vec<u8> {
     let mut w = Writer::new();
     w.bytes(CR_ENDPOINT_ID, req.endpoint_id.as_bytes())
@@ -310,13 +392,18 @@ pub fn connection_request(req: &ConnectionRequest) -> Vec<u8> {
     for m in &req.mediums {
         w.varint(CR_MEDIUMS, *m);
     }
-    w.bytes(CR_ENDPOINT_INFO, &req.endpoint_info);
+    w.bytes(CR_ENDPOINT_INFO, &req.endpoint_info)
+        .bytes(CR_MEDIUM_METADATA, &medium_metadata());
     if let Some(v) = req.keep_alive_interval_millis {
         w.varint(CR_KEEPALIVE_INTERVAL, v);
     }
     if let Some(v) = req.keep_alive_timeout_millis {
         w.varint(CR_KEEPALIVE_TIMEOUT, v);
     }
+    w.bytes(
+        CR_CONNECTIONS_DEVICE,
+        &connections_device(&req.endpoint_id, &req.endpoint_info),
+    );
     offline(T_CONNECTION_REQUEST, V1_CONNECTION_REQUEST, &w.finish())
 }
 
@@ -325,6 +412,24 @@ pub fn connection_request(req: &ConnectionRequest) -> Vec<u8> {
 /// `status` is written as well as `response` because it is the field older peers read.
 /// It is marked deprecated in the schema, and omitting it makes a peer that predates
 /// `response` see a default of 0 and treat an acceptance as a rejection.
+///
+/// **Three more fields exist only to satisfy a receiver, and all three fail silently.**
+/// A stock peer that finds any of them missing closes the socket without a frame --
+/// after our ACCEPT, before its own -- which looks like the network dropping rather than
+/// like a rejection:
+///
+/// - `multiplex_socket_bitmask` must be PRESENT and zero. Zero means "no medium
+///   multiplexes", which is what we do; absent means the peer cannot tell.
+/// - `safe_to_disconnect_version` below 1 reads as "cannot disconnect safely", and the
+///   receiver drops us before it ever shows a consent dialog.
+/// - `keep_alive_timeout_millis` is the newest of the three and the last to be found.
+///
+/// Empty `handshake_data` is NOT written. It carried nothing, and this frame is compared
+/// field-for-field by the peer -- the shape below is the one observed to work.
+///
+/// Both directions send this same shape, because the peer validating it does not know
+/// which role we are playing. Credit: Bada's `OutboundFrames.connectionResponse`, which
+/// records each field against the device that needed it.
 pub fn connection_response(response: Response, os: OsType) -> Vec<u8> {
     let mut os_info = Writer::new();
     os_info.varint(OS_TYPE, os as u64);
@@ -333,7 +438,9 @@ pub fn connection_response(response: Response, os: OsType) -> Vec<u8> {
     w.varint(RSP_STATUS, if response == Response::Accept { 0 } else { 1 })
         .varint(RSP_RESPONSE, response as u64)
         .bytes(RSP_OS_INFO, &os_info.finish())
-        .bytes(RSP_HANDSHAKE_DATA, &[]);
+        .varint(RSP_MULTIPLEX_BITMASK, MULTIPLEX_SOCKET_BITMASK_NONE)
+        .varint(RSP_SAFE_TO_DISCONNECT, SAFE_TO_DISCONNECT_VERSION)
+        .varint(RSP_KEEPALIVE_TIMEOUT, KEEP_ALIVE_TIMEOUT_MILLIS);
     offline(T_CONNECTION_RESPONSE, V1_CONNECTION_RESPONSE, &w.finish())
 }
 
@@ -576,6 +683,149 @@ mod tests {
                 other => panic!("wrong frame: {other:?}"),
             }
         }
+    }
+
+    // ------------------------------------------------------- required fields ---
+    //
+    // The tests below assert PRESENCE, and they exist because every one of these fields
+    // fails silently. A stock peer missing any of them closes the socket without sending
+    // a frame, so nothing above this layer can tell a missing field from a radio going
+    // out of range.
+    //
+    // A round-trip test cannot catch this: our own parser is happy either way, which is
+    // exactly how they came to be missing in the first place. These assert against the
+    // encoded bytes instead.
+
+    /// Dig the nested ConnectionRequest out of a built frame.
+    fn request_body(bytes: &[u8]) -> Vec<u8> {
+        let v1 = protobuf::first_bytes(bytes, OF_V1).unwrap().expect("no V1Frame");
+        protobuf::first_bytes(v1, V1_CONNECTION_REQUEST)
+            .unwrap()
+            .expect("no ConnectionRequest")
+            .to_vec()
+    }
+
+    /// Dig the nested ConnectionResponse out of a built frame.
+    fn response_body(bytes: &[u8]) -> Vec<u8> {
+        let v1 = protobuf::first_bytes(bytes, OF_V1).unwrap().expect("no V1Frame");
+        protobuf::first_bytes(v1, V1_CONNECTION_RESPONSE)
+            .unwrap()
+            .expect("no ConnectionResponse")
+            .to_vec()
+    }
+
+    fn sample_request() -> ConnectionRequest {
+        ConnectionRequest {
+            endpoint_id: "ABCD".into(),
+            endpoint_name: "Pixel".into(),
+            endpoint_info: vec![0x21, 0xAA, 0xBB],
+            handshake_data: vec![],
+            nonce: 0,
+            mediums: vec![Medium::Bluetooth as u64, Medium::WifiLan as u64],
+            keep_alive_interval_millis: Some(KEEP_ALIVE_INTERVAL_MILLIS),
+            keep_alive_timeout_millis: Some(KEEP_ALIVE_TIMEOUT_MILLIS),
+        }
+    }
+
+    /// Without this a stock Android receiver accepts the socket and never answers.
+    #[test]
+    fn a_request_carries_medium_metadata() {
+        let body = request_body(&connection_request(&sample_request()));
+        let meta = protobuf::first_bytes(&body, CR_MEDIUM_METADATA)
+            .unwrap()
+            .expect("no medium_metadata in the request");
+
+        // Present AND false. Absent is a different thing to the peer that reads it,
+        // which is the whole reason these are written out rather than left at a default.
+        assert_eq!(protobuf::first_varint(meta, MM_SUPPORTS_5GHZ).unwrap(), Some(0));
+        assert_eq!(protobuf::first_varint(meta, MM_SUPPORTS_6GHZ).unwrap(), Some(0));
+        assert_eq!(protobuf::first_varint(meta, MM_MOBILE_RADIO).unwrap(), Some(0));
+        // -1 sign-extended to 64 bits, which is what protobuf does with a negative
+        // int32: ten bytes on the wire. A naive cast would write one and mean 2^32-1.
+        assert_eq!(
+            protobuf::first_varint(meta, MM_AP_FREQUENCY).unwrap(),
+            Some(u64::MAX)
+        );
+    }
+
+    /// The same failure as above, and the same silence.
+    #[test]
+    fn a_request_carries_a_connections_device() {
+        let req = sample_request();
+        let body = request_body(&connection_request(&req));
+        let device = protobuf::first_bytes(&body, CR_CONNECTIONS_DEVICE)
+            .unwrap()
+            .expect("no connections_device in the request");
+
+        // It repeats the endpoint id and info, which are already fields 1 and 6 of the
+        // request. Redundant on the wire; read in preference to the flat fields.
+        assert_eq!(
+            protobuf::first_bytes(device, CD_ENDPOINT_ID).unwrap(),
+            Some(req.endpoint_id.as_bytes())
+        );
+        assert_eq!(
+            protobuf::first_bytes(device, CD_ENDPOINT_INFO).unwrap(),
+            Some(&req.endpoint_info[..])
+        );
+        assert_eq!(
+            protobuf::first_varint(device, CD_ENDPOINT_TYPE).unwrap(),
+            Some(ENDPOINT_TYPE_CONNECTIONS)
+        );
+    }
+
+    /// A sender with no endpoint_info is a sender the receiver cannot name, and the
+    /// consent prompt is built from it. This is what it was for weeks.
+    #[test]
+    fn an_empty_endpoint_info_is_visible_as_empty() {
+        let mut req = sample_request();
+        req.endpoint_info = Vec::new();
+        let body = request_body(&connection_request(&req));
+        assert_eq!(
+            protobuf::first_bytes(&body, CR_ENDPOINT_INFO).unwrap(),
+            Some(&[][..]),
+            "an empty endpoint_info should still be encoded, not silently dropped"
+        );
+    }
+
+    /// Three fields, and a receiver that drops us without a word when any is absent.
+    #[test]
+    fn a_response_carries_the_fields_a_stock_receiver_checks_for() {
+        let body = response_body(&connection_response(Response::Accept, OsType::Android));
+
+        // Zero, and PRESENT. This is the one most easily "optimised away" as a default.
+        assert_eq!(
+            protobuf::first_varint(&body, RSP_MULTIPLEX_BITMASK).unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            protobuf::first_varint(&body, RSP_SAFE_TO_DISCONNECT).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            protobuf::first_varint(&body, RSP_KEEPALIVE_TIMEOUT).unwrap(),
+            Some(KEEP_ALIVE_TIMEOUT_MILLIS)
+        );
+        // The empty handshake_data we used to write is gone. This frame is compared
+        // field-for-field, and an extra empty field is a difference.
+        assert_eq!(
+            protobuf::first_bytes(&body, RSP_HANDSHAKE_DATA).unwrap(),
+            None
+        );
+    }
+
+    /// Both directions send the same response shape, because the peer validating it does
+    /// not know which role we are playing.
+    #[test]
+    fn a_rejection_carries_them_too() {
+        let body = response_body(&connection_response(Response::Reject, OsType::Android));
+        assert_eq!(
+            protobuf::first_varint(&body, RSP_MULTIPLEX_BITMASK).unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            protobuf::first_varint(&body, RSP_SAFE_TO_DISCONNECT).unwrap(),
+            Some(1)
+        );
     }
 
     /// A peer that predates the `response` field says yes with `status = 0`.

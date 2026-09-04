@@ -9,41 +9,67 @@ did not exist, and the live work was two hundred lines down.
 
 ## Open
 
-### Quick Share offline: RFCOMM is the wrong door for Android peers
+### Quick Share offline: RFCOMM is the right door — the request was the wrong shape
 
-Established by testing against two real peers, 2026-09-04.
+Established by testing against two real peers 2026-09-04, then by reading Bada 2026-09-05.
 
 | peer | RFCOMM connect | then |
 |---|---|---|
 | Windows Quick Share | accepted | full UKEY2 handshake, encrypted channel, then "cannot complete transfer" |
 | Android Quick Share (two devices) | accepted | **ignores everything** — never answers the ConnectionRequest |
 
-Both accept the socket. Only Windows speaks the raw OfflineFrame protocol on it.
+**The first version of this entry concluded the door was wrong, and that was wrong.** It
+said the initial control connection had to be BLE L2CAP or GATT wrapped in a MultiplexFrame
+stream, and laid out four steps starting with extracting a PSM. Reading Bada instead of
+inferring from the symptom says otherwise, on three separate pieces of evidence:
 
-**The initial control connection for an offline peer is BLE L2CAP or GATT, not RFCOMM**,
-and it is wrapped in Nearby's length-prefixed MultiplexFrame stream — a virtual socket on
-top of the physical one. RFCOMM appears only as an *upgrade* path, carried in
-`BluetoothCredentials` inside `UPGRADE_PATH_AVAILABLE`. Bada puts these in a `bootstrap`
-package for exactly that reason: `BleL2capInitialControlClient`,
-`BleGattInitialControlServer`.
+- Its send-route priority is **LAN → RFCOMM → BLE L2CAP → BLE GATT** (`SendBootstrapPlan`),
+  so RFCOMM outranks both BLE routes for exactly the peer we were testing against.
+- `UserFacingMediumFeatures.BLUETOOTH_CLASSIC_BOOTSTRAP_ROUTE_ENABLED` is `true`, and its
+  comment records *why*: "Stock GMS receivers bootstrap off-LAN over RFCOMM (verified by
+  HCI snoop of stock-to-stock transfers); their BLE GATT/L2CAP server paths are unreliable
+  because stock senders never exercise them."
+- `useNearbyMultiplexInitialTransport` defaults to `false` and no caller sets it. Multiplex
+  is a **LAN** option, and the transport-based constructor hardcodes it off. Nothing
+  multiplexes an RFCOMM bootstrap.
 
-**The L2CAP PSM comes from the fast advertisement we already parse.** It is a field in the
-endpoint data that `ble::parse_advertisement` currently ignores. That is the thread to
-pull first, because everything else depends on having a PSM to connect to.
+And the peers agree: our captured Android advertisements are the fast form, which carries
+no PSM at all. Bada's own runbook expects exactly that —
+`rejected=[wifi-lan=missing, ble-l2cap=peer-psm-missing]`.
 
-What this needs, in order:
+So the socket was right. **What was wrong was the ConnectionRequest, in five places** — all
+fields a stock Android receiver requires and none of which produce an error when absent:
 
-1. extract the CoC PSM from the advertisement — protocol crate, unit-testable
-2. the MultiplexFrame layer — protocol crate, unit-testable
-3. L2CAP connect in the app (`createL2capChannel`), replacing RFCOMM as the first hop
-4. keep RFCOMM only as an upgrade target
+| field | what it is | absent means |
+|---|---|---|
+| `endpoint_info` | **we sent an empty vector** | the receiver builds its "X wants to share" prompt from this. Empty leaves it with a request it cannot show anyone |
+| `medium_metadata` (7) | this device's radios | request is not dispatched |
+| `connections_device` (12) | endpoint id + info again, inside the `Device` oneof | read in preference to the flat fields |
+| `multiplex_socket_bitmask` (5, response) | present and **zero** | Samsung One UI 8.0.5 FINs ~104 ms after our ACCEPT |
+| `safe_to_disconnect_version` (7, response) | 1 | One UI 7+ drops us before the consent dialog |
+
+`keep_alive_timeout_millis` was also 30 s where stock is 600 s, in both the request and
+(newly) the response — the field was added to `ConnectionResponseFrame` in Dec 2024 and a
+Galaxy S24 Ultra FINs ~150 ms without it.
+
+Every one of these is silent. That is why the symptom was a socket that connects and then
+does nothing, and why it read as the wrong transport. Fixed in `frames.rs`; the two
+derived fields are built inside `connection_request` rather than taken from the caller, so
+no caller can omit them again. Five tests assert presence against the encoded bytes,
+because a round-trip test cannot catch this — our own parser is happy either way, which is
+how they came to be missing.
+
+Credit for all of it: Bada's `OutboundFrames`, whose comments record each field against the
+device that needed it.
+
+**Untested on hardware.** Windows got further than Android on the old shape, so it may
+still fail at the same place; if it does, the next suspect is unchanged — see below.
 
 **What is NOT wrong, and should not be re-litigated:** the crypto. Against Windows the
 plaintext handshake completes, the channel comes up, the peer is identified and a session
 PIN derives. HKDF is on RFC vectors, D2D derivation and AES-CBC on Bada's. The remaining
-Windows-side failure is a separate question from the Android one and is most likely the
-SecureMessage envelope, which is the one layer in that path with no foreign-implementation
-vector.
+Windows-side failure is most likely the SecureMessage envelope, the one layer in that path
+with no foreign-implementation vector.
 
 
 ### Quick Share: what is left is the socket, not the protocol

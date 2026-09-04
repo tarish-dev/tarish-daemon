@@ -84,15 +84,48 @@ where
     // Only claim what can actually be carried: offering a medium we cannot deliver
     // invites the peer to negotiate an upgrade onto a path that does not exist, and the
     // failure then arrives halfway through a transfer instead of up front.
+    // WHO WE ARE, in the same encoding a receiver advertises over BLE.
+    //
+    // This was an empty vector, on the reading that a sender is already identified by
+    // endpoint_name. It is not: a stock receiver builds its "X wants to share" prompt
+    // from endpoint_info and reads endpoint_name only as a legacy fallback, so an empty
+    // one leaves it with a request it cannot show anyone.
+    //
+    // The metadata key is 16 random bytes rather than zeros. We have no Google account
+    // to root a contact certificate in, so nothing can decrypt it and nothing needs to
+    // -- but an all-zero key is a value a peer can recognise as unset, and a receiver
+    // that recognises it may treat us as a device with no identity at all.
+    let mut metadata = [0u8; super::endpoint::METADATA_LEN];
+    // SAFETY: writing exactly METADATA_LEN bytes into a buffer of that size.
+    unsafe {
+        libc::getrandom(
+            metadata.as_mut_ptr() as *mut libc::c_void,
+            metadata.len(),
+            0,
+        );
+    }
+    let endpoint_info = super::endpoint::EndpointInfo {
+        // Version 1, not 0. Zero is what a field left unset looks like.
+        version: 1,
+        hidden: false,
+        device_type: super::endpoint::DeviceType::Phone,
+        metadata,
+        device_name: Some(device_name.to_string()),
+    }
+    .encode();
+
     let request = frames::ConnectionRequest {
         endpoint_id: endpoint_id.to_string(),
         endpoint_name: device_name.to_string(),
-        endpoint_info: Vec::new(),
+        endpoint_info,
         handshake_data: Vec::new(),
         nonce: 0,
         mediums: mediums.to_vec(),
-        keep_alive_interval_millis: Some(10_000),
-        keep_alive_timeout_millis: Some(30_000),
+        keep_alive_interval_millis: Some(frames::KEEP_ALIVE_INTERVAL_MILLIS),
+        // Ten minutes, not thirty seconds. The peer schedules its own KEEP_ALIVE
+        // cadence against this, and thirty seconds is shorter than a user takes to
+        // accept a transfer.
+        keep_alive_timeout_millis: Some(frames::KEEP_ALIVE_TIMEOUT_MILLIS),
     };
     write_frame(&mut out, &frames::connection_request(&request))?;
 

@@ -25,7 +25,7 @@ pub const SERVICE_TYPE: &str = "_FC9F5ED42C8A._tcp.local";
 //   if !hidden  1 byte name length, then that many bytes of UTF-8
 //   then        TLV records: 1 byte type, 1 byte length, value
 const HEADER_LEN: usize = 1;
-const METADATA_LEN: usize = 16;
+pub const METADATA_LEN: usize = 16;
 const VERSION_SHIFT: u8 = 5;
 const VISIBILITY_SHIFT: u8 = 4;
 const DEVICE_TYPE_SHIFT: u8 = 1;
