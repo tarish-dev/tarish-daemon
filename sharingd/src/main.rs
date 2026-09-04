@@ -874,12 +874,35 @@ impl IBarqService for BarqService {
                 // Windows completed the handshake, took the introduction, and then said
                 // it could not complete the transfer.
                 //
-                // WIFI_LAN is advertised even though the upgrade itself is not
-                // implemented yet. That is a deliberate, temporary asymmetry: it tells us
-                // whether the peer responds by OFFERING an upgrade path, which is the one
-                // piece of information needed to know what to build next. If it does, the
-                // negotiation frames are already written and tested -- only the radio
-                // side is missing.
+                // WIFI_LAN was removed here after Windows offered an upgrade path at
+                // 172.20.9.166:58151 the instant the file finished, which we could not
+                // adopt, and then reported the transfer failed with every byte already
+                // delivered. Right diagnosis, wrong fix -- and it cost every Android
+                // peer.
+                //
+                // ADVERTISING BLUETOOTH ALONE IS A SET OF ONE THAT NO RECEIVER SHARES.
+                // A stock Android receiver intersects our advertised mediums with its
+                // own upgrade mediums before it dispatches the connection, and Bluetooth
+                // Classic is not in that set -- a stock stack does not register it as an
+                // upgrade medium at all. The intersection comes out EMPTY, the request
+                // is never dispatched, and the socket closes with nothing on the wire.
+                // Nobody is ever asked to accept anything. Measured against a real
+                // phone: RFCOMM accepted, DISC 209 ms later, not one frame in between.
+                // Windows is laxer and completed the same handshake, which is why this
+                // read as working.
+                //
+                // WIFI_LAN is the entry that fixes it, and specifically WIFI_LAN rather
+                // than a Wi-Fi Direct or hotspot medium: to a receiver, WIFI_LAN in the
+                // intersection means STAY ON THE SOCKET WE ARE ALREADY ON. It gives the
+                // peer a non-empty set whose best outcome is not to upgrade at all,
+                // which is the only outcome we can honour. That is also why NearDrop has
+                // hardcoded it since day one.
+                //
+                // What made the Windows failure go away was the other half of the same
+                // change: the UPGRADE_PATH_AVAILABLE arm in `outbound.rs` that answers
+                // UPGRADE_FAILURE. Declining an offer closes the negotiation and keeps
+                // the payload where it is. Advertising nothing worth offering stops the
+                // transfer before it starts.
                 &[
                     frames_medium_bluetooth(),
                     barq_protocol::frames::Medium::WifiLan as u64,

@@ -33,6 +33,7 @@ use barq_protocol::channel::SecureChannel;
 use barq_protocol::d2d::{self, Role};
 use barq_protocol::frames::{self, Frame as OfflineFrame, PayloadChunk, PayloadHeader, PayloadType};
 use barq_protocol::fsm::{Effect, Event, Outbound};
+use barq_protocol::payload::{Assembler, Event as PayloadEvent};
 use barq_protocol::sharing::{FileMetadata, FileType, Introduction};
 use barq_protocol::ukey2::handshake::ClientHandshake;
 use log::{debug, info, warn};
@@ -159,9 +160,16 @@ where
     )?;
 
     let their_response = input.next()?;
+    // How this transfer is allowed to END is decided here, at the start. See
+    // `finish_cleanly`.
+    let peer_safe_disconnect;
     match frames::parse(&their_response).map_err(bad)? {
         OfflineFrame::ConnectionResponse(r) if r.response == frames::Response::Accept => {
-            debug!("quickshare: peer is {:?}", r.os_type);
+            peer_safe_disconnect = r.safe_to_disconnect_version >= 1;
+            debug!(
+                "quickshare: peer is {:?}, safe-disconnect v{}",
+                r.os_type, r.safe_to_disconnect_version
+            );
         }
         OfflineFrame::ConnectionResponse(r) => {
             return Err(bad(format!("peer declined the connection: {:?}", r.response)));
@@ -217,11 +225,25 @@ where
     };
     let total: u64 = introduction.total_size().max(0) as u64;
 
+    let mut assembler = Assembler::new();
     let mut fsm = Outbound::new(introduction);
     let mut next_payload_id: i64 = 1;
     let mut pending = fsm.start();
 
     loop {
+        // DRAIN EVERY EFFECT BEFORE READING AGAIN.
+        //
+        // An effect can produce more effects -- notably, finishing the files pushes
+        // TransferComplete, which produces Done. This took ONE batch per read, so those
+        // trailing effects sat in `pending` while we blocked on the peer, and how the
+        // transfer ended depended on what the peer happened to send next: something
+        // innocuous and we would loop round and finish cleanly, its own Disconnection
+        // first and we would report the transfer "not accepted" -- with the file already
+        // delivered. Two runs of the same file, one of each.
+        //
+        // From the peer's side it is worse: it has every byte, sits at 100%, and waits
+        // for a sender that will not close the session until the peer speaks first.
+        // Whoever blinks last decides whether it says done or failed.
         let batch = std::mem::take(&mut pending);
         for effect in batch {
             match effect {
@@ -239,18 +261,7 @@ where
                     pending.extend(fsm.on(Event::TransferComplete));
                 }
                 Effect::Done => {
-                    // ASK, then WAIT. We advertised safe_to_disconnect_version in the
-                    // connection response, so a bare close is a broken promise: the peer
-                    // still has bytes in its read pipeline, and a TCP FIN arriving before
-                    // it drains marks every payload still in there as failed. The
-                    // transfer then succeeds on our side and fails on theirs.
-                    write_frame(
-                        &mut out,
-                        &channel
-                            .encrypt(&frames::disconnection(true, false))
-                            .map_err(chan)?,
-                    )?;
-                    drain_for_safe_disconnect(&mut input, &mut channel);
+                    finish_cleanly(&mut out, &mut channel, peer_safe_disconnect)?;
                     // Done covers both "sent everything" and "they said no". Which one
                     // it was is the state, not the effect.
                     return Ok(fsm.state() == barq_protocol::fsm::State::Done && total > 0);
@@ -270,18 +281,33 @@ where
             continue;
         }
 
+        // Only now, with nothing left to do locally, wait on the peer.
+        if !pending.is_empty() {
+            continue;
+        }
         let wire = input.next()?;
         let plain = channel.decrypt(&wire).map_err(chan)?;
         match frames::parse(&plain).map_err(bad)? {
             OfflineFrame::PayloadTransfer(pt) => {
                 // The only payloads a sender receives are the peer's own sharing frames:
                 // its paired-key exchange and, eventually, its user's answer.
-                if let Some(chunk) = pt.chunk.as_ref() {
-                    if pt.header.payload_type == PayloadType::Bytes {
-                        let frame = barq_protocol::sharing::parse(&chunk.body)
+                //
+                // THROUGH THE ASSEMBLER, exactly as the inbound path does. This parsed
+                // each chunk body directly as a sharing frame, which works only if every
+                // BYTES payload arrives as a single chunk. It does not: a stock peer
+                // sends the body and the LAST_CHUNK terminator as two frames, and the
+                // terminator's body is EMPTY. Parsing that as a sharing frame fails with
+                // "no v1 frame" and killed the whole transfer -- a frame the peer sent
+                // correctly, rejected by us, one step after the encrypted channel came
+                // up. The exact mirror of the send-side bug, on the same payload shape.
+                match assembler.accept(&pt).map_err(|e| bad(e.to_string()))? {
+                    PayloadEvent::Bytes { data, .. } => {
+                        let frame = barq_protocol::sharing::parse(&data)
                             .map_err(|e| bad(format!("sharing frame: {e}")))?;
                         pending.extend(fsm.on(Event::Frame(frame)));
                     }
+                    // A sender is offered no files, and a partial payload is not news.
+                    _ => {}
                 }
             }
             OfflineFrame::KeepAlive { ack: false, seq_num } => {
@@ -301,6 +327,24 @@ where
                         .and_then(|w| write_frame(&mut out, &w));
                 }
                 return Ok(false);
+            }
+            OfflineFrame::BandwidthUpgrade(body) => {
+                // WE CANNOT TAKE ONE, SO SAY SO.
+                //
+                // This was ignored. Silence is not a neutral answer: the peer has opened
+                // a listener and is waiting for us to either adopt the path or fail it,
+                // and a transfer that ends while that negotiation is still open is
+                // reported as failed -- even when every byte of the file already
+                // arrived. That is exactly what a completed send followed by "failed" on
+                // the peer looks like.
+                //
+                // Answering UPGRADE_FAILURE closes the negotiation and leaves the
+                // payload on the medium we are already on, which is what we want until
+                // there is an upgrade implementation to adopt with.
+                debug!("quickshare: declining a bandwidth upgrade we cannot take");
+                let _ = barq_protocol::upgrade::parse(&body); // logged shape only
+                let decline = frames::bandwidth_upgrade(&barq_protocol::upgrade::failure());
+                write_frame(&mut out, &channel.encrypt(&decline).map_err(chan)?)?;
             }
             other => debug!("quickshare: ignoring {other:?}"),
         }
@@ -400,33 +444,46 @@ fn random_i64() -> io::Result<i64> {
     Ok(i64::from_be_bytes(b))
 }
 
-/// Wait for the peer to acknowledge our safe-disconnect request, then let the socket go.
+/// End the session the way THIS peer requires, which is not the same for every peer.
 ///
-/// Best effort by design. Every outcome here is fine -- the ack arrives, the peer sends
-/// its own disconnection, or the socket ends -- and none of them changes whether the
-/// transfer succeeded. What is NOT fine is closing immediately, which is the thing this
-/// exists to avoid.
+/// The peer told us in its ConnectionResponse, and getting this wrong looks identical
+/// either way from here: we sent every byte and the peer says the transfer failed.
 ///
-/// There is no timeout because there is no timer to hang this on: the underlying socket
-/// is the app's, and it closes its end when the transfer finishes. A peer that answers
-/// nothing gives us an EOF, which ends the loop.
-fn drain_for_safe_disconnect<S: Read>(input: &mut Frames<S>, channel: &mut SecureChannel) {
-    // A handful of frames, not an unbounded read: a peer that keeps talking after being
-    // told we are leaving should not keep us here.
-    for _ in 0..8 {
-        let Ok(wire) = input.next() else { return };
-        let Ok(plain) = channel.decrypt(&wire) else {
-            return;
-        };
-        match frames::parse(&plain) {
-            Ok(OfflineFrame::Disconnection { ack_safe: true, .. }) => {
-                debug!("quickshare: peer acknowledged the disconnect");
-                return;
-            }
-            // Their own goodbye is just as good an answer: they are done reading.
-            Ok(OfflineFrame::Disconnection { .. }) => return,
-            Ok(_) => continue,
-            Err(_) => return,
-        }
+/// **A peer that supports safe-disconnect (version >= 1)** -- stock Android, Samsung,
+/// and us -- wants to be told. Closing without asking is a bare FIN, and anything still
+/// in its read pipeline is marked failed.
+///
+/// **A peer with version 0** -- the default, and what Windows Quick Share reports --
+/// wants the opposite. It treats a Disconnection that arrives before it has finished
+/// writing the file as a FAILED transfer, however many bytes it already has. So we say
+/// nothing and let it finish and close first.
+///
+/// We had both of these wrong in turn. Sending nothing and waiting for the peer to speak
+/// made the ending a race, which is why the same file succeeded and failed on alternate
+/// attempts. Then sending the Disconnection unconditionally made it deterministic --
+/// deterministically wrong against Windows, which is version 0. The field was there in
+/// its response the whole time.
+///
+/// Credit: Bada's `OutboundConnectionDriver.peerSafeToDisconnectVersion`, which names
+/// Windows Quick Share and the "Can't complete transfer" it produces.
+fn finish_cleanly<W: Write>(
+    out: &mut W,
+    channel: &mut SecureChannel,
+    peer_safe_disconnect: bool,
+) -> io::Result<()> {
+    if peer_safe_disconnect {
+        write_frame(
+            out,
+            &channel
+                .encrypt(&frames::disconnection(true, false))
+                .map_err(chan)?,
+        )?;
+    } else {
+        debug!("quickshare: peer cannot be disconnected; letting it finish first");
     }
+    // Either way, do not pull the socket out from under a peer that is still reading.
+    // A sleep rather than a read: a read that waits for a peer which has simply stopped
+    // talking never returns, and that hang cost a transfer that had already succeeded.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    Ok(())
 }

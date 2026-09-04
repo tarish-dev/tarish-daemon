@@ -209,6 +209,19 @@ where
         // Taken out first rather than drained in place: handling an effect can produce
         // MORE effects -- asking the user yields their answer, which yields the response
         // frame -- and those go on the same queue we are walking.
+        // DRAIN EVERY EFFECT BEFORE READING AGAIN.
+        //
+        // An effect can produce more effects -- notably, finishing the files pushes
+        // TransferComplete, which produces Done. This took ONE batch per read, so those
+        // trailing effects sat in `pending` while we blocked on the peer, and how the
+        // transfer ended depended on what the peer happened to send next: something
+        // innocuous and we would loop round and finish cleanly, its own Disconnection
+        // first and we would report the transfer "not accepted" -- with the file already
+        // delivered. Two runs of the same file, one of each.
+        //
+        // From the peer's side it is worse: it has every byte, sits at 100%, and waits
+        // for a sender that will not close the session until the peer speaks first.
+        // Whoever blinks last decides whether it says done or failed.
         let batch = std::mem::take(&mut pending);
         for effect in batch {
             match effect {
@@ -289,6 +302,10 @@ where
             continue;
         }
 
+        // Only now, with nothing left to do locally, wait on the peer.
+        if !pending.is_empty() {
+            continue;
+        }
         let wire = input.next()?;
         let plain = channel.decrypt(&wire).map_err(chan)?;
         match frames::parse(&plain).map_err(bad)? {

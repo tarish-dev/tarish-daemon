@@ -255,6 +255,14 @@ pub struct ConnectionResponse {
     pub response: Response,
     pub os_type: OsType,
     pub handshake_data: Vec<u8>,
+    /// What the peer claims about the safe-disconnect handshake, and **the field that
+    /// decides how a transfer is allowed to end.**
+    ///
+    /// `0` -- the default, and what Windows Quick Share reports -- means the peer has
+    /// safe-disconnect DISABLED. Such a peer treats a Disconnection arriving before it
+    /// has finished writing the file as a FAILED transfer, however many bytes it
+    /// received. `>= 1` means it can be told we are leaving.
+    pub safe_to_disconnect_version: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -630,6 +638,10 @@ fn parse_connection_response(b: &[u8]) -> Result<ConnectionResponse, Error> {
         handshake_data: protobuf::first_bytes(b, RSP_HANDSHAKE_DATA)?
             .unwrap_or(&[])
             .to_vec(),
+        // Absent means 0 means "do not disconnect me". The default is the strict case
+        // on purpose: a peer that says nothing is treated as one that cannot cope.
+        safe_to_disconnect_version: protobuf::first_varint(b, RSP_SAFE_TO_DISCONNECT)?
+            .unwrap_or(0),
     })
 }
 
