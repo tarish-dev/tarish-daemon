@@ -431,12 +431,32 @@ struct BarqService {
     /// Last Wi-Fi frequency the client reported, so we only write on a change.
     sta_freq: Arc<std::sync::atomic::AtomicI32>,
     peers: PeerTable,
+    /// Quick Share peers the app has seen over BLE, keyed by endpoint id.
+    ///
+    /// Separate from `peers`, which is the AirDrop mDNS table. Two protocols, two
+    /// discovery mechanisms, two tables -- merged only at getPeers, where each row
+    /// carries the protocol that found it.
+    ble_peers: Arc<Mutex<std::collections::HashMap<String, BlePeer>>>,
     /// What this device is permitted to do. Starts DENIED -- see setPolicy in the AIDL.
     policy: Arc<Mutex<BarqPolicy>>,
     /// Mirrors policy.requireConfirmation for the accept loop, which runs on the httpd
     /// threads and must not take the policy lock on every offer.
     auto_accept: Arc<AtomicBool>,
 }
+
+/// A Quick Share peer seen over BLE.
+struct BlePeer {
+    name: Option<String>,
+    seen: std::time::Instant,
+}
+
+/// How long a BLE peer stays listed after its last advertisement.
+///
+/// Peers advertise several times a second, so this is generous. It exists because BLE
+/// gives no "gone" event: a device that walks away simply stops, and without an expiry
+/// it would sit in the list forever and the first send to it would fail with no
+/// explanation.
+const BLE_PEER_TTL: Duration = Duration::from_secs(20);
 
 /// Deny everything. A daemon that has never heard from the app shares nothing.
 fn denied_policy() -> BarqPolicy {
@@ -455,6 +475,7 @@ fn denied_policy() -> BarqPolicy {
 // Mirrors the constants in IBarqService.aidl. Kept as plain consts because the Rust
 // backend does not expose interface constants in a form that can be matched on.
 const PROTOCOL_AIRDROP: i32 = 0;
+const PROTOCOL_QUICKSHARE: i32 = 1;
 
 const MODE_OFF: i32 = 0;
 const MODE_RECEIVE: i32 = 1;
@@ -482,6 +503,7 @@ impl BarqService {
             active: Arc::new(AtomicBool::new(false)),
             sta_freq: Arc::new(std::sync::atomic::AtomicI32::new(-1)),
             peers,
+            ble_peers: Arc::new(Mutex::new(std::collections::HashMap::new())),
             policy: Arc::new(Mutex::new(denied_policy())),
             auto_accept: Arc::new(AtomicBool::new(false)),
         }
@@ -675,6 +697,41 @@ impl IBarqService for BarqService {
         Ok(device_name())
     }
 
+    fn reportBlePeer(&self, address: &str, rssi: i32, service_data: &[u8]) -> BinderResult<()> {
+        let Some(a) = barq_protocol::ble::parse_advertisement(service_data) else {
+            return Ok(()); // not an advertisement we understand; nothing to report
+        };
+        // Only Quick Share. The same service carries other Nearby services, and listing
+        // one of those as a peer produces a device that can never be sent to.
+        if !a.is_quick_share {
+            return Ok(());
+        }
+
+        let mut peers = self
+            .ble_peers
+            .lock()
+            .map_err(|_| Status::from(StatusCode::UNKNOWN_ERROR))?;
+        let now = std::time::Instant::now();
+        peers.retain(|_, p| now.duration_since(p.seen) < BLE_PEER_TTL);
+
+        let fresh = !peers.contains_key(&a.endpoint_id);
+        if fresh {
+            log::info!(
+                "quickshare: BLE peer {} {:?} rssi={rssi} ({address})",
+                a.endpoint_id,
+                a.device_name.as_deref().unwrap_or("<no name in the clear>")
+            );
+        }
+        peers.insert(
+            a.endpoint_id,
+            BlePeer {
+                name: a.device_name,
+                seen: now,
+            },
+        );
+        Ok(())
+    }
+
     fn refreshPeers(&self) -> BinderResult<()> {
         // Clear the published snapshot here, and let the discovery loop clear what it
         // owns -- its own table, the resolved-name cache and the probe record. Doing
@@ -750,6 +807,35 @@ impl IBarqService for BarqService {
                 .then_with(|| a.instance.cmp(&b.instance))
         });
 
+        // Quick Share peers, from BLE, appended to the AirDrop ones.
+        //
+        // Two protocols in one list is the whole reason BarqPeer carries `protocol`: a
+        // person picking a device is picking a protocol, and an Apple peer found over
+        // AWDL cannot be reached the way an Android one over BLE can.
+        let mut quickshare: Vec<BarqPeer> = Vec::new();
+        if let Ok(mut ble) = self.ble_peers.lock() {
+            let now = std::time::Instant::now();
+            // Expire here as well as on report: a peer that walks away stops advertising,
+            // and nothing else would ever notice it had gone.
+            ble.retain(|_, p| now.duration_since(p.seen) < BLE_PEER_TTL);
+            for (id, p) in ble.iter() {
+                quickshare.push(BarqPeer {
+                    id: id.clone(),
+                    // A contacts-only peer publishes no name in the clear, and we have no
+                    // certificate to decrypt one. The endpoint id is what we honestly
+                    // have -- the same choice the AirDrop path makes before /Discover
+                    // answers.
+                    name: p.name.clone().unwrap_or_else(|| id.clone()),
+                    model: String::new(),
+                    rssi: 0,
+                    protocol: PROTOCOL_QUICKSHARE,
+                });
+            }
+        }
+        // Sorted for the same reason the AirDrop list is: an unstable order makes the
+        // app rebuild its tiles and a device move under a finger mid-tap.
+        quickshare.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+
         Ok(out
             .into_iter()
             .map(|p| BarqPeer {
@@ -769,6 +855,7 @@ impl IBarqService for BarqService {
                 // table yet; when it is, this is the field that keeps the two apart.
                 protocol: PROTOCOL_AIRDROP,
             })
+            .chain(quickshare)
             .collect())
     }
 

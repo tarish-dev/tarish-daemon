@@ -171,4 +171,21 @@ interface IBarqService {
 
     /** The name currently advertised, resolved through the same fallbacks the daemon uses. */
     String getDeviceName();
+
+    /**
+     * Report a Quick Share BLE advertisement the app saw.
+     *
+     * THE APP OWNS THE RADIO; THE DAEMON OWNS THE PROTOCOL. A native daemon cannot reach
+     * framework Bluetooth, so the app scans -- but it forwards the raw service data
+     * rather than decoding it, because the decoder lives in libbarq_protocol with test
+     * vectors captured from real devices. Parsing it a second time in Java would be a
+     * second thing to get wrong, and the two would drift.
+     *
+     * Peers reported this way appear in getPeers() with PROTOCOL_QUICKSHARE, and expire
+     * on their own if the app stops seeing them.
+     *
+     * `address` is the peer's BLE address, which is usually randomised and rotates; it is
+     * used only to dedupe within a session, never as an identity.
+     */
+    void reportBlePeer(String address, int rssi, in byte[] serviceData);
 }
