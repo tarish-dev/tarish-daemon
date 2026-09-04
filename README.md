@@ -1,25 +1,80 @@
 # Barq
 
-**`barqd`** — an AWDL transport daemon for Android.
+**AirDrop and Quick Share on Android, with no Google Play Services — sandboxed or
+otherwise — and no Google account.**
 
-Barq brings up and holds an [AWDL](https://en.wikipedia.org/wiki/Apple_Wireless_Direct_Link)
-link — the Wi-Fi peer-to-peer layer Apple devices use for AirDrop — as a native
-system daemon, and hands the rest of the system a working IPv6 interface with
-discovered peers on it.
+Send a file to a MacBook from a GrapheneOS phone that has never spoken to Google. The Mac
+shows a real device name and a normal AirDrop prompt; the phone shows a normal share
+sheet. Nothing signs in, nothing checks in, and no Google application is installed.
 
-It exists so that a sharing *app* does not have to. On Android, third-party code
-that wants to keep running must hold a foreground service and therefore a
-permanent visible notification. A native daemon started by `init` has no such
-obligation: no foreground-service rule, no Doze, no app-standby, no notification.
-Barq takes the transport so the UI can be an ordinary app that is not running most
-of the time.
+That is working today, both directions, under SELinux enforcing. Quick Share — the
+Android and Windows side — is in progress: its protocol is complete and tested, and
+discovery finds real devices over BLE with no network at all.
 
-This is the same split Apple and Google both ship. Google's is `mosey_server`
-(native, `system`, `NET_ADMIN|NET_RAW`, invisible) plus a client app; Apple's is
-`sharingd`. Barq is the equivalent piece for a build that has neither.
+## Why, when sandboxed Play Services exists
 
-The two-process split described in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) is done, and both halves are Rust.
+GrapheneOS's sandboxed Play Services is excellent, and it is not an answer to this.
+
+**It cannot do AirDrop at all.** AirDrop needs Google's `mosey` stack running with
+platform privileges. Getting it working the other way — the route this project took
+first — required *privileged* Google Play Services, not the sandboxed kind, plus a
+successful check-in to Google's servers to receive the feature flag that enables it. That
+is a long way from "install an app".
+
+**And for many people the objection is not the sandbox, it is the code.** A sandboxed
+Play Services is still Google's code running on your device. Plenty of people who choose
+GrapheneOS do not want it there in any form, at any privilege level. That is a legitimate
+position and it should not cost you file sharing with the people around you.
+
+Barq needs no Play Services, no Google account, no check-in, and no network path to
+Google. It works on a build with zero Google applications installed.
+
+## What is ours, and what comes from the vendor image
+
+Being precise about this matters more than the line count, so here is the whole stack.
+
+**AirDrop** leans on two Google binaries for the radio, and nothing above it:
+
+| Layer | Whose |
+|---|---|
+| Radio and MAC — `wonder.ko` | **vendor** (Google/Broadcom kernel module) |
+| AWDL protocol — election, sync, peers, action frames — `libmosey_daemon_ffi.so` | **vendor** (Google userspace blob) |
+| Lifecycle, privilege split, the AWDL interface, routing | **ours** |
+| mDNS `_airdrop._tcp` — advertise, browse, resolve | **ours** |
+| TLS listener and the HTTPS server | **ours** |
+| The AirDrop protocol — `/Discover`, `/Ask`, `/Upload`, Apple plists | **ours** |
+| cpio extraction, the inbox, the consent prompt | **ours** |
+| BLE beacon, share sheet, UI | **ours** |
+
+Both blobs already ship in the vendor image of supported Pixels. Barq does not install
+them, and a phone running Barq has nothing on it that a stock phone does not — they are
+radio drivers, not Play Services. Replacing them with an open AWDL implementation is
+possible, and is why the FFI is isolated behind a single file, but it is not what Barq
+does today.
+
+**Quick Share uses no vendor blobs at all.** Every layer is ours:
+
+| Layer | |
+|---|---|
+| BLE discovery — wake-up pulse and endpoint advertisement | ours |
+| UKEY2 handshake — commitment, P-256 ECDH, key confirmation | ours |
+| D2D key derivation, SecureMessage envelope | ours |
+| Secure channel — traffic keys, sequence numbers, replay refusal | ours |
+| Length-prefixed framing, Nearby Connections offline frames | ours |
+| Payload reassembly, with its bounds checks | ours |
+| Nearby Sharing frames — introduction, response, paired key | ours |
+| Ordering state machines, bandwidth upgrade | ours |
+| Bluetooth transport, socket handling | ours |
+
+That half is **6,600 lines of Rust with 163 tests**, including one that runs a whole
+share between two peers inside a single process: handshake, key derivation, encrypted
+channel, introduction, acceptance, and a file in chunks, reassembled and compared byte
+for byte.
+
+Some of it could not be captured off the air and had to be derived — the RFCOMM service
+UUID a peer listens on never appears in a packet, and the BLE advertisement's field
+layout is documented nowhere public. Where a value came from someone else's work, the
+comment beside it says whose.
 
 ## Status
 
@@ -120,7 +175,8 @@ IBarqCallback.aidl   onPeerFound/Lost, onTransferOffered/Progress/Finished
 
 It lives here rather than in the client because the daemon is the server: it
 defines the protocol and a client is written against it. [Barq
-app](../barq-app) consumes these files directly instead of keeping its own copy,
+app](https://github.com/bodaay/barq-app) consumes these files directly instead of
+keeping its own copy,
 so the two cannot drift apart silently.
 
 Two rules the contract encodes deliberately:
@@ -132,25 +188,6 @@ Two rules the contract encodes deliberately:
 - **Every callback is `oneway`.** The daemon must never block on a UI process
   that may be slow, frozen, or about to be killed. A client that is not running
   is the normal case, not an error.
-
-## What is actually Barq, and what is not
-
-`barqd` is ~1,500 lines and `barqsharingd` around 5,900, over a 6,600-line protocol crate. It would be misleading to call it an AWDL implementation.
-
-| Layer | Provided by | Whose |
-|---|---|---|
-| Radio / MAC | `wonder.ko` | vendor kernel module (Google/Broadcom) |
-| AWDL protocol — election, sync, peers, action frames | `libmosey_daemon_ffi.so` | vendor userspace blob (Google) |
-| **Lifecycle, privileges, routing, integration** | **`barqd`** | **this repo** |
-
-Both blobs already ship in the vendor image for supported devices, so Barq adds
-nothing to a phone that is not already on it — but the AWDL protocol itself is
-Google's, loaded through a five-function C ABI. Barq is a *host* for it with its
-own lifecycle and privilege model.
-
-Replacing that layer with an open implementation (e.g. OWL) is possible and is
-the reason the FFI is isolated behind one file, but it is not what Barq does
-today.
 
 ## How it works
 
