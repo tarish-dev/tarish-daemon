@@ -863,9 +863,27 @@ impl IBarqService for BarqService {
                 sock,
                 &device,
                 &endpoint,
-                // The medium the caller actually connected over. Claiming anything else
-                // invites the peer to negotiate an upgrade onto a path that is not there.
-                &[frames_medium_bluetooth()],
+                // The mediums we are WILLING TO UPGRADE TO, which is not the same as
+                // the one we connected over.
+                //
+                // This listed BLUETOOTH alone, reasoning that claiming a medium we
+                // cannot carry would fail later. That reading was wrong: the field
+                // advertises upgrade candidates, so listing only Bluetooth tells a stock
+                // peer there is no way to get the file off Bluetooth at all -- and
+                // nothing sends a file over Bluetooth alone, because it would crawl.
+                // Windows completed the handshake, took the introduction, and then said
+                // it could not complete the transfer.
+                //
+                // WIFI_LAN is advertised even though the upgrade itself is not
+                // implemented yet. That is a deliberate, temporary asymmetry: it tells us
+                // whether the peer responds by OFFERING an upgrade path, which is the one
+                // piece of information needed to know what to build next. If it does, the
+                // negotiation frames are already written and tested -- only the radio
+                // side is missing.
+                &[
+                    frames_medium_bluetooth(),
+                    barq_protocol::frames::Medium::WifiLan as u64,
+                ],
                 out_files,
                 &progress,
             ) {

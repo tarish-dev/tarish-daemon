@@ -251,6 +251,60 @@ pub fn verify_and_decrypt(
 mod tests {
     use super::*;
 
+    /// Known-answer vectors from Bada's `SecureMessageVectors.kt` (Apache 2.0).
+    ///
+    /// EVERY OTHER TEST HERE ROUND-TRIPS AGAINST OURSELVES, which proves this module
+    /// agrees with itself and nothing about whether a real peer can read what it
+    /// produces. These are fixed inputs with fixed expected outputs from a different
+    /// implementation, so they catch the class of bug a round-trip cannot: a consistent
+    /// envelope that is consistently wrong.
+    mod known_answer {
+        use openssl::symm::{encrypt, Cipher};
+
+        fn unhex(s: &str) -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect()
+        }
+
+        fn key() -> Vec<u8> {
+            unhex("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        }
+
+        fn iv() -> Vec<u8> {
+            unhex("000102030405060708090a0b0c0d0e0f")
+        }
+
+        #[test]
+        fn aes_256_cbc_matches_a_foreign_implementation() {
+            let want = unhex(
+                "81762578643ceed2b3bfdb58aac6d3766a68d01b47bc3d7cd0f8f1219e169274\
+                 c82dd71a6168affa9594bb5b62fe4a25"
+                    .replace(char::is_whitespace, "")
+                    .as_str(),
+            );
+            let got = encrypt(
+                Cipher::aes_256_cbc(),
+                &key(),
+                Some(&iv()),
+                b"Quick Share KAT plaintext for issue #13.",
+            )
+            .unwrap();
+            assert_eq!(got, want, "AES-256-CBC with PKCS7 disagrees with Bada");
+        }
+
+        /// A single byte, so the padding is the whole block. If PKCS7 were applied
+        /// differently this is where it shows.
+        #[test]
+        fn a_one_byte_plaintext_pads_the_same_way() {
+            let want = unhex("2840f7d54ef2a3b15de5ae171b5d6fed");
+            let got = encrypt(Cipher::aes_256_cbc(), &key(), Some(&iv()), &[0x41]).unwrap();
+            assert_eq!(got, want, "PKCS7 padding disagrees with Bada");
+        }
+    }
+
+
     const ENC: &[u8; 32] = b"0123456789abcdef0123456789abcdef";
     const MAC: &[u8; 32] = b"fedcba9876543210fedcba9876543210";
     const IV: &[u8; 16] = b"0123456789abcdef";
