@@ -447,6 +447,8 @@ struct BarqService {
 /// A Quick Share peer seen over BLE.
 struct BlePeer {
     name: Option<String>,
+    /// How to reach it with no network. None when the peer advertised no address.
+    mac: Option<String>,
     seen: std::time::Instant,
 }
 
@@ -701,9 +703,11 @@ impl IBarqService for BarqService {
         let Some(a) = barq_protocol::ble::parse_advertisement(service_data) else {
             return Ok(()); // not an advertisement we understand; nothing to report
         };
-        // Only Quick Share. The same service carries other Nearby services, and listing
-        // one of those as a peer produces a device that can never be sent to.
-        if !a.is_quick_share {
+        // A peer with no address is discoverable and not reachable, which is worse than
+        // absent: it puts a device in the list that cannot be sent to. Unverified
+        // advertisements -- the fast form, which carries no service-id hash -- are kept
+        // only when they do carry an address, so the list stays actionable.
+        if a.bluetooth_mac.is_none() && !a.verified {
             return Ok(());
         }
 
@@ -717,15 +721,17 @@ impl IBarqService for BarqService {
         let fresh = !peers.contains_key(&a.endpoint_id);
         if fresh {
             log::info!(
-                "quickshare: BLE peer {} {:?} rssi={rssi} ({address})",
+                "quickshare: BLE peer {} {:?} rssi={rssi} ble={address} bt={}",
                 a.endpoint_id,
-                a.device_name.as_deref().unwrap_or("<no name in the clear>")
+                a.device_name.as_deref().unwrap_or("<no name in the clear>"),
+                a.bluetooth_mac.as_deref().unwrap_or("<not reachable>")
             );
         }
         peers.insert(
             a.endpoint_id,
             BlePeer {
                 name: a.device_name,
+                mac: a.bluetooth_mac,
                 seen: now,
             },
         );
@@ -829,6 +835,7 @@ impl IBarqService for BarqService {
                     model: String::new(),
                     rssi: 0,
                     protocol: PROTOCOL_QUICKSHARE,
+                    bluetoothMac: p.mac.clone().unwrap_or_default(),
                 });
             }
         }
@@ -850,6 +857,9 @@ impl IBarqService for BarqService {
                     .unwrap_or_else(|| p.short_id().to_string()),
                 model: String::new(),
                 rssi: 0,
+                // AirDrop peers are reached over AWDL by link-local address, never
+                // over Bluetooth.
+                bluetoothMac: String::new(),
                 // Everything getPeers returns today came from the AirDrop browser.
                 // Quick Share discovery runs on wlan0 and is not folded into this
                 // table yet; when it is, this is the field that keeps the two apart.

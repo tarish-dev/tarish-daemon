@@ -310,6 +310,14 @@ pub struct Advertisement {
     /// name in the clear is one we cannot identify, and reporting the endpoint id is
     /// honest.
     pub device_name: Option<String>,
+    /// Whether the advertisement carried the NearbySharing service-id hash.
+    ///
+    /// Only the REGULAR form has one. A fast advertisement omits it entirely, so a peer
+    /// found that way is structurally valid but not *provably* Quick Share -- the same
+    /// service carries other Nearby services in the same shape. Reported rather than
+    /// decided here: the caller knows whether it would rather miss a peer or list one it
+    /// cannot talk to.
+    pub verified: bool,
     /// **How to reach this peer with no network.** Present in the regular form; `None` in
     /// the fast form, and `None` when the advertiser zeroed it, which means it has no
     /// BR/EDR listener to connect to.
@@ -399,6 +407,7 @@ fn body_at(data: &[u8], at: usize, regular: bool) -> Option<Advertisement> {
         endpoint_id: String::from_utf8_lossy(id).into_owned(),
         device_name: name_from_info(&info),
         endpoint_info: info,
+        verified: regular,
         bluetooth_mac,
     })
 }
@@ -439,6 +448,8 @@ fc86671defa6084b2d50726f4172749cc7d3e40de9000056ce";
             assert_eq!(a.endpoint_info.len(), 17);
             // No name in the clear: these are the contacts-only form.
             assert_eq!(a.device_name, None);
+            // And no service-id hash, because the fast form has none.
+            assert!(!a.verified);
         }
     }
 
@@ -449,6 +460,7 @@ fc86671defa6084b2d50726f4172749cc7d3e40de9000056ce";
         let a = parse_advertisement(&unhex(WINDOWS)).expect("should parse");
         assert_eq!(a.endpoint_id, "BQFU");
         // 1 flags + 2 salt + 14 key + 1 length + 8 name.
+        assert!(a.verified, "carried the NearbySharing service-id hash");
         assert_eq!(a.endpoint_info.len(), 26);
         assert_eq!(a.device_name.as_deref(), Some("K-ProArt"));
         // THE POINT OF THE WHOLE EXERCISE: how to reach this peer with no network.

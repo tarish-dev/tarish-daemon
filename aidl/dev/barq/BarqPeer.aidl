@@ -19,4 +19,16 @@ parcelable BarqPeer {
      * whether or not the UI admits it, so the UI says it.
      */
     int protocol;
+    /**
+     * How to open a connection to this peer when there is no network, or empty.
+     *
+     * Quick Share peers found over BLE carry a Bluetooth Classic MAC in their
+     * advertisement; that address is the whole point of BLE discovery, since the
+     * advertisement itself carries nothing to connect to. Empty means the peer published
+     * no address -- it advertised the short form, or it has no BR/EDR listener -- and it
+     * is therefore discoverable but not reachable this way.
+     *
+     * Always empty for AirDrop peers, which are reached over AWDL by link-local address.
+     */
+    String bluetoothMac;
 }
