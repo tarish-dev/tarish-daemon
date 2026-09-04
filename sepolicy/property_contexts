@@ -13,7 +13,7 @@ barq.awdl.          u:object_r:barq_awdl_prop:s0
 #
 # The prefix argument above is right for `barq.awdl.`, where one process owns every key
 # in the namespace. It is wrong here: `persist.barq.` is SHARED. barqd reads
-# persist.barq.mosey_config, .channels, .sta_freq and .country as operator overrides,
+# persist.barq.mosey_config, .channels, .sta_freq and .country as manual overrides,
 # and labelling the prefix pulled all four onto a type barqd has no grant for -- so
 # every one of them silently stopped working, including the regulatory country
 # override, while the log filled with barqd read denials.

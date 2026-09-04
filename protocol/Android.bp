@@ -28,10 +28,11 @@
 // and links without argument, so this matches them.
 //
 // The staleness that shape invites is real and has already cost this project days
-// (integrator BUILD-NOTES 45: a device kept answering against an AIDL library eight days
-// old). It is handled where it belongs, in the deploy step: scripts/gos-push.sh carries
-// every Barq library, verifies each against the build by hash, and refuses a partial
-// deploy. That is a better answer than picking a link mode to dodge the problem.
+-- a device once kept answering against an AIDL library eight days old, reporting
+// UNKNOWN_TRANSACTION for every method added since while every older one worked. It is
+// handled where it belongs, in the deploy step: whatever ships this daemon must carry
+// every Barq library and verify each against the build. That is a better answer than
+// picking a link mode to dodge the problem.
 
 rust_library {
     name: "libbarq_protocol",
@@ -47,21 +48,20 @@ rust_library {
 
 // Runs the #[cfg(test)] modules. Host-side, so it needs no phone.
 //
-// From the grapheneos repo, which sets up the build environment correctly -- doing
-// it by hand gets you a soong bootstrap failure that has nothing to do with your
-// change:
+// Build it from an initialised build tree -- doing it by hand outside one gets a soong
+// bootstrap failure that has nothing to do with your change:
 //
-//     scripts/gos-build.sh -d <device> -t permissive --skip-vendor -m barq_protocol_test
+//     source build/envsetup.sh && lunch <device>-cur-userdebug
+//     m barq_protocol_test
 //
 // Then run it. LD_LIBRARY_PATH is REQUIRED: the binary links host BoringSSL and
 // without it fails with
 //     error while loading shared libraries: libcrypto-host.so
 // which reads like a broken build rather than a missing search path.
 //
-//     O=/srv/build/grapheneos-userdebug
+//     O=$(readlink -f $OUT_DIR)
 //     export LD_LIBRARY_PATH=$O/host/linux-x86/lib64:$O/host/linux-x86/lib
-//     $O/soong/.intermediates/vendor/barq/protocol/barq_protocol_test/\
-//         linux_glibc_x86_64/barq_protocol_test --test-threads=1
+//     $O/host/linux-x86/nativetest64/barq_protocol_test/barq_protocol_test
 //
 rust_test_host {
     name: "barq_protocol_test",

@@ -13,7 +13,7 @@
 //! Quick Share over Wi-Fi LAN is plain TCP on the network the device is already
 //! joined to -- `wlan0`, not `mosey0`. It needs no AWDL at all, which is the whole
 //! reason it is worth having: on a BCM4383 device AWDL cannot coexist with Wi-Fi
-//! (see the integrator's BUILD-NOTES 40), so AirDrop is not usable there and this is.
+//! -- measured, and the same on stock -- so AirDrop is not usable there and this is.
 //!
 //! Bandwidth-upgrade paths -- BLE medium negotiation, Wi-Fi Direct -- are
 //! deliberately out of scope. They are where the radio problems live.

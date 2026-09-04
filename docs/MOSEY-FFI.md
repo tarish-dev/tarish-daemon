@@ -99,5 +99,5 @@ fail loudly rather than degrade.
 Recovered by breakpointing Google's `mosey_server` during real AirDrop transfers
 and reading the argument registers, then confirmed by calling the library
 directly. The full investigation — including the traps and several wrong turns —
-is in the GrapheneOS buildfarm repo under `docs/MOSEY-ABI.md`, with raw captures
+is kept with the OS integration, alongside the raw captures
 in `awdl/captures/`.

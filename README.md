@@ -89,8 +89,20 @@ are advertising*. Released, `barqd` costs 0.05%.
 the session comes and goes. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for
 why it is a property and not `ctl.start` or binder.
 
-**What Barq does not do yet:** mDNS (`_airdrop._tcp.local`), the AirDrop protocol
-itself, and the IPC implementation. It is the transport and nothing above it.
+### Quick Share
+
+The second protocol, for Android and Windows peers, is in progress. The **protocol is
+complete and tested** — `libbarq_protocol` is 6,600 lines of Rust with 157 tests,
+including one that runs a whole share between two peers in a single process: UKEY2
+handshake, key derivation, encrypted channel, introduction, acceptance, and a file in
+chunks, reassembled and compared byte for byte.
+
+Discovery over BLE works against real devices: a Windows machine running Quick Share is
+found by name with no network involved at all.
+
+What is not finished is the transport plumbing — an mDNS responder for the same-network
+case, and the Wi-Fi Direct half of the no-network case. See
+[docs/TODO.md](docs/TODO.md).
 
 ## Clients
 
@@ -100,7 +112,9 @@ The daemon owns the client contract, in `aidl/dev/barq/`:
 IBarqService.aidl    getStatus, setDiscoverable, setActive, getPeers, sendFiles,
                      respondToOffer, cancelTransfer, getReceivedFiles,
                      openReceivedFile, deleteReceivedFile,
-                     register/unregisterCallback
+                     register/unregisterCallback, refreshPeers,
+                     setPolicy, getPolicy, setDeviceName, getDeviceName,
+                     reportBlePeer
 IBarqCallback.aidl   onPeerFound/Lost, onTransferOffered/Progress/Finished
 ```
 
@@ -121,7 +135,7 @@ Two rules the contract encodes deliberately:
 
 ## What is actually Barq, and what is not
 
-`barqd` is ~300 lines and `barqsharingd` around 3,000. It would be misleading to call it an AWDL implementation.
+`barqd` is ~1,500 lines and `barqsharingd` around 5,900, over a 6,600-line protocol crate. It would be misleading to call it an AWDL implementation.
 
 | Layer | Provided by | Whose |
 |---|---|---|
@@ -247,3 +261,35 @@ the policy costs a build cycle each time.
 ## Name
 
 بَرْق — *barq*, Arabic for lightning; historically the word for telegraph.
+
+## Running it on GrapheneOS
+
+Barq is built to be integrated into an OS image, not sideloaded: it is two `init`
+services with their own SELinux domains and a dedicated AID, none of which an APK can
+give itself. [docs/GRAPHENEOS.md](docs/GRAPHENEOS.md) is the full procedure — what to
+copy, what to wire into the build, the one framework patch that is required and why, and
+how to verify each step landed.
+
+It is written for GrapheneOS because that is where it was developed, but nothing in it is
+GrapheneOS-specific. The same steps apply to AOSP or to any build you control.
+
+## Credits
+
+**[Bada](https://github.com/kyujin-cho/Bada)** is a working Quick Share implementation
+for Android, in Kotlin, under Apache 2.0. `libbarq_protocol` is a Rust port of the
+protocol layers of its `core-protocol` module. The code here is rewritten — different
+language, different process model — but the protocol knowledge is Bada's, and several
+constants in this implementation exist because Bada found them first and wrote down why
+they matter. Where a value came from Bada, the comment beside it says so.
+
+**[OpenDrop](https://github.com/seemoo-lab/opendrop)** and the AWDL research from the
+Secure Mobile Networking Lab at TU Darmstadt are what made the AirDrop side tractable.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+Apache 2.0 rather than MIT deliberately: this is a clean-room implementation of two
+proprietary protocols, and Apache's patent grant matters more here than the shorter
+licence text does. It is also Bada's licence and AOSP's, so nothing downstream has to
+reason about compatibility.

@@ -307,7 +307,7 @@ fn read_property(name: &str) -> Option<String> {
 /// The SIM is authoritative when Wi-Fi has not persisted anything, and it is where
 /// the platform's own WifiCountryCode looks too.
 ///
-///   1. `persist.barq.country`            explicit operator override
+///   1. `persist.barq.country`            explicit manual override
 ///   2. `persist.vendor.wifi.country`     what the Wi-Fi stack persisted, if anything
 ///   3. `gsm.operator.iso-country`        the network the SIM is registered on
 ///   4. `gsm.sim.operator.iso-country`    the SIM's home country

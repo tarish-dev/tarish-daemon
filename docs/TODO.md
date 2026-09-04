@@ -142,7 +142,7 @@ which is exactly the shape of this. Either it is not reaching the Mac or macOS i
 rejecting it.
 
 Settling it needs the air, not more inference: capture our advertisement and compare
-it byte-for-byte against a real Apple sender's. The operator has done this before for
+it byte-for-byte against a real Apple sender's. The author has done this before for
 GoOpenDrop and has the reference; the sniffing hardware was not to hand when this was
 found.
 
@@ -173,7 +173,7 @@ The coexistence work landed and is verified on BCM**4390** (mustang): AWDL goes 
 opposite band from the Wi-Fi association and both run indefinitely. On BCM**4383**
 (frankel) the same code picks the right band and Wi-Fi dies anyway, does not recover
 when AWDL stops, survives a Wi-Fi toggle, and needs a reboot. Full measurements in the
-integrator's BUILD-NOTES 40.
+BUILD-NOTES 40 of the OS integration.
 
 The difference is `wondertap`. 4390 exposes it, so `wonder.ko` binds and the Netlink
 path drives a real `wonder` wiphy. 4383 does not, so barqd falls back to driving
@@ -237,7 +237,7 @@ Google closed the issue tracker report without a fix. That is our symptom, with 
 implementation, on the same hardware — so this is a property of the platform rather
 than of our stack, and "match stock behaviour" is not an available answer.
 
-**Do NOT make the radiotap fallback refuse.** That was the plan until the operator
+**Do NOT make the radiotap fallback refuse.** That was the plan until the author
 tested stock Android on the same device: it drops Wi-Fi too. Refusing would trade a
 working feature for an interruption stock does not avoid either, leaving us strictly
 worse than the phone shipped. Make it explicit instead — tell the user the radio is
@@ -247,7 +247,7 @@ radiotap path needs the equivalent.
 
 ### Always-on VPN lockdown breaks peer-to-peer, and should not just fail silently
 
-**Priority: first.** Operator requirement. **The mechanism is now designed — see
+**Priority: first.** A project requirement. **The mechanism is now designed — see
 docs/POLICY.md.** Session-based rather than per-transfer, because discovery is
 continuous and cannot be authorised as an event.
 
@@ -286,7 +286,7 @@ why. The device simply stops being able to send or receive, and the app looks br
 
 **Measured: Google's own implementation fails the same way**
 
-Tested by the operator on the previous build, with privileged GMS and Play Store
+Tested by the author on the previous build, with privileged GMS and Play Store
 installed: with *Block connections without VPN* on, **AirDrop through Google's own
 stack does not work either**. Same setting, same outcome.
 
@@ -524,7 +524,8 @@ Two parts, both shipped:
 Why this never affected AirDrop, which had been doing mDNS for weeks: the access map
 is keyed by INTERFACE, and `mosey0` is not a managed network. The gate is wlan0-only.
 
-Full mechanism and the three rejected alternatives: grapheneos BUILD-NOTES 41.
+Full mechanism and the three rejected alternatives are recorded with the OS
+integration.
 
 
 - **Per-transfer consent.** `/Ask` blocked on `respondToOffer` rather than answering 200

@@ -98,7 +98,7 @@ that hardcodes `Connection: close` is fine for being listed and wrong for receiv
 
 ## Scope: "everyone" only — contacts mode is deliberately not implemented
 
-Operator's decision, and it removes the single worst dependency in the protocol.
+A deliberate design decision, and it removes the single worst dependency in the protocol.
 
 Contacts-only AirDrop proves identity with an Apple-issued **validation record** and
 client certificate. Those cannot be generated; they have to be **extracted from a real
