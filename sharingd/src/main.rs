@@ -460,6 +460,57 @@ struct BlePeer {
 /// explanation.
 const BLE_PEER_TTL: Duration = Duration::from_secs(20);
 
+/// BLUETOOTH, from the ConnectionRequest medium enum.
+fn frames_medium_bluetooth() -> u64 {
+    barq_protocol::frames::Medium::Bluetooth as u64
+}
+
+/// A coarse MIME type from a file name, for the introduction's file metadata.
+///
+/// Advisory: it picks the icon the peer shows and nothing else, so a wrong guess costs a
+/// wrong icon rather than a failed transfer.
+fn mime_of(name: &str) -> String {
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "heic" => "image/heic",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "mp3" => "audio/mpeg",
+        "pdf" => "application/pdf",
+        "txt" => "text/plain",
+        "apk" => "application/vnd.android.package-archive",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
+/// Reports progress to clients while a Quick Share send runs.
+struct TransferProgress {
+    id: i64,
+    transfers: Transfers,
+    callbacks: Callbacks,
+}
+
+impl quickshare::outbound::Progress for TransferProgress {
+    fn progress(&self, done: u64, total: u64) {
+        let cbs = match self.callbacks.lock() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        for cb in cbs.iter() {
+            let _ = cb.onTransferProgress(self.id, done as i64, total as i64);
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.transfers.is_cancelled(self.id)
+    }
+}
+
 /// Deny everything. A daemon that has never heard from the app shares nothing.
 fn denied_policy() -> BarqPolicy {
     BarqPolicy {
@@ -736,6 +787,96 @@ impl IBarqService for BarqService {
             },
         );
         Ok(())
+    }
+
+    fn sendFilesOnSocket(
+        &self,
+        peer_id: &str,
+        socket: &binder::ParcelFileDescriptor,
+        files: &[binder::ParcelFileDescriptor],
+        names: &[String],
+    ) -> BinderResult<i64> {
+        if !allows_send(self.quickshare_mode()) {
+            log::warn!("sendFilesOnSocket refused — policy does not permit Quick Share send");
+            return Err(Status::from(StatusCode::PERMISSION_DENIED));
+        }
+        if files.len() != names.len() {
+            log::warn!("sendFilesOnSocket: {} descriptors but {} names", files.len(), names.len());
+            return Err(Status::from(StatusCode::BAD_VALUE));
+        }
+
+        // Duplicate everything before returning: the parcel closes its descriptors when
+        // this transaction ends, and the transfer runs on another thread. Reading from a
+        // closed fd presents as a truncated file rather than an error, which is the worst
+        // way for this to fail.
+        let sock = dup_file(socket).map_err(|e| {
+            log::warn!("sendFilesOnSocket: could not dup the socket: {e}");
+            Status::from(StatusCode::BAD_VALUE)
+        })?;
+        let mut out_files = Vec::with_capacity(files.len());
+        for (f, n) in files.iter().zip(names) {
+            let file = dup_file(f).map_err(|e| {
+                log::warn!("sendFilesOnSocket: could not dup {n}: {e}");
+                Status::from(StatusCode::BAD_VALUE)
+            })?;
+            let size = file.metadata().map(|m| m.len() as i64).unwrap_or(0);
+            out_files.push(quickshare::outbound::OutFile {
+                name: n.clone(),
+                mime: mime_of(n),
+                size,
+                reader: Box::new(file),
+            });
+        }
+
+        let id = self.transfers.begin();
+        let device = device_name();
+        let endpoint = quickshare::random_endpoint_id();
+        let endpoint = quickshare::instance_name(&endpoint)
+            .split('.')
+            .next()
+            .unwrap_or("BARQ")
+            .to_string();
+        let peer = peer_id.to_string();
+        let transfers = self.transfers.clone();
+        let callbacks = self.callbacks.clone();
+
+        std::thread::spawn(move || {
+            // Two handles on the same socket. `send` wants a reader and a writer, and a
+            // socket is both -- but it must be ONE socket, not two, or the peer's replies
+            // arrive on a descriptor nobody is reading.
+            let reader = match sock.try_clone() {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!("quickshare: could not clone the socket: {e}");
+                    transfers.finish(id);
+                    return;
+                }
+            };
+            let progress = TransferProgress {
+                id,
+                transfers: transfers.clone(),
+                callbacks,
+            };
+            log::info!("quickshare: sending {} file(s) to {peer}", out_files.len());
+            match quickshare::outbound::send(
+                reader,
+                sock,
+                &device,
+                &endpoint,
+                // The medium the caller actually connected over. Claiming anything else
+                // invites the peer to negotiate an upgrade onto a path that is not there.
+                &[frames_medium_bluetooth()],
+                out_files,
+                &progress,
+            ) {
+                Ok(true) => log::info!("quickshare: transfer {id} complete"),
+                Ok(false) => log::info!("quickshare: transfer {id} was not accepted"),
+                Err(e) => log::warn!("quickshare: transfer {id} failed: {e}"),
+            }
+            transfers.finish(id);
+        });
+
+        Ok(id)
     }
 
     fn refreshPeers(&self) -> BinderResult<()> {

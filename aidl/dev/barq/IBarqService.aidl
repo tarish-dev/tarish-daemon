@@ -188,4 +188,23 @@ interface IBarqService {
      * used only to dedupe within a session, never as an identity.
      */
     void reportBlePeer(String address, int rssi, in byte[] serviceData);
+
+    /**
+     * Send files to a Quick Share peer over a socket the CALLER already connected.
+     *
+     * The daemon cannot open this connection itself. Reaching a peer with no network
+     * means Bluetooth, and framework Bluetooth is unreachable from a native service --
+     * the same reason BLE scanning lives in the app. So the app connects and hands the
+     * socket over; the daemon runs the protocol on it, which is the half that is tested.
+     *
+     * `socket` is one end of a socket pair, not the Bluetooth socket itself: Android does
+     * not expose a BluetoothSocket's descriptor through public API. The app pumps bytes
+     * between the two. That costs a copy in each direction and avoids reflecting into
+     * hidden platform fields, which is the kind of thing that breaks on an OS update
+     * with no warning.
+     *
+     * Returns a transfer id, or 0 if the send could not be started.
+     */
+    long sendFilesOnSocket(String peerId, in ParcelFileDescriptor socket,
+            in ParcelFileDescriptor[] files, in String[] names);
 }
