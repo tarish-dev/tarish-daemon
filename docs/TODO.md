@@ -9,6 +9,43 @@ did not exist, and the live work was two hundred lines down.
 
 ## Open
 
+### Quick Share offline: RFCOMM is the wrong door for Android peers
+
+Established by testing against two real peers, 2026-09-04.
+
+| peer | RFCOMM connect | then |
+|---|---|---|
+| Windows Quick Share | accepted | full UKEY2 handshake, encrypted channel, then "cannot complete transfer" |
+| Android Quick Share (two devices) | accepted | **ignores everything** — never answers the ConnectionRequest |
+
+Both accept the socket. Only Windows speaks the raw OfflineFrame protocol on it.
+
+**The initial control connection for an offline peer is BLE L2CAP or GATT, not RFCOMM**,
+and it is wrapped in Nearby's length-prefixed MultiplexFrame stream — a virtual socket on
+top of the physical one. RFCOMM appears only as an *upgrade* path, carried in
+`BluetoothCredentials` inside `UPGRADE_PATH_AVAILABLE`. Bada puts these in a `bootstrap`
+package for exactly that reason: `BleL2capInitialControlClient`,
+`BleGattInitialControlServer`.
+
+**The L2CAP PSM comes from the fast advertisement we already parse.** It is a field in the
+endpoint data that `ble::parse_advertisement` currently ignores. That is the thread to
+pull first, because everything else depends on having a PSM to connect to.
+
+What this needs, in order:
+
+1. extract the CoC PSM from the advertisement — protocol crate, unit-testable
+2. the MultiplexFrame layer — protocol crate, unit-testable
+3. L2CAP connect in the app (`createL2capChannel`), replacing RFCOMM as the first hop
+4. keep RFCOMM only as an upgrade target
+
+**What is NOT wrong, and should not be re-litigated:** the crypto. Against Windows the
+plaintext handshake completes, the channel comes up, the peer is identified and a session
+PIN derives. HKDF is on RFC vectors, D2D derivation and AES-CBC on Bada's. The remaining
+Windows-side failure is a separate question from the Android one and is most likely the
+SecureMessage envelope, which is the one layer in that path with no foreign-implementation
+vector.
+
+
 ### Quick Share: what is left is the socket, not the protocol
 
 `libbarq_protocol` is complete and covered by 127 tests, including one that runs a whole
