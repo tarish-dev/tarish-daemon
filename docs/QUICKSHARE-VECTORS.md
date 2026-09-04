@@ -148,10 +148,10 @@ With extended advertising enabled, 614 sightings in 30 seconds:
 
 | offset | bytes | meaning |
 |---|---|---|
-| 0 | `48` | version 2, socket 2, **fast = 0**, so the service-id hash is present |
-| 1–3 | `fc 9f 5e` | `sha256("NearbySharing")[..3]` |
-| 4–8 | `00 00 00 2b 23` | **not established** |
-| 9–11 | `fc 9f 5e` | the hash **again** — reason not established |
+| 0–6 | `48 fc9f5e 000000` | outer frame header |
+| 7 | `2b` | **body length, 43** |
+| 8 | `23` | `versPCP` — version 1, PCP_HIGH. Constant on stock peers |
+| 9–11 | `fc 9f 5e` | `sha256("NearbySharing")[..3]` |
 | 12–15 | `42 51 46 55` | endpoint id, `"BQFU"` |
 | 16 | `1a` | endpoint-info length, 26 |
 | 17 | `06` | flags |
@@ -159,7 +159,20 @@ With extended advertising enabled, 614 sightings in 30 seconds:
 | 20–33 | `29 a1 … a6` | encrypted metadata key, 14 bytes |
 | 34 | `08` | name length |
 | 35–42 | `4b 2d 50 …` | **`"K-ProArt"`** |
-| 43– | | trailing; Bluetooth MAC and UWB fields, not parsed |
+| 43–48 | `9c c7 d3 e4 0d e9` | **Bluetooth MAC `9C:C7:D3:E4:0D:E9`** |
+| 49–52 | `00 00 56 ce` | device token and padding |
+
+`8 + 43 + 2 = 53` exactly.
+
+**The Bluetooth MAC is the point.** It is how a peer is reached when there is no network:
+BLE finds the device and hands over an address to open a Bluetooth connection to. The
+fast form has no MAC, which is why the same peer can be discoverable and unreachable.
+
+**Field names and meanings are Bada's**, from `BleServiceData.kt`. This table originally
+recorded offsets 1–2 and 4–8 as "constant across samples, meaning not established" and
+the trailing bytes as "purpose unknown". They are a body length, a version/PCP byte, and
+a device token. The structure had been reconstructed correctly from captures; the labels
+were guesses, and reading Bada replaced them with facts.
 
 1 + 2 + 14 + 1 + 8 = 26 exactly, which is what makes the reading solid rather than
 plausible.
@@ -170,6 +183,8 @@ rooted in a Google account to read. Barq has none and wants none, so a contacts-
 is reported without a name rather than guessed at. Everyone-mode is the case Barq can
 use, and it is also the case a person chooses deliberately.
 
-Because the hash appears twice, the parser locates the endpoint id from the **last**
-occurrence rather than a fixed offset. That is a workaround for something not understood,
-and is marked as such in the code.
+The hash appears twice because the outer frame repeats it. The parser scans for a hash
+that is preceded by a version byte and followed by an ASCII endpoint id and a length that
+fits, rather than trusting a fixed offset — the frame header differs between captures
+(two bytes on the Android peers, eight on this one) and validating the body is more
+robust than characterising every wrapper.

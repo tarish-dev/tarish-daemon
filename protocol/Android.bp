@@ -28,7 +28,7 @@
 // and links without argument, so this matches them.
 //
 // The staleness that shape invites is real and has already cost this project days
--- a device once kept answering against an AIDL library eight days old, reporting
+// -- a device once kept answering against an AIDL library eight days old, reporting
 // UNKNOWN_TRANSACTION for every method added since while every older one worked. It is
 // handled where it belongs, in the deploy step: whatever ships this daemon must carry
 // every Barq library and verify each against the build. That is a better answer than

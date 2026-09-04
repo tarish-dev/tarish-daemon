@@ -254,40 +254,47 @@ mod tests {
 // --------------------------------------------------- the endpoint advertisement ---
 //
 // The FastInit pulse above is a doorbell. THIS is the directory: the Nearby Connections
-// BLE advertisement, on service 0xFEF3, is what actually carries a peer's identity and
-// is how a Quick Share device is found with no network.
+// BLE advertisement, on service 0xFEF3, carries a peer's identity and -- crucially -- its
+// Bluetooth MAC, which is how a device is reached when there is no network at all.
 //
 // Worth stating plainly, because this module originally claimed otherwise: in a capture
 // taken next to an actively-sharing Android device and a Windows machine running Quick
-// Share, there were ZERO 0xFE2C pulses over several minutes, and hundreds of 0xFEF3
+// Share, there were ZERO 0xFE2C pulses over several minutes and hundreds of 0xFEF3
 // advertisements. Discovery happens here.
 //
-// The layout below is READ FROM CAPTURED TRAFFIC, not from a specification, and the
-// parts that are guesses are marked as such. Three independent samples from two devices
-// agreed on every field asserted here.
+// FORMAT CREDIT: the field names and their meanings are Bada's
+// (core-protocol/.../endpoint/BleServiceData.kt, Apache 2.0). This layout was first
+// reconstructed here from captures, which got the structure right and the labels wrong --
+// "constant across samples, meaning not established" turned out to be a body length and a
+// version/PCP byte. Reading Bada settled all of it.
 //
-//     4a 17 23 | 39 32 58 4d | 11 | 32 <16 more> | xx xx
-//     |  |  |    |             |    |              |
-//     |  |  |    |             |    |              two trailing bytes, purpose unknown
-//     |  |  |    |             |    endpoint info: flags, 2-byte salt, 14-byte key
-//     |  |  |    |             endpoint info length, 0x11 = 17
-//     |  |  |    endpoint id, four ASCII characters ("92XM", "WDKH", "BRJ6")
-//     |  |  constant across every sample; meaning not established
-//     |  constant across every sample; 0x17 = 23 = payload length minus four
-//     version and flags; bit 1 set marks a fast advertisement
+//     body:  versPCP | [service_id_hash 3] | endpoint_id 4 | info_len | EndpointInfo | [mac 6]
+//
+// `versPCP` packs version (3 bits) and PCP (5 bits); stock peers emit version 1, PCP_HIGH,
+// giving 0x23. The service-id hash and the trailing MAC are present in the REGULAR form
+// and absent from the FAST form, which is the whole difference between them.
+//
+// The body sits inside a frame whose header differs between captures -- two bytes on the
+// Android peers, eight on the Windows one. Rather than hardcode either, the body is found
+// by its own internal consistency: a version byte followed by the service-id hash, then a
+// four-character ASCII endpoint id and a length that fits. That is robust to a wrapper we
+// have not fully characterised, and refuses anything that merely looks similar.
 
 /// Nearby Connections' assigned service. Quick Share advertises its endpoints here.
 pub const NEARBY_SERVICE_UUID_16: u16 = 0xFEF3;
 
-/// Where the endpoint id starts, and how long it is.
-const ADVERT_ENDPOINT_ID_AT: usize = 3;
-/// Four ASCII characters, the same identifier that appears in a ConnectionRequest and
-/// in the mDNS instance name.
+/// `sha256("NearbySharing")[..3]` — marks an advertisement as Quick Share rather than
+/// some other Nearby Connections service.
+pub const SERVICE_ID_HASH: [u8; 3] = [0xFC, 0x9F, 0x5E];
+
+/// Four ASCII characters, the same identifier that appears in a ConnectionRequest and in
+/// the mDNS instance name.
 pub const ENDPOINT_ID_LEN: usize = 4;
-/// The byte holding the endpoint-info length.
-const ADVERT_INFO_LEN_AT: usize = 7;
-/// Shortest thing that can still contain an endpoint id and an info length.
-const ADVERT_MIN_LEN: usize = ADVERT_INFO_LEN_AT + 1;
+/// Bluetooth Classic MAC, in the regular form only.
+const MAC_LEN: usize = 6;
+/// Where the name length sits inside EndpointInfo: after flags, a 2-byte salt and a
+/// 14-byte encrypted metadata key.
+const NAME_LEN_AT: usize = 17;
 
 /// A peer found over BLE.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -299,36 +306,18 @@ pub struct Advertisement {
     pub endpoint_info: Vec<u8>,
     /// The name, when the peer published one in the clear. `None` for a contacts-only
     /// peer, whose name is inside the encrypted key and needs a certificate rooted in a
-    /// Google account to read. That is not a gap to close: a device that will not tell
-    /// us its name in the clear is one we cannot identify, and saying so is honest.
+    /// Google account to read. That is not a gap to close: a device that will not say its
+    /// name in the clear is one we cannot identify, and reporting the endpoint id is
+    /// honest.
     pub device_name: Option<String>,
-    /// True when the advertisement carried the NearbySharing service-id hash. A `false`
-    /// here means some other Nearby Connections service, which is not ours to talk to.
-    pub is_quick_share: bool,
+    /// **How to reach this peer with no network.** Present in the regular form; `None` in
+    /// the fast form, and `None` when the advertiser zeroed it, which means it has no
+    /// BR/EDR listener to connect to.
+    pub bluetooth_mac: Option<String>,
 }
 
-/// `sha256("NearbySharing")[..3]` — marks an advertisement as Quick Share rather than
-/// some other Nearby Connections service.
-pub const SERVICE_ID_HASH: [u8; 3] = [0xFC, 0x9F, 0x5E];
-
 /// Pull the device name out of endpoint info, if it is there in the clear.
-///
-/// Layout, from a captured visible-to-everyone advertisement:
-///
-/// ```text
-///   06      flags
-///   23 34   salt
-///   29 .. a6  encrypted metadata key, 14 bytes
-///   08      name length
-///   "K-ProArt"
-/// ```
-///
-/// 1 + 2 + 14 = 17, so anything at or below that length carries no name -- which is the
-/// contacts-only form, where the name is inside the encrypted key and needs a
-/// certificate we do not have. A peer visible to everyone puts it in the clear, and
-/// that is the case Barq can actually use.
 fn name_from_info(info: &[u8]) -> Option<String> {
-    const NAME_LEN_AT: usize = 17;
     let len = *info.get(NAME_LEN_AT)? as usize;
     let start = NAME_LEN_AT + 1;
     let end = start.checked_add(len)?;
@@ -344,54 +333,73 @@ fn name_from_info(info: &[u8]) -> Option<String> {
     Some(name)
 }
 
-/// Parse a Nearby Connections BLE advertisement.
-///
-/// Conservative on purpose: the layout came from captures, so this validates what it can
-/// (the endpoint id is printable ASCII, the declared info length fits) and refuses
-/// anything else rather than returning fields it is not confident in. A wrong endpoint id
-/// is worse than no peer -- it produces a connection attempt to something that will not
-/// answer.
-pub fn parse_advertisement(data: &[u8]) -> Option<Advertisement> {
-    if data.len() < ADVERT_MIN_LEN + ENDPOINT_ID_LEN {
+/// All zeroes means "no BR/EDR listener", not an address.
+fn format_mac(b: &[u8]) -> Option<String> {
+    if b.len() != MAC_LEN || b.iter().all(|&x| x == 0) {
         return None;
+    }
+    Some(
+        b.iter()
+            .map(|x| format!("{x:02X}"))
+            .collect::<Vec<_>>()
+            .join(":"),
+    )
+}
+
+/// Parse a Quick Share BLE endpoint advertisement.
+///
+/// Finds the body wherever it sits rather than assuming a frame header, and validates
+/// what it finds. Returning a wrong endpoint id would be worse than returning nothing --
+/// it produces a connection attempt to something that will never answer.
+pub fn parse_advertisement(data: &[u8]) -> Option<Advertisement> {
+    // The REGULAR form, identified by the service-id hash with a version byte in front.
+    // Scanned for rather than read at a fixed offset: the hash appears twice in the
+    // captured Windows advertisement, and only one of them starts a real body.
+    for i in 1..data.len().saturating_sub(SERVICE_ID_HASH.len()) {
+        if data[i..i + SERVICE_ID_HASH.len()] != SERVICE_ID_HASH {
+            continue;
+        }
+        if let Some(a) = body_at(data, i - 1, true) {
+            return Some(a);
+        }
     }
 
-    // TWO SHAPES, told apart by where the endpoint id sits.
-    //
-    // A non-fast advertisement carries the service-id hash, and the endpoint id follows
-    // it. Captured from a Windows machine visible to everyone, the hash appears TWICE --
-    // at offset 1 and again just before the endpoint id -- and the reason is not
-    // established, so this locates the id by the LAST hash rather than assuming a fixed
-    // offset. A fast advertisement omits the hash entirely and the id is at a fixed
-    // offset, which is the form the captured Android devices used.
-    let hash_at = data
-        .windows(SERVICE_ID_HASH.len())
-        .rposition(|w| w == SERVICE_ID_HASH);
-    let (id_at, is_quick_share) = match hash_at {
-        Some(i) => (i + SERVICE_ID_HASH.len(), true),
-        None => (ADVERT_ENDPOINT_ID_AT, false),
-    };
-    if id_at + ENDPOINT_ID_LEN >= data.len() {
-        return None;
+    // The FAST form: no hash, no MAC. The body follows a two-byte frame header.
+    body_at(data, 2, false)
+}
+
+/// Read a body starting at `at`, where `at` is the version byte.
+fn body_at(data: &[u8], at: usize, regular: bool) -> Option<Advertisement> {
+    let mut o = at.checked_add(1)?; // past versPCP
+    if regular {
+        o = o.checked_add(SERVICE_ID_HASH.len())?;
     }
-    let id = &data[id_at..id_at + ENDPOINT_ID_LEN];
-    // Every endpoint id seen on the wire is printable ASCII, and ours is generated that
-    // way too. Anything else means this is not the advertisement shape we decoded.
+    let id_end = o.checked_add(ENDPOINT_ID_LEN)?;
+    let id = data.get(o..id_end)?;
+    // Every endpoint id on the wire is printable ASCII, and ours is generated that way.
+    // This is what stops a run of arbitrary bytes being read as a peer.
     if !id.iter().all(|c| c.is_ascii_graphic()) {
         return None;
     }
-    let len_at = id_at + ENDPOINT_ID_LEN;
-    let info_len = data[len_at] as usize;
-    let start = len_at + 1;
-    if info_len == 0 || start + info_len > data.len() {
+    let info_len = *data.get(id_end)? as usize;
+    let info_start = id_end + 1;
+    let info_end = info_start.checked_add(info_len)?;
+    if info_len == 0 || info_end > data.len() {
         return None;
     }
-    let info = data[start..start + info_len].to_vec();
+    let info = data[info_start..info_end].to_vec();
+
+    let bluetooth_mac = if regular {
+        data.get(info_end..info_end + MAC_LEN).and_then(format_mac)
+    } else {
+        None
+    };
+
     Some(Advertisement {
         endpoint_id: String::from_utf8_lossy(id).into_owned(),
         device_name: name_from_info(&info),
         endpoint_info: info,
-        is_quick_share,
+        bluetooth_mac,
     })
 }
 
@@ -439,11 +447,33 @@ fc86671defa6084b2d50726f4172749cc7d3e40de9000056ce";
     #[test]
     fn the_windows_machine_decodes_with_its_name() {
         let a = parse_advertisement(&unhex(WINDOWS)).expect("should parse");
-        assert!(a.is_quick_share, "carries the NearbySharing service-id hash");
         assert_eq!(a.endpoint_id, "BQFU");
         // 1 flags + 2 salt + 14 key + 1 length + 8 name.
         assert_eq!(a.endpoint_info.len(), 26);
         assert_eq!(a.device_name.as_deref(), Some("K-ProArt"));
+        // THE POINT OF THE WHOLE EXERCISE: how to reach this peer with no network.
+        assert_eq!(a.bluetooth_mac.as_deref(), Some("9C:C7:D3:E4:0D:E9"));
+    }
+
+    /// The fast form carries no MAC, and must not invent one from whatever follows.
+    #[test]
+    fn the_fast_form_has_no_bluetooth_mac() {
+        for hex in CAPTURED {
+            let a = parse_advertisement(&unhex(hex)).expect("should parse");
+            assert_eq!(a.bluetooth_mac, None);
+        }
+    }
+
+    /// An advertiser with no BR/EDR listener zeroes the field. That is "nothing to
+    /// connect to", not an address of 00:00:00:00:00:00.
+    #[test]
+    fn a_zeroed_mac_is_reported_as_absent() {
+        let mut b = unhex(WINDOWS);
+        for i in 43..49 {
+            b[i] = 0;
+        }
+        let a = parse_advertisement(&b).expect("still parses");
+        assert_eq!(a.bluetooth_mac, None);
     }
 
     /// A name length running past the buffer must yield no name rather than a panic or
@@ -457,19 +487,24 @@ fc86671defa6084b2d50726f4172749cc7d3e40de9000056ce";
         assert_eq!(a.device_name, None);
     }
 
+    /// In the fast form the endpoint id sits at offset 3, after the frame header and the
+    /// version byte. Corrupting it must yield nothing rather than a peer named with
+    /// control characters.
     #[test]
     fn an_endpoint_id_that_is_not_ascii_is_refused() {
         let mut b = unhex(CAPTURED[0]);
-        b[ADVERT_ENDPOINT_ID_AT] = 0x00;
+        b[3] = 0x00;
         assert!(parse_advertisement(&b).is_none());
     }
 
     /// A declared length running past the buffer must be refused, not truncated into
     /// something that looks like a peer.
+    /// A declared length running past the buffer must be refused, not truncated into
+    /// something that looks like a peer.
     #[test]
     fn an_overlong_info_length_is_refused() {
         let mut b = unhex(CAPTURED[0]);
-        b[ADVERT_INFO_LEN_AT] = 0xFF;
+        b[7] = 0xFF;
         assert!(parse_advertisement(&b).is_none());
     }
 
