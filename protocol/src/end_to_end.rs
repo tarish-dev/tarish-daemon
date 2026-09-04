@@ -262,10 +262,18 @@ fn a_complete_share_from_handshake_to_file() {
     assert_eq!(assembled, body, "the file did not survive the round trip");
 
     // --- disconnection --------------------------------------------------------
-    let wire = framing::encode(&sender.channel.encrypt(&frames::disconnection()).unwrap());
+    let wire = framing::encode(
+        &sender
+            .channel
+            .encrypt(&frames::disconnection(true, false))
+            .unwrap(),
+    );
     assert!(matches!(
         receiver.receive(&wire)[..],
-        [Received::Offline(OfflineFrame::Disconnection)]
+        [Received::Offline(OfflineFrame::Disconnection {
+            request_safe: true,
+            ..
+        })]
     ));
 }
 

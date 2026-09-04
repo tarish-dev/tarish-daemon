@@ -8,8 +8,8 @@
 //!  2. us   -> UKEY2 ClientInit         plaintext
 //!     peer -> UKEY2 ServerInit
 //!  3. us   -> UKEY2 ClientFinished
-//!  4. peer -> ConnectionResponse       plaintext
-//!     us   -> ConnectionResponse(ACCEPT)
+//!  4. us   -> ConnectionResponse(ACCEPT)  plaintext -- WE GO FIRST
+//!     peer -> ConnectionResponse
 //!  5. ---- encrypted from here ----
 //!  6. paired key both ways, our introduction, THEIR user's answer, then the files
 //! ```
@@ -84,6 +84,7 @@ where
     // Only claim what can actually be carried: offering a medium we cannot deliver
     // invites the peer to negotiate an upgrade onto a path that does not exist, and the
     // failure then arrives halfway through a transfer instead of up front.
+    //
     // WHO WE ARE, in the same encoding a receiver advertises over BLE.
     //
     // This was an empty vector, on the reading that a sender is already identified by
@@ -141,6 +142,22 @@ where
     write_frame(&mut out, &client_finished)?;
 
     // --- 4. connection responses, still plaintext ----------------------------
+    //
+    // SEND FIRST, THEN RECEIVE. Not the other way round.
+    //
+    // This read the peer's response before sending ours, which is a deadlock against
+    // any peer that does the same -- and a stock receiver does. Both sides sit on a
+    // blocking read until one times out, so the symptom is a socket that connected,
+    // carried a whole UKEY2 handshake, and then went silent with no error on either
+    // end. Windows happens to send first, which is why it worked there and only there.
+    //
+    // There is no negotiation to lose by going first: we already decided to accept when
+    // we opened the connection.
+    write_frame(
+        &mut out,
+        &frames::connection_response(frames::Response::Accept, frames::OsType::Android),
+    )?;
+
     let their_response = input.next()?;
     match frames::parse(&their_response).map_err(bad)? {
         OfflineFrame::ConnectionResponse(r) if r.response == frames::Response::Accept => {
@@ -151,10 +168,6 @@ where
         }
         other => return Err(bad(format!("expected a connection response, got {other:?}"))),
     }
-    write_frame(
-        &mut out,
-        &frames::connection_response(frames::Response::Accept, frames::OsType::Android),
-    )?;
 
     // --- 5. keys. CLIENT, because we opened the handshake --------------------
     let (secrets, keys) = d2d::derive_all(
@@ -177,7 +190,7 @@ where
     // mistake that produces a receiver holding bytes it cannot attribute to any file.
     let mut payload_ids = Vec::with_capacity(files.len());
     let mut metadata = Vec::with_capacity(files.len());
-    for (i, f) in files.iter().enumerate() {
+    for f in files.iter() {
         let id = random_i64()?;
         payload_ids.push(id);
         metadata.push(FileMetadata {
@@ -186,7 +199,14 @@ where
             payload_id: id,
             size: f.size,
             mime_type: f.mime.clone(),
-            id: i as i64 + 1,
+            // THE SAME VALUE as payload_id, not an index.
+            //
+            // The two fields are separate in the schema and it is tempting to number
+            // attachments 1..n, which is what this did. A Samsung receiver keys its
+            // receive-side bookkeeping on `id`, so an id that matches nothing it was
+            // told about discards the attachment -- with a single NULL_MESSAGE line at
+            // the medium layer and no error anywhere the user can see.
+            id,
             ..Default::default()
         });
     }
@@ -206,8 +226,9 @@ where
         for effect in batch {
             match effect {
                 Effect::Send(frame) => {
-                    let wire = wrap_bytes(&mut next_payload_id, &frame);
-                    write_frame(&mut out, &channel.encrypt(&wire).map_err(chan)?)?;
+                    for wire in wrap_bytes(&mut next_payload_id, &frame) {
+                        write_frame(&mut out, &channel.encrypt(&wire).map_err(chan)?)?;
+                    }
                 }
                 Effect::BeginSending(_) => {
                     info!("quickshare: peer accepted, sending");
@@ -218,10 +239,18 @@ where
                     pending.extend(fsm.on(Event::TransferComplete));
                 }
                 Effect::Done => {
+                    // ASK, then WAIT. We advertised safe_to_disconnect_version in the
+                    // connection response, so a bare close is a broken promise: the peer
+                    // still has bytes in its read pipeline, and a TCP FIN arriving before
+                    // it drains marks every payload still in there as failed. The
+                    // transfer then succeeds on our side and fails on theirs.
                     write_frame(
                         &mut out,
-                        &channel.encrypt(&frames::disconnection()).map_err(chan)?,
+                        &channel
+                            .encrypt(&frames::disconnection(true, false))
+                            .map_err(chan)?,
                     )?;
+                    drain_for_safe_disconnect(&mut input, &mut channel);
                     // Done covers both "sent everything" and "they said no". Which one
                     // it was is the state, not the effect.
                     return Ok(fsm.state() == barq_protocol::fsm::State::Done && total > 0);
@@ -260,8 +289,17 @@ where
                 write_frame(&mut out, &channel.encrypt(&ka).map_err(chan)?)?;
             }
             OfflineFrame::KeepAlive { .. } => {}
-            OfflineFrame::Disconnection => {
+            OfflineFrame::Disconnection { request_safe, .. } => {
                 info!("quickshare: peer disconnected");
+                if request_safe {
+                    // They asked; answering costs one frame and lets them close cleanly
+                    // instead of timing us out.
+                    let ack = frames::disconnection(false, true);
+                    let _ = channel
+                        .encrypt(&ack)
+                        .map_err(chan)
+                        .and_then(|w| write_frame(&mut out, &w));
+                }
                 return Ok(false);
             }
             other => debug!("quickshare: ignoring {other:?}"),
@@ -302,22 +340,47 @@ fn send_one<W: Write, P: Progress>(
         }
         let eof = filled < buf.len();
 
-        let chunk = PayloadChunk {
-            flags: if eof { frames::FLAG_LAST_CHUNK } else { 0 },
-            offset,
-            body: buf[..filled].to_vec(),
-        };
-        let wire = frames::payload_data(&header, &chunk);
-        write_frame(out, &channel.encrypt(&wire).map_err(chan)?)?;
+        // Data chunks NEVER carry the flag, not even the last one. See the terminator
+        // below -- fusing them is a silent data-loss bug, not an optimisation.
+        if filled > 0 {
+            let chunk = PayloadChunk {
+                flags: 0,
+                offset,
+                body: buf[..filled].to_vec(),
+            };
+            let wire = frames::payload_data(&header, &chunk);
+            write_frame(out, &channel.encrypt(&wire).map_err(chan)?)?;
 
-        offset += filled as i64;
-        *done += filled as u64;
-        progress.progress(*done, total);
+            offset += filled as i64;
+            *done += filled as u64;
+            progress.progress(*done, total);
+        }
 
         if eof {
             break;
         }
     }
+
+    // THE TERMINATOR IS ITS OWN FRAME: no body, the flag, and the final offset.
+    //
+    // This used to ride on the last data chunk -- one frame carrying both the bytes and
+    // the LAST_CHUNK flag. That is accepted by our own receiver and by anything that
+    // reads the flag after consuming the body, so it round-trips perfectly in tests.
+    //
+    // A stock Samsung receiver discards the whole payload. It decrypts the frame, the
+    // safe-disconnect handshake completes, the transfer looks finished from our side,
+    // and no file is written -- the UI says it could not receive the file. The only
+    // trace is a NULL_MESSAGE line at the medium layer.
+    //
+    // BYTES payloads already use this two-frame shape, which is what made the
+    // difference easy to miss: the same encoder, one path correct and one not.
+    let terminator = PayloadChunk {
+        flags: frames::FLAG_LAST_CHUNK,
+        offset,
+        body: Vec::new(),
+    };
+    let wire = frames::payload_data(&header, &terminator);
+    write_frame(out, &channel.encrypt(&wire).map_err(chan)?)?;
 
     // A file whose size was declared larger than what was read leaves the receiver
     // waiting for bytes that will never come. Say so rather than let it hang.
@@ -335,4 +398,35 @@ fn random_i64() -> io::Result<i64> {
     let mut b = [0u8; 8];
     openssl::rand::rand_bytes(&mut b).map_err(|_| bad("no randomness"))?;
     Ok(i64::from_be_bytes(b))
+}
+
+/// Wait for the peer to acknowledge our safe-disconnect request, then let the socket go.
+///
+/// Best effort by design. Every outcome here is fine -- the ack arrives, the peer sends
+/// its own disconnection, or the socket ends -- and none of them changes whether the
+/// transfer succeeded. What is NOT fine is closing immediately, which is the thing this
+/// exists to avoid.
+///
+/// There is no timeout because there is no timer to hang this on: the underlying socket
+/// is the app's, and it closes its end when the transfer finishes. A peer that answers
+/// nothing gives us an EOF, which ends the loop.
+fn drain_for_safe_disconnect<S: Read>(input: &mut Frames<S>, channel: &mut SecureChannel) {
+    // A handful of frames, not an unbounded read: a peer that keeps talking after being
+    // told we are leaving should not keep us here.
+    for _ in 0..8 {
+        let Ok(wire) = input.next() else { return };
+        let Ok(plain) = channel.decrypt(&wire) else {
+            return;
+        };
+        match frames::parse(&plain) {
+            Ok(OfflineFrame::Disconnection { ack_safe: true, .. }) => {
+                debug!("quickshare: peer acknowledged the disconnect");
+                return;
+            }
+            // Their own goodbye is just as good an answer: they are done reading.
+            Ok(OfflineFrame::Disconnection { .. }) => return,
+            Ok(_) => continue,
+            Err(_) => return,
+        }
+    }
 }

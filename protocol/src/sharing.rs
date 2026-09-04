@@ -73,6 +73,11 @@ const TM_ID: u32 = 6;
 const IN_FILE_METADATA: u32 = 1;
 const IN_TEXT_METADATA: u32 = 2;
 const IN_START_TRANSFER: u32 = 6;
+const IN_USE_CASE: u32 = 8;
+
+/// `SharingUseCase.NEARBY_SHARE`. The alternative is REMOTE_COPY, which is a different
+/// product; UNKNOWN (the proto default) is what a receiver sees when the field is absent.
+const USE_CASE_NEARBY_SHARE: u64 = 1;
 
 // ConnectionResponseFrame (the SHARING one -- not the offline frame of the same name)
 const RS_STATUS: u32 = 1;
@@ -335,6 +340,11 @@ pub fn introduction(intro: &Introduction) -> Vec<u8> {
     if intro.start_transfer {
         w.varint(IN_START_TRANSFER, 1);
     }
+    // ALWAYS. Absent, the field reads as UNKNOWN, and a Samsung receiver treats the
+    // introduction as malformed and falls through to a path that never registers the
+    // attachment -- so the transfer is accepted, the bytes arrive, and no file appears.
+    // Not a parameter, because there is no other use case this daemon has.
+    w.varint(IN_USE_CASE, USE_CASE_NEARBY_SHARE);
     wrap(T_INTRODUCTION, V1_INTRODUCTION, &w.finish())
 }
 

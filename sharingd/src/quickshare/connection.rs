@@ -213,8 +213,9 @@ where
         for effect in batch {
             match effect {
                 Effect::Send(frame) => {
-                    let wire = wrap_bytes(&mut next_payload_id, &frame);
-                    write_frame(&mut out, &channel.encrypt(&wire).map_err(chan)?)?;
+                    for wire in wrap_bytes(&mut next_payload_id, &frame) {
+                        write_frame(&mut out, &channel.encrypt(&wire).map_err(chan)?)?;
+                    }
                 }
                 Effect::AskUser(intro) => {
                     total_bytes = intro.total_size().max(0) as u64;
@@ -254,7 +255,14 @@ where
                 }
                 Effect::BeginSending(_) => { /* we never send on an inbound connection */ }
                 Effect::Done => {
-                    write_frame(&mut out, &channel.encrypt(&frames::disconnection()).map_err(chan)?)?;
+                    // We advertised safe_to_disconnect_version in our response, so ask
+                    // rather than just going -- same contract as the sending side.
+                    write_frame(
+                        &mut out,
+                        &channel
+                            .encrypt(&frames::disconnection(true, false))
+                            .map_err(chan)?,
+                    )?;
                     if transfer_id != 0 {
                         transfers.finish(transfer_id);
                     }
@@ -357,8 +365,18 @@ where
                 write_frame(&mut out, &channel.encrypt(&ka).map_err(chan)?)?;
             }
             OfflineFrame::KeepAlive { .. } => {}
-            OfflineFrame::Disconnection => {
+            OfflineFrame::Disconnection { request_safe, .. } => {
                 info!("quickshare: peer disconnected");
+                if request_safe {
+                    // The sender is holding its socket open waiting for this. Without it
+                    // it closes on a timeout and may mark the transfer failed -- after
+                    // we already wrote the file.
+                    let ack = frames::disconnection(false, true);
+                    let _ = channel
+                        .encrypt(&ack)
+                        .map_err(chan)
+                        .and_then(|w| write_frame(&mut out, &w));
+                }
                 if transfer_id != 0 {
                     transfers.finish(transfer_id);
                 }
@@ -370,7 +388,19 @@ where
 }
 
 /// Wrap a sharing frame in a single-chunk BYTES payload.
-pub(crate) fn wrap_bytes(next_id: &mut i64, frame: &[u8]) -> Vec<u8> {
+/// Wrap one sharing frame as a BYTES payload: **two** PayloadTransfer frames.
+///
+/// The body and the LAST_CHUNK flag do not travel together. This produced one fused
+/// frame -- body plus flag -- which our own receiver reads correctly, so it round-trips
+/// in tests and looks right on the wire. A stock receiver reassembles nothing from it:
+/// the payload never completes, so the sharing frame inside it is never delivered.
+///
+/// That is what an introduction that reaches a peer and produces no accept prompt looks
+/// like. Every sharing frame goes through here -- paired key, introduction, response --
+/// so the fused shape broke all of them at once and in the same invisible way.
+///
+/// The terminator's offset is the total size, not zero.
+pub(crate) fn wrap_bytes(next_id: &mut i64, frame: &[u8]) -> Vec<Vec<u8>> {
     *next_id += 1;
     let header = PayloadHeader {
         id: *next_id,
@@ -378,12 +408,20 @@ pub(crate) fn wrap_bytes(next_id: &mut i64, frame: &[u8]) -> Vec<u8> {
         total_size: frame.len() as i64,
         ..Default::default()
     };
-    let chunk = PayloadChunk {
-        flags: frames::FLAG_LAST_CHUNK,
+    let data = PayloadChunk {
+        flags: 0,
         offset: 0,
         body: frame.to_vec(),
     };
-    frames::payload_data(&header, &chunk)
+    let terminator = PayloadChunk {
+        flags: frames::FLAG_LAST_CHUNK,
+        offset: frame.len() as i64,
+        body: Vec::new(),
+    };
+    vec![
+        frames::payload_data(&header, &data),
+        frames::payload_data(&header, &terminator),
+    ]
 }
 
 pub(crate) fn write_frame(out: &mut impl Write, payload: &[u8]) -> io::Result<()> {

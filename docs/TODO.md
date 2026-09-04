@@ -62,6 +62,31 @@ how they came to be missing.
 Credit for all of it: Bada's `OutboundFrames`, whose comments record each field against the
 device that needed it.
 
+**Then four more of the same kind, from the same source** — Bada's `AGENTS.md` is a list of
+requirements discovered one device at a time, and each of these fails without an error:
+
+- **The ConnectionResponse exchange is send-first, then receive.** We read the peer's
+  before sending ours. Against a peer that does the same, that is a plain deadlock: both
+  sides block on a read until one times out. Windows happens to send first, which is
+  exactly why it was the only peer that ever got past this point.
+- **A FILE payload's LAST_CHUNK terminator is its own frame** — empty body, offset =
+  total size — and so is a BYTES payload's. We fused body and flag into one frame in both
+  paths. Our own receiver reads that correctly, so it round-trips in tests and looks right
+  on the wire; a stock receiver reassembles nothing from it. Every sharing frame goes
+  through the BYTES path, so an introduction sent that way reaches the peer and produces
+  no accept prompt.
+- **`IntroductionFrame.use_case` must be NEARBY_SHARE**, and each `FileMetadata.id` must
+  equal its `payload_id`. Ours numbered attachments 1..n. Samsung keys its receive-side
+  bookkeeping on `id` and discards an attachment it cannot match.
+- **The DisconnectionFrame must set `request_safe_to_disconnect`**, and the sender must
+  wait for the ack before closing. Having advertised `safe_to_disconnect_version = 1`, a
+  bare close is a broken promise: the FIN arrives before the peer drains its read pipeline
+  and every payload still in there is marked failed — so the transfer succeeds on our side
+  and fails on theirs.
+
+That last one only became a requirement *because* we started advertising the version, so
+it and the response fields have to land together.
+
 **Untested on hardware.** Windows got further than Android on the old shape, so it may
 still fail at the same place; if it does, the next suspect is unchanged — see below.
 

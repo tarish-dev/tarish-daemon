@@ -130,6 +130,10 @@ const PC_BODY: u32 = 3;
 const CM_EVENT: u32 = 1;
 const CM_OFFSET: u32 = 2;
 
+// DisconnectionFrame
+const DC_REQUEST_SAFE: u32 = 1;
+const DC_ACK_SAFE: u32 = 2;
+
 // KeepAliveFrame
 const KA_ACK: u32 = 1;
 const KA_SEQ_NUM: u32 = 2;
@@ -299,7 +303,13 @@ pub enum Frame {
     ConnectionResponse(ConnectionResponse),
     PayloadTransfer(PayloadTransfer),
     KeepAlive { ack: bool, seq_num: u64 },
-    Disconnection,
+    /// `request_safe_to_disconnect` asks the peer to drain its read pipeline and
+    /// answer before the socket goes away; `ack_safe_to_disconnect` is that answer.
+    /// Both false is the old unqualified "I am going now".
+    Disconnection {
+        request_safe: bool,
+        ack_safe: bool,
+    },
     BandwidthUpgrade(Vec<u8>),
     Unknown(u64),
 }
@@ -516,8 +526,24 @@ pub fn keep_alive(ack: bool, seq_num: u64) -> Vec<u8> {
     offline(T_KEEP_ALIVE, V1_KEEP_ALIVE, &w.finish())
 }
 
-pub fn disconnection() -> Vec<u8> {
-    offline(T_DISCONNECTION, V1_DISCONNECTION, &[])
+/// Build a DisconnectionFrame.
+///
+/// **`request_safe` must be true whenever we advertised `safe_to_disconnect_version`,**
+/// which `connection_response` always does. The two form a contract: having claimed we
+/// can disconnect safely, closing the socket without asking is a bare TCP FIN, and a
+/// stock receiver marks every payload still in its read pipeline as failed. The
+/// transfer completes on our side and fails on theirs.
+///
+/// After sending it, wait for the peer's ack (or its own Disconnection) before closing.
+pub fn disconnection(request_safe: bool, ack_safe: bool) -> Vec<u8> {
+    let mut w = Writer::new();
+    if request_safe {
+        w.varint(DC_REQUEST_SAFE, 1);
+    }
+    if ack_safe {
+        w.varint(DC_ACK_SAFE, 1);
+    }
+    offline(T_DISCONNECTION, V1_DISCONNECTION, &w.finish())
 }
 
 // ------------------------------------------------------------------ decoding ---
@@ -551,7 +577,13 @@ pub fn parse(bytes: &[u8]) -> Result<Frame, Error> {
             let seq_num = protobuf::first_varint(body, KA_SEQ_NUM)?.unwrap_or(0);
             Frame::KeepAlive { ack, seq_num }
         }
-        T_DISCONNECTION => Frame::Disconnection,
+        T_DISCONNECTION => {
+            let b = protobuf::first_bytes(v1, V1_DISCONNECTION)?.unwrap_or(&[]);
+            Frame::Disconnection {
+                request_safe: protobuf::first_varint(b, DC_REQUEST_SAFE)?.unwrap_or(0) != 0,
+                ack_safe: protobuf::first_varint(b, DC_ACK_SAFE)?.unwrap_or(0) != 0,
+            }
+        }
         T_BANDWIDTH_UPGRADE => Frame::BandwidthUpgrade(body.to_vec()),
         other => Frame::Unknown(other),
     })
@@ -910,7 +942,29 @@ mod tests {
             }
             other => panic!("wrong frame: {other:?}"),
         }
-        assert_eq!(parse(&disconnection()).unwrap(), Frame::Disconnection);
+        assert_eq!(
+            parse(&disconnection(false, false)).unwrap(),
+            Frame::Disconnection {
+                request_safe: false,
+                ack_safe: false
+            }
+        );
+        // The shape we actually send: having advertised safe_to_disconnect_version, a
+        // disconnection that does not request it is a bare FIN to the peer.
+        assert_eq!(
+            parse(&disconnection(true, false)).unwrap(),
+            Frame::Disconnection {
+                request_safe: true,
+                ack_safe: false
+            }
+        );
+        assert_eq!(
+            parse(&disconnection(false, true)).unwrap(),
+            Frame::Disconnection {
+                request_safe: false,
+                ack_safe: true
+            }
+        );
     }
 
     /// Forward compatibility: a frame type we do not model must not fail the connection.
