@@ -397,6 +397,7 @@ fn send_one<W: Write, P: Progress>(
         ..Default::default()
     };
 
+    let started = std::time::Instant::now();
     let mut offset: i64 = 0;
     let mut buf = vec![0u8; CHUNK];
     loop {
@@ -462,7 +463,15 @@ fn send_one<W: Write, P: Progress>(
             file.name, file.size
         );
     }
-    info!("quickshare: sent {} ({offset} bytes)", file.name);
+    // The RATE, not just the total. "Slow" is not a number, and the two candidates --
+    // the radio and our own send window -- are only distinguishable by one.
+    let secs = started.elapsed().as_secs_f64().max(0.001);
+    info!(
+        "quickshare: sent {} ({offset} bytes in {:.1}s, {:.0} KB/s)",
+        file.name,
+        secs,
+        offset as f64 / 1024.0 / secs
+    );
     Ok(())
 }
 

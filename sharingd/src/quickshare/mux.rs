@@ -99,8 +99,18 @@ const MAX_PACKET_PAYLOAD: usize = 16 * 1024;
 ///
 /// The peer tells us exactly how much it has taken, in every PACKET_ACKNOWLEDGEMENT. So
 /// we count what we send, count what it confirms, and refuse to get more than this far
-/// apart. Big enough to keep the radio busy, small enough that "sent" means something.
-const MAX_BYTES_IN_FLIGHT: u64 = 64 * 1024;
+/// apart.
+///
+/// **The size of it is a throughput decision, not a safety one.** Every time we hit the
+/// limit we stop until an acknowledgement comes back, and on BLE that wait is a
+/// connection interval -- tens of milliseconds during which the radio has nothing to
+/// send. At 64 KiB and 16 KiB packets only four packets were ever in flight, which made
+/// the link stall on almost every one. This allows sixteen.
+///
+/// Correctness does not depend on it: `drain` still waits for the peer to confirm
+/// everything before the socket may close, so a wider window means more bytes in the air,
+/// not a weaker guarantee.
+const MAX_BYTES_IN_FLIGHT: u64 = 256 * 1024;
 
 /// How long to wait for the peer to catch up before giving up on it.
 const ACK_TIMEOUT: Duration = Duration::from_secs(30);

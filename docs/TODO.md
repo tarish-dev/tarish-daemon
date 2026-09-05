@@ -9,6 +9,50 @@ did not exist, and the live work was two hundred lines down.
 
 ## Open
 
+### The payload runs over Bluetooth, and it should not
+
+Quick Share sends work, and they are slow: ~126 KB/s for a 2.7 MB file on frankel. That is
+not the send window and not the framing. **It is the medium.**
+
+Bluetooth is only supposed to carry the BOOTSTRAP -- handshake, PIN, consent. Stock then
+performs a bandwidth upgrade and moves the payload to Wi-Fi Direct, a hotspot, or the LAN.
+It never sends a multi-megabyte file over Bluetooth. We do, because `outbound.rs` answers
+every `UPGRADE_PATH_AVAILABLE` with `UPGRADE_FAILURE`:
+
+    OfflineFrame::BandwidthUpgrade(body) => {
+        // WE CANNOT TAKE ONE, SO SAY SO.
+
+Declining was right when it was written -- an ignored offer leaves the negotiation open
+and the transfer is reported failed with every byte delivered, which is what the Windows
+"cannot complete transfer" was. It is not right as a destination.
+
+**What it needs.**
+
+- **Solicit, do not wait.** Stock GMS receivers never offer an upgrade unprompted: they
+  advertise `autoUpgradeBandwidth: false` and stay idle until the sender sends
+  `BANDWIDTH_UPGRADE_NEGOTIATION{UPGRADE_PATH_REQUEST}`. Bada sends it right after the
+  sharing FSM's first PKE frame, so the receiver's group bring-up overlaps the consent
+  wait rather than following it.
+- **Adopt the offer**, connect on the new medium, then tear the old one down in order:
+  `LAST_WRITE_TO_PRIOR_CHANNEL`, `SAFE_TO_CLOSE_PRIOR_CHANNEL`.
+- **Failure policy**, which is not symmetric: a Bluetooth bootstrap falls back to staying
+  on Bluetooth for anything that goes wrong BEFORE the teardown starts (no offer,
+  malformed offer, adopt timeout). After `LAST_WRITE` it is terminal -- the old channel is
+  no longer safe to stream on.
+
+**The protocol half is already written and tested**: `barq_protocol::upgrade`, including
+`a_whole_upgrade_completes_on_both_sides`. What is missing is the radio.
+
+**Do WIFI_LAN first.** When both devices are on the same network the upgrade is a TCP
+connection to an address the peer hands us -- no Wi-Fi Direct, no P2P group, no new
+framework surface, and it is the path Windows already offered us unprompted
+(`172.20.9.166:58151`, which we declined). Wi-Fi Direct is the one that matters offline and
+is the bigger piece: `WifiP2pManager` lives in the framework, so like BLE it belongs in the
+app with the daemon driving it over AIDL.
+
+Until then the send window is worth what it is worth and no more: 256 KiB of packets in
+flight keeps the radio busy, but the radio is the ceiling.
+
 ### Cancelling needs a pass, and a refusal currently reports as success
 
 Reported from real use 2026-09-05, after PIN entry, wrong-PIN and both-sides cancel were
