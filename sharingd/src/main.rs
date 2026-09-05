@@ -523,6 +523,12 @@ struct BarqService {
     /// Mirrors policy.requireConfirmation for the accept loop, which runs on the httpd
     /// threads and must not take the policy lock on every offer.
     auto_accept: Arc<AtomicBool>,
+    /// Whether a sender must type the PIN before anything leaves this device.
+    ///
+    /// Held here rather than read from the policy at send time because the send runs on
+    /// its own thread and the policy can change under it; this is the value that was in
+    /// force when the transfer started.
+    require_pin: Arc<AtomicBool>,
 }
 
 /// A Quick Share peer seen over BLE.
@@ -626,6 +632,8 @@ struct TransferProgress {
     id: i64,
     transfers: Transfers,
     callbacks: Callbacks,
+    /// Snapshotted when the transfer began. See `BarqService::require_pin`.
+    require_pin: bool,
 }
 
 impl TransferProgress {
@@ -663,6 +671,13 @@ impl quickshare::outbound::Progress for TransferProgress {
     }
 
     fn confirm_pin(&self, pin: &str) -> bool {
+        if !self.require_pin {
+            // Turned off deliberately, by the person or by their organisation. Nothing to
+            // ask, and nothing to park -- the PIN is never handed out, so there is no
+            // value to clear either.
+            log::debug!("quickshare: PIN confirmation is off; sending without it");
+            return true;
+        }
         self.transfers.set_pin(self.id, pin);
         {
             let cbs = match self.callbacks.lock() {
@@ -692,6 +707,10 @@ fn denied_policy() -> BarqPolicy {
         quickshareManaged: false,
         requireConfirmationManaged: false,
         deviceNameManaged: false,
+        // The strict end of every switch, because this is what the daemon believes
+        // before the app has ever spoken to it.
+        requirePin: true,
+        requirePinManaged: false,
     }
 }
 
@@ -729,6 +748,8 @@ impl BarqService {
             ble_peers: Arc::new(Mutex::new(std::collections::HashMap::new())),
             policy: Arc::new(Mutex::new(denied_policy())),
             auto_accept: Arc::new(AtomicBool::new(false)),
+            // Required until the app says otherwise.
+            require_pin: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -868,8 +889,15 @@ impl IBarqService for BarqService {
             policy.requireConfirmationManaged,
             policy.deviceNameManaged,
         );
+        log::info!(
+            "policy: requirePin={} (managed: {})",
+            policy.requirePin,
+            policy.requirePinManaged
+        );
         self.auto_accept
             .store(!policy.requireConfirmation, Ordering::SeqCst);
+        self.require_pin
+            .store(policy.requirePin, Ordering::SeqCst);
 
         // A name that is no longer permitted must stop being advertised, so apply it
         // here rather than only in setDeviceName -- an admin pinning a name should take
@@ -1812,6 +1840,9 @@ impl BarqService {
         let peer = peer_id.to_string();
         let transfers = self.transfers.clone();
         let callbacks = self.callbacks.clone();
+        // Read ONCE, here, not inside the transfer. A policy push halfway through a send
+        // should not change whether that send was allowed to skip its confirmation.
+        let require_pin = self.require_pin.load(Ordering::SeqCst);
 
         std::thread::spawn(move || {
             // Two handles on the same socket. `send` wants a reader and a writer, and a
@@ -1829,6 +1860,7 @@ impl BarqService {
                 id,
                 transfers: transfers.clone(),
                 callbacks,
+                require_pin,
             };
             log::info!("quickshare: sending {} file(s) to {peer}", out_files.len());
             // The virtual socket, opened before anything above it says a word.

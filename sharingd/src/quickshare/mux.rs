@@ -110,7 +110,7 @@ const MAX_PACKET_PAYLOAD: usize = 16 * 1024;
 /// Correctness does not depend on it: `drain` still waits for the peer to confirm
 /// everything before the socket may close, so a wider window means more bytes in the air,
 /// not a weaker guarantee.
-const MAX_BYTES_IN_FLIGHT: u64 = 256 * 1024;
+const MAX_BYTES_IN_FLIGHT: u64 = 64 * 1024;
 
 /// How long to wait for the peer to catch up before giving up on it.
 const ACK_TIMEOUT: Duration = Duration::from_secs(30);

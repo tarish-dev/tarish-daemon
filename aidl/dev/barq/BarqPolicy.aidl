@@ -32,4 +32,23 @@ parcelable BarqPolicy {
     boolean quickshareManaged;
     boolean requireConfirmationManaged;
     boolean deviceNameManaged;
+
+    /**
+     * Whether the person sending must type the PIN shown on the receiving device before
+     * anything is sent.
+     *
+     * On by default. Off is a real choice -- the PIN costs a step on every transfer, and
+     * someone handing a file to a device in front of them may not want it -- but it is
+     * the only check that the peer we negotiated with is the one in the room, so turning
+     * it off is a decision rather than a default.
+     *
+     * Quick Share only. AirDrop has no equivalent: its confirmation is on the receiving
+     * device, which is a different question.
+     *
+     * APPENDED LAST, and any future field must be too: parcelable fields are read
+     * positionally, so inserting one above this silently shifts every field after it.
+     */
+    boolean requirePin;
+
+    boolean requirePinManaged;
 }
