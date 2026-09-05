@@ -1,39 +1,45 @@
 //! Running the Quick Share protocol over an L2CAP channel.
 //!
-//! An RFCOMM socket is a byte stream: write a length-prefixed frame and the peer reads
-//! it. An L2CAP connection-oriented channel is not. Nearby runs a **virtual socket** over
-//! it, and a peer will not say a word until one has been asked for and accepted:
+//! RFCOMM hands you a byte stream and the protocol can be written straight to it. L2CAP
+//! does not: Nearby runs its own socket layer on top, and a peer ignores everything until
+//! that layer has been set up.
 //!
 //! ```text
-//!   us   -> MultiplexFrame { CONTROL, CONNECTION_REQUEST }
-//!   peer -> MultiplexFrame { CONTROL, CONNECTION_RESPONSE { CONNECTION_ACCEPTED } }
-//!   then every frame in both directions is wrapped in a DATA frame
+//!   us   -> [3][fc9f5e]                     request a data connection for our service
+//!   peer -> [23]                            ready
+//!   us   -> control INTRODUCTION{fc9f5e,V2} name the service and socket version
+//!   then  -> the ordinary OfflineFrame stream, in data packets
 //! ```
 //!
-//! Both layers are length-prefixed the same way, so the physical stream is
-//! `[len][MultiplexFrame]` and the bytes inside the data frames are, in turn,
-//! `[len][OfflineFrame]`. That nesting is why the wrappers below are byte streams rather
-//! than frame codecs: `outbound::send` does its own framing and neither knows nor needs
-//! to know that something is wrapping it.
+//! Every packet is `[len:4][service_id_hash:3][payload]`. `00 00 00` is the control
+//! channel -- introductions, acknowledgements, disconnections -- and the service hash is
+//! the data channel. Data payloads are the normal length-prefixed `OfflineFrame` stream,
+//! so `outbound::send` frames as it always does and never learns anything is wrapping it.
 //!
-//! **Which peers need this is not a choice.** A peer that advertises an L2CAP PSM refuses
-//! RFCOMM; a peer that advertises none accepts it. The app opens whichever socket the
+//! **There is no multiplex layer here, and that cost a night.** Nearby has one -- a
+//! virtual socket with its own CONNECTION_REQUEST, implemented in
+//! `barq_protocol::multiplex` -- and a stock Pixel does not use it. Its own log says so:
+//!
+//! ```text
+//!   onIncomingConnection(BLE) mode: LEGACY ... failed to initialize the connection
+//!   java.io.IOException: In readConnectionRequestFrame, expected a CONNECTION_REQUEST
+//!   v1 OfflineFrame but got a UNKNOWN_FRAME_TYPE frame instead
+//! ```
+//!
+//! LEGACY mode means one service per channel and no multiplexing, so the first thing
+//! after the introduction must be the Nearby CONNECTION_REQUEST itself. A MultiplexFrame
+//! there is acknowledged by byte count and then the socket is closed, which from our side
+//! looked exactly like a peer that had refused us.
+//!
+//! **Which peers need any of this is not a choice.** A peer advertising an L2CAP PSM
+//! refuses RFCOMM; a peer advertising none accepts it. The app opens whichever socket the
 //! advertisement asked for and says which it opened.
 
-use barq_protocol::multiplex::{self, Frame, ResponseCode, SERVICE_ID_HASH_LEN};
-use barq_protocol::service::SERVICE_ID;
+use barq_protocol::multiplex::SERVICE_ID_HASH_LEN;
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 
 use crate::quickshare::connection::{bad, write_frame, Frames};
-
-/// Header material shared by both halves: the salted service-id hash and the salt that
-/// produced it. Repeated on every frame, including data frames.
-#[derive(Clone)]
-struct Ident {
-    salted: [u8; multiplex::SERVICE_ID_HASH_LEN],
-    salt: String,
-}
 
 /// Reads the peer's data frames and presents their contents as a plain byte stream.
 pub struct MuxReader<R: Read, A: Write> {
@@ -53,7 +59,6 @@ pub struct MuxReader<R: Read, A: Write> {
 /// Wraps everything written to it in a data frame.
 pub struct MuxWriter<W: Write> {
     inner: W,
-    ident: Ident,
 }
 
 /// The first byte a Nearby L2CAP server expects: "give me a data connection".
@@ -144,10 +149,10 @@ fn introduction_packet() -> Vec<u8> {
 /// Wrap multiplex bytes as a data packet for this service.
 fn data_packet(payload: &[u8]) -> Vec<u8> {
     let mut out = barq_protocol::service::service_id_hash().to_vec();
-    // The multiplex frame carries its OWN length inside the packet: the packet length
-    // says how many bytes arrived, the inner one delimits the frame. Both are needed --
-    // one packet can hold more than one frame.
-    out.extend_from_slice(&barq_protocol::framing::encode(payload));
+    // `payload` is ALREADY a complete length-prefixed OfflineFrame -- the caller framed
+    // it. Framing it again would put two lengths in front of one frame, which is the
+    // shape a multiplex peer wants and this one does not.
+    out.extend_from_slice(payload);
     out
 }
 
@@ -172,12 +177,8 @@ fn data_packet(payload: &[u8]) -> Vec<u8> {
 pub fn open<R: Read, W: Write, A: Write>(
     read: R,
     mut write: W,
-    mut ack: A,
+    ack: A,
 ) -> io::Result<(MuxReader<R, A>, MuxWriter<W>)> {
-    let salt = multiplex::random_salt();
-    let salted = multiplex::salted_service_id_hash(SERVICE_ID, &salt);
-    let ident = Ident { salted, salt };
-
     let mut frames = Frames::new(read);
 
     // 1. the data connection.
@@ -227,45 +228,17 @@ pub fn open<R: Read, W: Write, A: Write>(
     // 2. introduce the socket. Control channel, and it must come before any data.
     write_frame(&mut write, &introduction_packet())?;
 
-    // 3. the virtual socket, on the data channel like everything else above this line
-    // is on the control channel.
-    write_frame(
-        &mut write,
-        &data_packet(&multiplex::connection_request(&ident.salted, &ident.salt)),
-    )?;
-    // A peer may send other frames before answering -- its own request, for one. Read
-    // past what we do not need rather than treating the first surprise as failure.
-    for _ in 0..8 {
-        let Some(inner) = read_data_packet(&mut frames, &mut ack)? else {
-            continue;
-        };
-        match multiplex::parse(&inner) {
-            Frame::ConnectionResponse(ResponseCode::Accepted) => {
-                log::debug!("quickshare: multiplex socket accepted");
-                return Ok((
-                    MuxReader {
-                        inner: frames,
-                        ack,
-                        buf: VecDeque::new(),
-                        done: false,
-                    },
-                    MuxWriter {
-                        inner: write,
-                        ident,
-                    },
-                ));
-            }
-            Frame::ConnectionResponse(code) => {
-                return Err(bad(format!("the peer refused a multiplex socket: {code:?}")));
-            }
-            Frame::Disconnection => {
-                return Err(bad("the peer closed the multiplex socket during setup"));
-            }
-            // Its own request, or something we do not model. Neither is an answer.
-            _ => continue,
-        }
-    }
-    Err(bad("the peer never accepted a multiplex socket"))
+    // No multiplex handshake follows. The next thing on this channel is the caller's
+    // own ConnectionRequest, which is what the peer is waiting to read.
+    Ok((
+        MuxReader {
+            inner: frames,
+            ack,
+            buf: VecDeque::new(),
+            done: false,
+        },
+        MuxWriter { inner: write },
+    ))
 }
 
 impl<R: Read, A: Write> Read for MuxReader<R, A> {
@@ -274,18 +247,11 @@ impl<R: Read, A: Write> Read for MuxReader<R, A> {
             if self.done {
                 return Ok(0);
             }
-            let Some(inner) = read_data_packet(&mut self.inner, &mut self.ack)? else {
-                continue;
-            };
-            match multiplex::parse(&inner) {
-                Frame::Data(payload) => self.buf.extend(payload),
-                Frame::Disconnection => {
-                    self.done = true;
-                    return Ok(0);
-                }
-                // Control chatter on a socket that is already open changes nothing for
-                // the stream above.
-                _ => continue,
+            match read_data_packet(&mut self.inner, &mut self.ack)? {
+                // The payload IS the stream: length-prefixed OfflineFrames, which the
+                // layer above parses. Nothing here looks inside.
+                Some(payload) => self.buf.extend(payload),
+                None => continue,
             }
         }
         let n = out.len().min(self.buf.len());
@@ -305,8 +271,7 @@ impl<W: Write> Write for MuxWriter<W> {
         // would make `write_all` call again with the remainder and split one protocol
         // frame across two data frames -- legal for a byte stream, and a peer that
         // reassembles them still gets the same bytes, but there is no reason to.
-        let frame = multiplex::data(&self.ident.salted, &self.ident.salt, data);
-        write_frame(&mut self.inner, &data_packet(&frame))?;
+        write_frame(&mut self.inner, &data_packet(data))?;
         Ok(data.len())
     }
 
@@ -316,11 +281,8 @@ impl<W: Write> Write for MuxWriter<W> {
 }
 
 impl<W: Write> MuxWriter<W> {
-    /// Close the virtual socket. Best effort: the physical channel is going away anyway.
-    pub fn close(&mut self) {
-        let bye = multiplex::disconnection(&self.ident.salted, &self.ident.salt);
-        let _ = write_frame(&mut self.inner, &bye);
-    }
+    /// Nothing to close at this layer: the physical channel going away is the close.
+    pub fn close(&mut self) {}
 }
 
 /// Bytes as hex, for the diagnostics above. Short reads only -- these are control
@@ -365,20 +327,9 @@ fn read_data_packet<R: Read, A: Write>(
         return Ok(None);
     }
 
-    // Acknowledge what arrived BEFORE parsing it. The peer is counting bytes, not
-    // frames, and it stops sending when its own count runs too far ahead of ours.
+    // Acknowledge what arrived BEFORE handing it on. The peer counts bytes, not frames,
+    // and it stops sending when its own count runs too far ahead of ours.
     let _ = write_frame(ack, &packet_acknowledgement(payload.len()));
 
-    // The payload is the multiplex frame with its own length in front.
-    if payload.len() < 4 {
-        return Ok(None);
-    }
-    let len = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
-    let frame = payload.get(4..4 + len).ok_or_else(|| {
-        bad(format!(
-            "L2CAP data packet claims {len} bytes but carries {}",
-            payload.len() - 4
-        ))
-    })?;
-    Ok(Some(frame.to_vec()))
+    Ok(Some(payload.to_vec()))
 }

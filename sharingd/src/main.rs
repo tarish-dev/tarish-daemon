@@ -1791,12 +1791,24 @@ impl BarqService {
 
         let id = self.transfers.begin();
         let device = device_name();
-        let endpoint = quickshare::random_endpoint_id();
-        let endpoint = quickshare::instance_name(&endpoint)
-            .split('.')
-            .next()
-            .unwrap_or("BARQ")
-            .to_string();
+        // FOUR CHARACTERS. Not the mDNS instance label.
+        //
+        // This ran the id through `instance_name`, which base64url-encodes a ten-byte
+        // structure -- version byte, id, service hash, reserved -- and produced a
+        // fourteen-character string. That is the right value for an mDNS record and the
+        // wrong one for this field, which wants the bare endpoint id.
+        //
+        // Windows tolerated it. A stock Pixel does not, and does not merely refuse:
+        //
+        //   FATAL EXCEPTION: highpool[467]
+        //   Process: com.google.android.gms.persistent
+        //   java.lang.IllegalArgumentException: ConnectionsDevice's endpoint id must be
+        //   assigned with length 4.
+        //
+        // It takes down com.google.android.gms.persistent, which is why the peer went
+        // from talking to us to silently dropping the channel -- the service handling it
+        // had died. Their crash, our malformed field.
+        let endpoint = String::from_utf8_lossy(&quickshare::random_endpoint_id()).into_owned();
         let peer = peer_id.to_string();
         let transfers = self.transfers.clone();
         let callbacks = self.callbacks.clone();

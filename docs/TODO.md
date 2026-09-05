@@ -9,7 +9,7 @@ did not exist, and the live work was two hundred lines down.
 
 ## Open
 
-### Quick Share to a stock Android peer: everything but the multiplex request
+### Quick Share to a stock Android peer: WORKING, and how
 
 Windows works end to end over RFCOMM. A stock Pixel does not, and the reason is that it
 does not accept RFCOMM at all -- **its advertisement says so, and that took far too long
@@ -40,24 +40,41 @@ Each of those was found by being wrong first, and each wrong version failed sile
   later
 - writing multiplex frames without the `fc9f5e` packet prefix does the same
 
-**Where it stands.** The peer now parses everything we send. Its last two packets,
-decoded:
+**NO MULTIPLEX LAYER.** Nearby has one, and this peer does not use it:
 
-    type=3  080322070a03fc9f5e1028   PACKET_ACKNOWLEDGEMENT { fc9f5e, received_size: 40 }
-    type=2  08021a050a03fc9f5e       DISCONNECTION          { fc9f5e }
+    onIncomingConnection(BLE) mode: LEGACY ... failed to initialize the connection
+    java.io.IOException: In readConnectionRequestFrame, expected a CONNECTION_REQUEST
+    v1 OfflineFrame but got a UNKNOWN_FRAME_TYPE frame instead
 
-40 bytes is exactly our data payload, so it read the multiplex CONNECTION_REQUEST, counted
-it, and closed the service socket instead of answering CONNECTION_RESPONSE. Framing is
-right; the request's CONTENT is not accepted.
+LEGACY means one service per channel, so the first thing after the introduction is the
+ordinary Nearby CONNECTION_REQUEST. A MultiplexFrame there is acknowledged by byte count
+and the socket then closed, which from the sending side is indistinguishable from being
+refused. `barq_protocol::multiplex` is kept and tested for peers that do multiplex.
 
-**Do not guess the next byte.** Four rounds of inference got the framing right and the
-fifth is where it stopped paying: the remaining candidates -- the salt as hex text vs raw
-bytes, whether the salted hash is computed over the same service string the peer used,
-whether a socket already introduced for a service may then request a multiplex socket for
-it -- are indistinguishable from here. The evidence that would settle it is a capture of
-stock-to-stock over L2CAP, which is where Bada's own notes came from; failing that, the
-`BleGattInitialControlClient` route is fully specified in Bada and is what its runbook
-says stock Android actually uses.
+**And the endpoint id must be FOUR CHARACTERS.** Ours was the mDNS instance label --
+`instance_name()` base64url-encodes a ten-byte structure and yields fourteen. Windows
+accepted it for weeks. A Pixel does not, and does not merely refuse:
+
+    FATAL EXCEPTION: highpool[467]
+    Process: com.google.android.gms.persistent
+    java.lang.IllegalArgumentException: ConnectionsDevice's endpoint id must be
+    assigned with length 4.
+
+It takes down `com.google.android.gms.persistent`, so the peer stops answering because the
+service handling us has died. That is why this looked like a protocol refusal for hours.
+
+**Verified 2026-09-05:** L2CAP connect, data connection, introduction, `peer is Android,
+safe-disconnect v4`, PIN, acceptance, 453693 bytes, `transfer 1 complete`.
+
+**HOW IT WAS FOUND, because it is the lesson.** Six rounds of inference from a reference
+implementation got the framing right and then stopped paying. Connecting the receiving
+phone over adb and reading ITS log gave the answer in one line, twice -- the LEGACY mode
+error and the endpoint-id crash. Neither was visible from the sending side, and neither
+was in Bada. **When a peer will not talk to you and you can hold it, read its log first.**
+
+Remaining: the peer rotates its BLE address and PSM every advertisement set, so a row more
+than a few seconds old fails at connect. The app should re-resolve immediately before
+dialing and retry once.
 
 Credit for the whole layer: Bada's `BleL2capInitialControlClient`, `NearbyBleSocketFrames`
 and `ble_frames.proto`.
