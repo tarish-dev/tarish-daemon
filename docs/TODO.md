@@ -9,6 +9,58 @@ did not exist, and the live work was two hundred lines down.
 
 ## Open
 
+### Cancelling needs a pass, and a refusal currently reports as success
+
+Reported from real use 2026-09-05, after PIN entry, wrong-PIN and both-sides cancel were
+otherwise tested and working.
+
+**The bug, and it is one line.** Enter the right PIN, then decline on the RECEIVER, and the
+sender says the file was sent.
+
+`fsm.rs`, the sender's handling of the peer's answer:
+
+    (State::Introduction, Frame::Response(_)) => {
+        // A refusal is a normal answer, not a failure.
+        self.state = State::Done;
+        vec![Effect::Done]
+    }
+
+and `outbound.rs`, deciding what happened:
+
+    return Ok(fsm.state() == State::Done && total > 0);
+
+A refusal lands in `State::Done`, which is also where a completed transfer lands, so the
+two are indistinguishable at the only place that decides. `total` does not help -- it is
+the size of what we OFFERED, not of what went. So `Ok(true)`, `STATUS_OK`, "Sent".
+
+Treating a refusal as a normal ending is right. Reusing the state that means "the files
+went" is what is wrong.
+
+Two ways to fix it, and the second is better:
+
+1. Track in `outbound::send` whether `Effect::BeginSending` was ever handled, and return
+   that instead of a state comparison. Small, local, and leaves the ambiguity in the FSM
+   for the next caller to trip over.
+2. Give the FSM a distinct terminal state -- `State::Refused` -- so "finished, nothing
+   sent" is not spelled the same as "finished, everything sent". The inbound side can use
+   it too, and the existing test
+   `a_refused_send_finishes_rather_than_failing` becomes the test that pins the
+   difference rather than the one that hides it.
+
+**While in there, the rest of cancelling wants checking.** These were not all exercised:
+
+- receiver cancels MID-TRANSFER, after accepting -- does the sender stop promptly, and
+  report cancelled rather than failed or sent?
+- sender cancels mid-transfer -- does the receiver discard the partial file rather than
+  keep a truncated one?
+- either side cancels during the PIN wait, which now has a 120 s window
+- a cancel that arrives while the L2CAP writer is blocked in `wait_for_room` -- the pacing
+  wait checks `closed` but not the transfer's cancel flag, so it may sit there until the
+  ack timeout
+
+Cancel at the PIN prompt is done and reports "Cancelled" correctly; that one is the model
+for how the others should read.
+
 ### Quick Share to a stock Android peer: WORKING, and how
 
 Windows works end to end over RFCOMM. A stock Pixel does not, and the reason is that it
