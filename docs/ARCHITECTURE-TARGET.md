@@ -92,23 +92,65 @@ Java and stay there.
 
 **1. Parsing moves into the app's uid.** Today a parser bug gets uid 7500: `inet`, its own
 directory, and whatever descriptors were handed in. After the move the same bug is in a
-process that can read the files the user selected, drive Bluetooth and BLE, and command
-`barqd`. Rust makes that class of bug much less likely; the blast radius still widens.
+process holding Bluetooth and BLE, the ability to command `barqd`, and the files it
+received.
 
-Getting the isolation back means keeping a protocol process -- which is `barqsharingd`
-again, app-owned rather than init-owned. `android:process` gives a separate process but the
-same uid, so it is not a real boundary. **This is a trade to make deliberately, not by
-omission.**
+**Scoped storage bounds this more than a first reading suggests**, and an earlier draft of
+this document overstated it as "the user's private files". It is not: the app gets its own
+directory, the `Downloads/Barq` entries it created, and per-URI grants for files the person
+picks in the share sheet. Arbitrary user files are not reachable by Android's design.
 
-**2. AirDrop's boundary pins the signing key.** `barqd` exposes a Unix socket, which is
-public API on the app side (`LocalSocket`) and needs no privilege to use. But *which* app
-may command the radio? The workable answer is SELinux: give the app its own domain via
-`seapp_contexts` keyed on package and signature, with the certificate in the image's
-`mac_permissions.xml`.
+So the delta is Bluetooth, BLE, radio control and received files. Real, narrower than
+claimed, and Rust carries the difference. Getting full isolation back means keeping a
+protocol process -- `barqsharingd` again, app-owned rather than init-owned;
+`android:process` gives a separate process but the same uid and so is not a boundary.
+**A trade to make deliberately, not by omission.**
 
-So MDM can install the APK, but only a build signed with the key the image trusts can use
-AirDrop. Quick Share, needing nothing, stays open to any build. A constraint rather than a
-blocker, and arguably correct.
+**2. Who may command the radio.** `barqd` exposes a Unix socket, which is public API on the
+app side (`LocalSocket`) and needs no privilege to use.
+
+An earlier draft justified restricting this by claiming an open socket would let any app
+bypass a VPN. **That was wrong.** Lockdown is enforced in eBPF on the cgroup egress hook
+**by uid**, not by routing -- a fib rule gets traffic onto `mosey0` and the gate still drops
+it. Routing cannot defeat lockdown, so no bypass exists to prevent.
+
+What remains is smaller and still real: AWDL is a radio, and an arbitrary app being able to
+switch it on is a battery and tracking surface. If that is worth gating, SELinux is the
+mechanism -- the app's own domain via `seapp_contexts`, keyed on package and signature, with
+the certificate in the image's `mac_permissions.xml`. The cost is that MDM can install the
+APK but only a build signed with a key the image trusts can drive AWDL. Quick Share, needing
+nothing, stays open to any build.
+
+**Gating is a choice here, not a requirement.** It was presented as one and should not have
+been.
+
+## What this FIXES, which is the part worth leading with
+
+`docs/POLICY.md` records, from measurement, that uid 7500 carries no `LOCKDOWN_VPN_MATCH`
+and is absent from the lockdown map -- as was `nobody` (9999) before the AID existed. So the
+exemption is not the AID's doing. **It is created by the untrusted half being a native
+daemon rather than an app**, which has been true since the first commit.
+
+Stated as that document states it: a person enables "Block connections without VPN",
+believes their device cannot move data off itself outside the tunnel, and Barq can still
+advertise, discover and transfer a file to a device across the room. Local rather than
+internet-facing, but data still leaves on a path the user believes is closed.
+
+**An app uid is >= 10000, carries the lockdown bit, and is subject to the gate.** So the
+target architecture closes that gap for free, and the session model in `POLICY.md` --
+`vpn_lockdown_sessions`, the idle, stall and maximum timers -- becomes unnecessary rather
+than merely unfinished. It exists to remediate a hole this shape does not open.
+
+The trade inverts with it: someone who WANTS Barq working under lockdown then needs a
+deliberate exemption (a device-owner allowlist) instead of getting one silently. Against
+that document's own stated priority -- "stop Barq being the thing that undermines lockdown"
+-- that is the right way round.
+
+Two cautions. `POLICY.md` says the *mechanism* of the 7500 exemption is unexplained after
+three attempts and should be re-measured on an Android bump; do not rely on it either way.
+And discovery is the first thing lockdown takes, because multicast is dropped above the
+system-uid exemption -- so under lockdown an app-uid Barq will not see peers at all, which
+is a visible behaviour change and should be said in the UI rather than looking broken.
 
 **And one consequence worth stating plainly:** listening while backgrounded needs a
 foreground service, so being discoverable costs a visible notification. `barqd`'s own
