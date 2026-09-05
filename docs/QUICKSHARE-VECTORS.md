@@ -88,7 +88,7 @@ against any Windows or Android peer with Quick Share visible to everyone.
 
 ## BLE endpoint advertisements, captured 2026-09-03
 
-Taken on mustang with an unfiltered BLE scan (`persist.barq.ble_debug 1`), in a room with
+Taken on mustang with an unfiltered BLE scan (`persist.tarish.ble_debug 1`), in a room with
 a Windows machine running Quick Share and an Android device actively sharing.
 
 **The headline result is a negative one.** Over several minutes there were **zero**
@@ -119,7 +119,7 @@ The endpoint-info length being exactly 17 across three samples from two devices 
 makes the reading credible: 1 + 2 + 14 is Quick Share's own endpoint-info shape.
 
 Decrypting the device name from the metadata key needs a contact certificate rooted in a
-Google account. Barq has none and wants none, so the field is carried and not
+Google account. Tarish has none and wants none, so the field is carried and not
 interpreted — the name arrives later over the connection, as it does for AirDrop.
 
 For contrast, the idle background advertisements on the same service are 17 bytes and a
@@ -179,8 +179,8 @@ plausible.
 
 **A peer visible to everyone publishes its name in the clear.** The contacts-only form
 does not — the name is inside the encrypted metadata key, which needs a certificate
-rooted in a Google account to read. Barq has none and wants none, so a contacts-only peer
-is reported without a name rather than guessed at. Everyone-mode is the case Barq can
+rooted in a Google account to read. Tarish has none and wants none, so a contacts-only peer
+is reported without a name rather than guessed at. Everyone-mode is the case Tarish can
 use, and it is also the case a person chooses deliberately.
 
 The hash appears twice because the outer frame repeats it. The parser scans for a hash

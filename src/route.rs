@@ -7,9 +7,9 @@
 //! route"; it just looks like the link does not work.
 //!
 //! Done with raw netlink rather than by running `ip`. Exec'ing it would need
-//! `allow barqd system_file:file execute_no_trans`, which lets this daemon run
+//! `allow tarishd system_file:file execute_no_trans`, which lets this daemon run
 //! ANY system binary — far too broad a grant to buy one route. This is also why
-//! barqd's SELinux domain grants no exec at all.
+//! tarishd's SELinux domain grants no exec at all.
 //!
 //! Raw libc rather than the rtnetlink crate on purpose: this process holds
 //! CAP_NET_ADMIN, so its dependency surface is worth keeping small, and
@@ -125,7 +125,7 @@ pub fn add_link_local(iface: &str) -> io::Result<()> {
 /// The one uid allowed to route over the AWDL link.
 ///
 /// Resolved BY NAME rather than hardcoded, because the number already lives in two
-/// places — `config/barq_aid.txt` here and the integrator's Connectivity patch, which
+/// places — `config/tarish_aid.txt` here and the integrator's Connectivity patch, which
 /// has to be kept in step with it. A third copy would be a third thing to forget, and
 /// getting it wrong here fails silently in the safe-looking direction: a rule scoped to
 /// the wrong uid still installs, and only the traffic stops.
@@ -134,12 +134,12 @@ pub fn add_link_local(iface: &str) -> io::Result<()> {
 /// whole point is that nothing else reaches this interface, so a fallback that quietly
 /// opened it up would be worse than no rule at all.
 fn sharing_uid() -> io::Result<u32> {
-    let name = CString::new("system_ext_barq").map_err(|_| io::Error::other("bad uid name"))?;
+    let name = CString::new("system_ext_tarish").map_err(|_| io::Error::other("bad uid name"))?;
     // SAFETY: name is a valid NUL-terminated string, and getpwnam returns a pointer
     // into static storage that we only read synchronously before returning a copy.
     let pw = unsafe { libc::getpwnam(name.as_ptr()) };
     if pw.is_null() {
-        return Err(io::Error::other("system_ext_barq is not a known user"));
+        return Err(io::Error::other("system_ext_tarish is not a known user"));
     }
     // SAFETY: checked non-null above; passwd is plain old data.
     Ok(unsafe { (*pw).pw_uid })

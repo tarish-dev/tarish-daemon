@@ -1,4 +1,4 @@
-# Barq
+# Tarish
 
 **AirDrop and Quick Share on Android, with no Google Play Services — sandboxed or
 otherwise — and no Google account.**
@@ -26,7 +26,7 @@ Play Services is still Google's code running on your device. Plenty of people wh
 GrapheneOS do not want it there in any form, at any privilege level. That is a legitimate
 position and it should not cost you file sharing with the people around you.
 
-Barq needs no Play Services, no Google account, no check-in, and no network path to
+Tarish needs no Play Services, no Google account, no check-in, and no network path to
 Google. It works on a build with zero Google applications installed.
 
 ## What is ours, and what comes from the vendor image
@@ -46,10 +46,10 @@ Being precise about this matters more than the line count, so here is the whole 
 | cpio extraction, the inbox, the consent prompt | **ours** |
 | BLE beacon, share sheet, UI | **ours** |
 
-Both blobs already ship in the vendor image of supported Pixels. Barq does not install
-them, and a phone running Barq has nothing on it that a stock phone does not — they are
+Both blobs already ship in the vendor image of supported Pixels. Tarish does not install
+them, and a phone running Tarish has nothing on it that a stock phone does not — they are
 radio drivers, not Play Services. Replacing them with an open AWDL implementation is
-possible, and is why the FFI is isolated behind a single file, but it is not what Barq
+possible, and is why the FFI is isolated behind a single file, but it is not what Tarish
 does today.
 
 **Quick Share uses no vendor blobs at all.** Every layer is ours:
@@ -83,14 +83,14 @@ applications installed, under SELinux enforcing.** Files go both ways, the peer
 shows a real device name, and an incoming transfer has to be accepted by a person.
 
 ```
-init.svc.barqd        = running     u:r:barqd:s0        user system
-init.svc.barqsharingd = running     u:r:barqsharingd:s0 user system_ext_barq
+init.svc.tarishd        = running     u:r:tarishd:s0        user system
+init.svc.tarishsharingd = running     u:r:tarishsharingd:s0 user system_ext_tarish
 
-barqd:        AWDL session up, handle=0xc00c19599c6bc80, channel=149, country=QA
-barqd:        rule: oif mosey0 lookup 54
-barqsharingd: AirDrop server up as "Pixel 10 Pro XL"
-barqsharingd: advertising as 7249a325a6b8._airdrop._tcp.local
-barqsharingd: peer 4d1a2c9f8e70 at fe80::… is "K-MBProM5"
+tarishd:        AWDL session up, handle=0xc00c19599c6bc80, channel=149, country=QA
+tarishd:        rule: oif mosey0 lookup 54
+tarishsharingd: AirDrop server up as "Pixel 10 Pro XL"
+tarishsharingd: advertising as 7249a325a6b8._airdrop._tcp.local
+tarishsharingd: peer 4d1a2c9f8e70 at fe80::… is "K-MBProM5"
 
 notifications ........ 0
 ```
@@ -109,7 +109,7 @@ notifications ........ 0
 
 ### AWDL and Wi-Fi share one radio
 
-Barq puts AWDL in the **opposite band** from the Wi-Fi association: 2.4 GHz when Wi-Fi
+Tarish puts AWDL in the **opposite band** from the Wi-Fi association: 2.4 GHz when Wi-Fi
 is on 5 GHz and vice versa. The frequency comes from the client through `setActive`,
 because both daemons are native and neither can see the Wi-Fi state.
 
@@ -117,7 +117,7 @@ That is sufficient on **BCM4390** (Pixel 10 Pro XL), where `wondertap` exists,
 `wonder.ko` binds, and AWDL runs on its own wiphy. Verified with both live for 90
 seconds continuously.
 
-It is **not** sufficient on **BCM4383** (Pixel 10), which has no `wondertap`. Barq
+It is **not** sufficient on **BCM4383** (Pixel 10), which has no `wondertap`. Tarish
 falls back to driving `radiotap0`, a monitor interface that takes the physical radio
 with it whatever channel is requested — AWDL works, discovery and transfers work, and
 Wi-Fi drops and does not return until the device reboots.
@@ -134,20 +134,20 @@ Whether this is inherent to the chip or an artefact of hardcoding
 
 ### The radio is held on demand
 
-`barqd` does not hold AWDL from boot any more. An idle session costs **6.5% of a
+`tarishd` does not hold AWDL from boot any more. An idle session costs **6.5% of a
 core continuously** — `libmosey` runs its own threads inside whichever process
-holds the handle — so the session follows `barq.awdl.wanted`, which
-`barqsharingd` sets from *a client is on screen, or a transfer is running, or we
-are advertising*. Released, `barqd` costs 0.05%.
+holds the handle — so the session follows `tarish.awdl.wanted`, which
+`tarishsharingd` sets from *a client is on screen, or a transfer is running, or we
+are advertising*. Released, `tarishd` costs 0.05%.
 
-`barqd` itself is still started once by `init` at boot and never restarted; only
+`tarishd` itself is still started once by `init` at boot and never restarted; only
 the session comes and goes. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for
 why it is a property and not `ctl.start` or binder.
 
 ### Quick Share
 
 The second protocol, for Android and Windows peers, is in progress. The **protocol is
-complete and tested** — `libbarq_protocol` is 6,600 lines of Rust with 157 tests,
+complete and tested** — `libtarish_protocol` is 6,600 lines of Rust with 157 tests,
 including one that runs a whole share between two peers in a single process: UKEY2
 handshake, key derivation, encrypted channel, introduction, acceptance, and a file in
 chunks, reassembled and compared byte for byte.
@@ -161,21 +161,21 @@ case, and the Wi-Fi Direct half of the no-network case. See
 
 ## Clients
 
-The daemon owns the client contract, in `aidl/dev/barq/`:
+The daemon owns the client contract, in `aidl/dev/tarish/`:
 
 ```
-IBarqService.aidl    getStatus, setDiscoverable, setActive, getPeers, sendFiles,
+ITarishService.aidl    getStatus, setDiscoverable, setActive, getPeers, sendFiles,
                      respondToOffer, cancelTransfer, getReceivedFiles,
                      openReceivedFile, deleteReceivedFile,
                      register/unregisterCallback, refreshPeers,
                      setPolicy, getPolicy, setDeviceName, getDeviceName,
                      reportBlePeer
-IBarqCallback.aidl   onPeerFound/Lost, onTransferOffered/Progress/Finished
+ITarishCallback.aidl   onPeerFound/Lost, onTransferOffered/Progress/Finished
 ```
 
 It lives here rather than in the client because the daemon is the server: it
-defines the protocol and a client is written against it. [Barq
-app](https://github.com/bodaay/barq-app) consumes these files directly instead of
+defines the protocol and a client is written against it. [Tarish
+app](https://github.com/tarish-dev/tarish-app) consumes these files directly instead of
 keeping its own copy,
 so the two cannot drift apart silently.
 
@@ -192,11 +192,11 @@ Two rules the contract encodes deliberately:
 ## How it works
 
 ```
-app  --binder-->  barqsharingd  --property-->  barqd  --dlopen-->  libmosey
-     setActive()                 barq.awdl.wanted
+app  --binder-->  tarishsharingd  --property-->  tarishd  --dlopen-->  libmosey
+     setActive()                 tarish.awdl.wanted
 
-init  --(sys.boot_completed)-->  barqd        (once, and never restarted)
-                                   |  wait for barq.awdl.wanted
+init  --(sys.boot_completed)-->  tarishd        (once, and never restarted)
+                                   |  wait for tarish.awdl.wanted
                                    |
                                    |  on 1:  mosey_start_5(channels, country, config, ...)
                                    |             -> wonder.ko over nl80211
@@ -208,8 +208,8 @@ init  --(sys.boot_completed)-->  barqd        (once, and never restarted)
                                    |
                                    +-- SIGTERM --> mosey_stop(handle)
 
-init  --(sys.boot_completed)-->  barqsharingd (no capabilities)
-                                   |  publish dev.barq.IBarqService
+init  --(sys.boot_completed)-->  tarishsharingd (no capabilities)
+                                   |  publish dev.tarish.ITarishService
                                    |  mDNS browse/advertise on mosey0
                                    |  TLS listener on [fe80::…%mosey0]:8770
                                    +  rebind both whenever mosey0 is replaced
@@ -218,7 +218,7 @@ init  --(sys.boot_completed)-->  barqsharingd (no capabilities)
 Two details that are not obvious and cost real time to find:
 
 **The session lives exactly as long as the process holding the handle.** Exit and
-`mosey0` disappears. `barqd` therefore does nothing but hold it — which is also
+`mosey0` disappears. `tarishd` therefore does nothing but hold it — which is also
 why the client app must never be the holder.
 
 **It can be stopped and started again in one process.** `mosey_start_5` after
@@ -233,58 +233,58 @@ socket bound to an address that no longer exists never returns *and never errors
 
 **An address is not enough.** Android routes by fwmark and gives a new interface
 its own routing table, which starts *empty* — `connect()` returns
-`ENETUNREACH` despite a valid address and a reachable neighbour. `barqd` adds the
+`ENETUNREACH` despite a valid address and a reachable neighbour. `tarishd` adds the
 link-local route itself, over netlink rather than by running `ip`, so the daemon
 never needs permission to execute anything.
 
 ## Layout
 
 ```
-src/main.rs              barqd — the privileged half: session lifecycle, routing
+src/main.rs              tarishd — the privileged half: session lifecycle, routing
 src/mosey.rs             the vendor FFI, isolated to one file
 src/route.rs             netlink: the link-local route and the fib rule
-sharingd/src/            barqsharingd — mDNS, TLS, HTTP, plist, cpio, transfers
-aidl/dev/barq/           the client contract (AIDL)
-init/barq.rc             init service: user system, group system inet, NET_ADMIN NET_RAW
+sharingd/src/            tarishsharingd — mDNS, TLS, HTTP, plist, cpio, transfers
+aidl/dev/tarish/           the client contract (AIDL)
+init/tarish.rc             init service: user system, group system inet, NET_ADMIN NET_RAW
 Android.bp               rust_binary x2, system_ext
-sepolicy/barqd.te        SELinux domain, privileged half
-sepolicy/barqsharingd.te SELinux domain, no capabilities
-sepolicy/barq.te         types shared between the two
+sepolicy/tarishd.te        SELinux domain, privileged half
+sepolicy/tarishsharingd.te SELinux domain, no capabilities
+sepolicy/tarish.te         types shared between the two
 sepolicy/file_contexts   labels both binaries
 sepolicy/service_contexts labels the binder service name
-sepolicy/property_contexts labels barq.awdl.wanted
+sepolicy/property_contexts labels tarish.awdl.wanted
 docs/ARCHITECTURE.md     the two-process split and the Rust decision
-docs/MOSEY-FFI.md        the vendor ABI barqd calls, and how it was recovered
+docs/MOSEY-FFI.md        the vendor ABI tarishd calls, and how it was recovered
 docs/INTEGRATING.md      what a platform must provide, and the traps
 ```
 
 ## Building
 
-Barq is built by the platform build, not standalone — it is a system daemon and
+Tarish is built by the platform build, not standalone — it is a system daemon and
 wants the platform toolchain, labelling and signing. Drop it into an AOSP-derived
 tree and add it to a product:
 
 ```make
-PRODUCT_PACKAGES += barqd barqsharingd
+PRODUCT_PACKAGES += tarishd tarishsharingd
 ```
 
 then install `sepolicy/` into the tree's private policy. The GrapheneOS buildfarm
-does this with `scripts/gos-barq.sh`.
+does this with `scripts/gos-tarish.sh`.
 
 All of `sepolicy/` must be installed, not just the `.te` files — `file_contexts`
 labels the executables, `service_contexts` labels the binder service name, and
-`property_contexts` labels `barq.awdl.wanted`. Each missing one fails differently
-and none of them fails loudly. In particular, `sepolicy/barqd.te` must be
+`property_contexts` labels `tarish.awdl.wanted`. Each missing one fails differently
+and none of them fails loudly. In particular, `sepolicy/tarishd.te` must be
 installed **with** `sepolicy/file_contexts`. Without
 the label the domain exists but nothing ever runs in it — the build succeeds,
-policy contains `barqd`, and `init` silently runs the daemon in its own domain
+policy contains `tarishd`, and `init` silently runs the daemon in its own domain
 instead. That failure looks correct from every angle except the one that matters.
 
 ## Requirements
 
-- `libmosey_daemon_ffi.so` present and loadable. barqd tries the plain soname
-  first, then the usual paths, and honours `BARQ_MOSEY_LIB` as an override.
-  **Shipping and pinning that library is the integrator's job** — barqd is
+- `libmosey_daemon_ffi.so` present and loadable. tarishd tries the plain soname
+  first, then the usual paths, and honours `TARISH_MOSEY_LIB` as an override.
+  **Shipping and pinning that library is the integrator's job** — tarishd is
   distribution-agnostic and only requires that one is there.
 - `wonder.ko` bound to the Wi-Fi driver. On Pixel 10 that is every model except
   the 10a (`bcmdhd4383` has no `wondertap` support).
@@ -297,11 +297,11 @@ the policy costs a build cycle each time.
 
 ## Name
 
-بَرْق — *barq*, Arabic for lightning; historically the word for telegraph.
+بَرْق — *tarish*, Arabic for lightning; historically the word for telegraph.
 
 ## Running it on GrapheneOS
 
-Barq is built to be integrated into an OS image, not sideloaded: it is two `init`
+Tarish is built to be integrated into an OS image, not sideloaded: it is two `init`
 services with their own SELinux domains and a dedicated AID, none of which an APK can
 give itself. [docs/GRAPHENEOS.md](docs/GRAPHENEOS.md) is the full procedure — what to
 copy, what to wire into the build, the one framework patch that is required and why, and
@@ -313,7 +313,7 @@ GrapheneOS-specific. The same steps apply to AOSP or to any build you control.
 ## Credits
 
 **[Bada](https://github.com/kyujin-cho/Bada)** is a working Quick Share implementation
-for Android, in Kotlin, under Apache 2.0. `libbarq_protocol` is a Rust port of the
+for Android, in Kotlin, under Apache 2.0. `libtarish_protocol` is a Rust port of the
 protocol layers of its `core-protocol` module. The code here is rewritten — different
 language, different process model — but the protocol knowledge is Bada's, and several
 constants in this implementation exist because Bada found them first and wrote down why

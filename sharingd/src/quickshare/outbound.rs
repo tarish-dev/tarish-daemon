@@ -29,13 +29,13 @@
 //! is how it was verified before ever meeting a real peer.
 
 use crate::quickshare::connection::{bad, chan, wrap_bytes, write_frame, Frames};
-use barq_protocol::channel::SecureChannel;
-use barq_protocol::d2d::{self, Role};
-use barq_protocol::frames::{self, Frame as OfflineFrame, PayloadChunk, PayloadHeader, PayloadType};
-use barq_protocol::fsm::{Effect, Event, Outbound};
-use barq_protocol::payload::{Assembler, Event as PayloadEvent};
-use barq_protocol::sharing::{FileMetadata, FileType, Introduction};
-use barq_protocol::ukey2::handshake::ClientHandshake;
+use tarish_protocol::channel::SecureChannel;
+use tarish_protocol::d2d::{self, Role};
+use tarish_protocol::frames::{self, Frame as OfflineFrame, PayloadChunk, PayloadHeader, PayloadType};
+use tarish_protocol::fsm::{Effect, Event, Outbound};
+use tarish_protocol::payload::{Assembler, Event as PayloadEvent};
+use tarish_protocol::sharing::{FileMetadata, FileType, Introduction};
+use tarish_protocol::ukey2::handshake::ClientHandshake;
 use log::{debug, info, warn};
 use std::io::{self, Read, Write};
 
@@ -191,10 +191,10 @@ where
         &result.server_init_msg,
     )
     .map_err(|_| bad("could not derive session keys"))?;
-    // The whole auth string, through the real derivation -- see `barq_protocol::pin`.
+    // The whole auth string, through the real derivation -- see `tarish_protocol::pin`.
     // This was the first two bytes as a big-endian u16 mod 10000, which produces a
     // four-digit number that is stable and session-specific and simply not the peer's.
-    let session_pin = barq_protocol::pin::derive(&secrets.auth_string);
+    let session_pin = tarish_protocol::pin::derive(&secrets.auth_string);
     // Deliberately not logged. `logcat` is readable by anything with the log group on a
     // userdebug build, and a PIN sitting in a log is a PIN nobody had to read off the
     // other device.
@@ -279,7 +279,7 @@ where
                     finish_cleanly(&mut out, &mut channel, peer_safe_disconnect)?;
                     // Done covers both "sent everything" and "they said no". Which one
                     // it was is the state, not the effect.
-                    return Ok(fsm.state() == barq_protocol::fsm::State::Done && total > 0);
+                    return Ok(fsm.state() == tarish_protocol::fsm::State::Done && total > 0);
                 }
                 Effect::Cancelled => {
                     warn!("quickshare: cancelled");
@@ -330,7 +330,7 @@ where
                 // up. The exact mirror of the send-side bug, on the same payload shape.
                 match assembler.accept(&pt).map_err(|e| bad(e.to_string()))? {
                     PayloadEvent::Bytes { data, .. } => {
-                        let frame = barq_protocol::sharing::parse(&data)
+                        let frame = tarish_protocol::sharing::parse(&data)
                             .map_err(|e| bad(format!("sharing frame: {e}")))?;
                         pending.extend(fsm.on(Event::Frame(frame)));
                     }
@@ -370,8 +370,8 @@ where
                 // payload on the medium we are already on, which is what we want until
                 // there is an upgrade implementation to adopt with.
                 debug!("quickshare: declining a bandwidth upgrade we cannot take");
-                let _ = barq_protocol::upgrade::parse(&body); // logged shape only
-                let decline = frames::bandwidth_upgrade(&barq_protocol::upgrade::failure());
+                let _ = tarish_protocol::upgrade::parse(&body); // logged shape only
+                let decline = frames::bandwidth_upgrade(&tarish_protocol::upgrade::failure());
                 write_frame(&mut out, &channel.encrypt(&decline).map_err(chan)?)?;
             }
             other => debug!("quickshare: ignoring {other:?}"),

@@ -2,13 +2,13 @@
 
 Third-party Rust crates copied here **unmodified** from crates.io.
 
-## Why inside Barq rather than external/rust/
+## Why inside Tarish rather than external/rust/
 
-Barq is meant to build outside the GrapheneOS tree — on LineageOS, or plain AOSP, as
+Tarish is meant to build outside the GrapheneOS tree — on LineageOS, or plain AOSP, as
 though someone else wrote it. A dependency placed in `external/rust/` would make that
 untrue: every consumer would have to know to put our dependencies there first.
 
-`gos-barq.sh` copies this whole checkout into `vendor/barq/`, so anything here comes
+`gos-tarish.sh` copies this whole checkout into `vendor/tarish/`, so anything here comes
 along on its own with no change on the consumer side.
 
 The one deliberate exception to vendoring is **`libmosey_daemon_ffi.so`**, which is
@@ -18,7 +18,7 @@ phone.
 
 ## Module naming
 
-Soong module names carry a `_barq` suffix so they cannot collide if AOSP later carries
+Soong module names carry a `_tarish` suffix so they cannot collide if AOSP later carries
 the same crate. `crate_name` stays the real name, so import paths are unchanged and the
 sources need no edits.
 

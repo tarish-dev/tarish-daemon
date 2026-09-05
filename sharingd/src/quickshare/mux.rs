@@ -18,7 +18,7 @@
 //!
 //! **There is no multiplex layer here, and that cost a night.** Nearby has one -- a
 //! virtual socket with its own CONNECTION_REQUEST, implemented in
-//! `barq_protocol::multiplex` -- and a stock Pixel does not use it. Its own log says so:
+//! `tarish_protocol::multiplex` -- and a stock Pixel does not use it. Its own log says so:
 //!
 //! ```text
 //!   onIncomingConnection(BLE) mode: LEGACY ... failed to initialize the connection
@@ -35,7 +35,7 @@
 //! refuses RFCOMM; a peer advertising none accepts it. The app opens whichever socket the
 //! advertisement asked for and says which it opened.
 
-use barq_protocol::multiplex::SERVICE_ID_HASH_LEN;
+use tarish_protocol::multiplex::SERVICE_ID_HASH_LEN;
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Condvar, Mutex};
@@ -154,13 +154,13 @@ pub struct MuxWriter<W: Write> {
 
 /// Tell the peer how much of its data we took.
 fn packet_acknowledgement(received: usize) -> Vec<u8> {
-    let hash = barq_protocol::service::service_id_hash();
+    let hash = tarish_protocol::service::service_id_hash();
 
-    let mut ack = barq_protocol::protobuf::Writer::new();
+    let mut ack = tarish_protocol::protobuf::Writer::new();
     ack.bytes(ACK_SERVICE_ID_HASH, &hash)
         .varint(ACK_RECEIVED_SIZE, received as u64);
 
-    let mut frame = barq_protocol::protobuf::Writer::new();
+    let mut frame = tarish_protocol::protobuf::Writer::new();
     frame
         .varint(SCF_TYPE, CONTROL_TYPE_PACKET_ACKNOWLEDGEMENT)
         .bytes(SCF_PACKET_ACKNOWLEDGEMENT, &ack.finish());
@@ -176,14 +176,14 @@ fn packet_acknowledgement(received: usize) -> Vec<u8> {
 /// Without it the data connection opens, the peer answers 23, and then it ignores every
 /// packet that follows and closes the channel about twenty seconds later.
 fn introduction_packet() -> Vec<u8> {
-    let hash = barq_protocol::service::service_id_hash();
+    let hash = tarish_protocol::service::service_id_hash();
 
-    let mut intro = barq_protocol::protobuf::Writer::new();
+    let mut intro = tarish_protocol::protobuf::Writer::new();
     intro
         .bytes(INTRO_SERVICE_ID_HASH, &hash)
         .varint(INTRO_SOCKET_VERSION, SOCKET_VERSION_V2);
 
-    let mut frame = barq_protocol::protobuf::Writer::new();
+    let mut frame = tarish_protocol::protobuf::Writer::new();
     frame
         .varint(SCF_TYPE, CONTROL_TYPE_INTRODUCTION)
         .bytes(SCF_INTRODUCTION, &intro.finish());
@@ -195,7 +195,7 @@ fn introduction_packet() -> Vec<u8> {
 
 /// Wrap payload bytes as a data packet for this service.
 fn data_packet(payload: &[u8]) -> Vec<u8> {
-    let mut out = barq_protocol::service::service_id_hash().to_vec();
+    let mut out = tarish_protocol::service::service_id_hash().to_vec();
     // `payload` is already part of a length-prefixed OfflineFrame stream. Framing it
     // again would put two lengths in front of one frame.
     out.extend_from_slice(payload);
@@ -221,7 +221,7 @@ where
     // 1. the data connection, naming the service.
     let mut request = Vec::with_capacity(1 + SERVICE_ID_HASH_LEN);
     request.push(COMMAND_REQUEST_DATA_CONNECTION);
-    request.extend_from_slice(&barq_protocol::service::service_id_hash());
+    request.extend_from_slice(&tarish_protocol::service::service_id_hash());
     write_frame(&mut write, &request)?;
 
     let ready = frames.next()?;
@@ -254,7 +254,7 @@ where
     });
     let pump_shared = Arc::clone(&shared);
     std::thread::Builder::new()
-        .name("barq-qs-l2cap".into())
+        .name("tarish-qs-l2cap".into())
         .spawn(move || pump(frames, ack, pump_shared))?;
 
     Ok((
@@ -285,17 +285,17 @@ fn pump<R: Read, A: Write>(mut frames: Frames<R>, mut ack: A, shared: Arc<Shared
         let (prefix, payload) = packet.split_at(SERVICE_ID_HASH_LEN);
 
         if prefix == CONTROL_PREFIX {
-            let kind = barq_protocol::protobuf::first_varint(payload, SCF_TYPE)
+            let kind = tarish_protocol::protobuf::first_varint(payload, SCF_TYPE)
                 .ok()
                 .flatten();
             if kind == Some(CONTROL_TYPE_PACKET_ACKNOWLEDGEMENT) {
                 // How much of what WE sent the peer has taken. The pacing in `write`
                 // waits on this and nothing else.
                 if let Ok(Some(a)) =
-                    barq_protocol::protobuf::first_bytes(payload, SCF_PACKET_ACKNOWLEDGEMENT)
+                    tarish_protocol::protobuf::first_bytes(payload, SCF_PACKET_ACKNOWLEDGEMENT)
                 {
                     if let Ok(Some(size)) =
-                        barq_protocol::protobuf::first_varint(a, ACK_RECEIVED_SIZE)
+                        tarish_protocol::protobuf::first_varint(a, ACK_RECEIVED_SIZE)
                     {
                         if let Ok(mut st) = shared.state.lock() {
                             // AN INCREMENT, not a total. Each acknowledgement reports the
@@ -322,7 +322,7 @@ fn pump<R: Read, A: Write>(mut frames: Frames<R>, mut ack: A, shared: Arc<Shared
             }
             continue;
         }
-        if prefix != barq_protocol::service::service_id_hash() {
+        if prefix != tarish_protocol::service::service_id_hash() {
             log::debug!("quickshare: L2CAP packet for another service, ignored");
             continue;
         }

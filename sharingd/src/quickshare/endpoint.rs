@@ -2,7 +2,7 @@
 //! that carries a device's name and type.
 //!
 //! Written from the protocol rather than from Bada's source. Bada is unlicensed --
-//! see barq-app/docs/CREDITS.md -- so it is read here as a specification, the same
+//! see tarish-app/docs/CREDITS.md -- so it is read here as a specification, the same
 //! way OpenDrop was read for AirDrop. The constants below are protocol facts: byte
 //! offsets, bit positions and a hash prefix, none of which are anyone's expression.
 

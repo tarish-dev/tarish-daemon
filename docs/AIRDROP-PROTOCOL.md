@@ -2,9 +2,9 @@
 
 ## Status
 
-Not implemented in Barq. **Already solved in GoOpenDrop**, whose server and client both
+Not implemented in Tarish. **Already solved in GoOpenDrop**, whose server and client both
 implement the full exchange against real Apple devices. What follows is what that
-establishes, so Barq implements from a working description instead of rediscovering it.
+establishes, so Tarish implements from a working description instead of rediscovering it.
 
 Reimplemented, not reused, at the author's request — see [CREDITS](CREDITS.md) in the
 app repo. The value taken is the description.
@@ -18,7 +18,7 @@ HTTPS on the **AWDL interface's IPv6 link-local address, with the scope ID**:
 ```
 
 Binding to the scoped address matters. A link-local address is ambiguous without its
-interface, and the port must be the one the SRV record advertises. Barq currently
+interface, and the port must be the one the SRV record advertises. Tarish currently
 advertises `8770` with **nothing bound to it**, which is why no peer could ever list us
 regardless of discovery.
 
@@ -30,7 +30,7 @@ it supports everyone-mode with **no Apple credentials at all**. GoOpenDrop's wor
 configuration used an *extracted* certificate, key and validation record, so on its own it
 could not tell us whether everyone-mode works without them. OpenDrop can, and does.
 
-| | opendrop | Barq |
+| | opendrop | Tarish |
 |---|---|---|
 | server certificate | self-signed, 2048-bit RSA, 365 days | same |
 | client certificate | `ssl.CERT_NONE` — *"we accept self-signed certificates as does Apple"* | none |
@@ -51,7 +51,7 @@ This looks redundant and is not. Closing a socket while unread data sits in the 
 buffer makes the kernel send **RST rather than FIN**; the client treats that as a failed
 exchange, discards whatever we wrote, and retries immediately.
 
-Barq's first listener replied and closed without reading, and the symptom was a Mac
+Tarish's first listener replied and closed without reading, and the symptom was a Mac
 posting `/Discover` **8035 times** in roughly forty minutes -- about three per second,
 which is retry-storm behaviour rather than polling. The response body was correct the
 whole time and never got read.
@@ -147,7 +147,7 @@ values and both interoperate, so this is a capability bitmap and not a magic con
 which is worth knowing, because it means a wrong value degrades features rather than
 breaking discovery outright.
 
-Barq sends `489` because that is what was measured from a working Android
+Tarish sends `489` because that is what was measured from a working Android
 implementation on the same hardware. The remaining bits are not decoded here and are
 not guessed at.
 
@@ -184,7 +184,7 @@ cheap first milestone.
 The uploaded bundle is a **cpio archive**, so a cpio reader is required to receive and a
 writer to send. GoOpenDrop implements both in `awdl/cpio/`.
 
-## What this means for Barq's order of work
+## What this means for Tarish's order of work
 
 1. Bind TLS on the advertised port with a self-signed certificate
 2. `HEAD /` and a fixed `/Discover` response — enough to be listed

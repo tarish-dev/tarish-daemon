@@ -1,8 +1,8 @@
-# barqd — Barq AWDL transport daemon.
+# tarishd — Tarish AWDL transport daemon.
 #
 # Derived from Google's own mosey_server policy, read out of
 # vendor/google_devices/<device>/sepolicy/system_ext/private/sepolicy_ext.cil.
-# That is the right template because barqd does the same job through the same
+# That is the right template because tarishd does the same job through the same
 # library, so its access needs are the same set.
 #
 # What each rule is actually for, since "copied from Google" is not a reason:
@@ -14,16 +14,16 @@
 #   tun_device/tun_socket mosey0 is a TUN interface libmosey creates
 #   sysfs_net             reading interface state
 #
-# NOT copied from Google: binder, service_manager, dumpstate. barqd publishes no
+# NOT copied from Google: binder, service_manager, dumpstate. tarishd publishes no
 # binder service yet, and granting access we do not use is how a domain quietly
 # becomes as privileged as the thing it replaced.
 
-type barqd, domain, coredomain;
-type barqd_exec, file_type, exec_type, system_file_type;
+type tarishd, domain, coredomain;
+type tarishd_exec, file_type, exec_type, system_file_type;
 
-init_daemon_domain(barqd)
+init_daemon_domain(tarishd)
 
-allow barqd self:capability { net_admin net_raw };
+allow tarishd self:capability { net_admin net_raw };
 
 # nl80211 to wonder.ko, and the route/neighbour work libmosey does itself.
 # These sets are Google's, verbatim from mosey_server's rules in the device's own
@@ -36,14 +36,14 @@ allow barqd self:capability { net_admin net_raw };
 # Each omission costs a full build-and-flash cycle to discover, and the reference
 # implementation does the same work through the same library, so its set is the
 # evidence. Trimming is only worth doing with a denial log proving a rule unused.
-allow barqd self:netlink_generic_socket { ioctl read write create getattr setattr lock append map bind connect getopt setopt shutdown };
-allow barqd self:netlink_route_socket { read write create nlmsg_read nlmsg_write nlmsg_readpriv nlmsg_getneigh };
-allow barqd self:packet_socket { ioctl read write create getattr setattr lock append map bind connect listen accept getopt setopt shutdown };
-allow barqd self:netlink_netfilter_socket create;
-allow barqd self:udp_socket { create ioctl };
-allow barqd self:unix_dgram_socket { ioctl };
-allow barqd self:tun_socket create;
-allow barqd tun_device:chr_file { ioctl read write getattr lock append map open watch watch_reads };
+allow tarishd self:netlink_generic_socket { ioctl read write create getattr setattr lock append map bind connect getopt setopt shutdown };
+allow tarishd self:netlink_route_socket { read write create nlmsg_read nlmsg_write nlmsg_readpriv nlmsg_getneigh };
+allow tarishd self:packet_socket { ioctl read write create getattr setattr lock append map bind connect listen accept getopt setopt shutdown };
+allow tarishd self:netlink_netfilter_socket create;
+allow tarishd self:udp_socket { create ioctl };
+allow tarishd self:unix_dgram_socket { ioctl };
+allow tarishd self:tun_socket create;
+allow tarishd tun_device:chr_file { ioctl read write getattr lock append map open watch watch_reads };
 
 # IOCTL COMMAND WHITELISTING. Granting `ioctl` on a class is not enough on
 # Android: the specific command numbers must also be allowed with allowxperm, or
@@ -56,37 +56,37 @@ allow barqd tun_device:chr_file { ioctl read write getattr lock append map open 
 # 0x54ca is TUNSETIFF, i.e. creating mosey0 itself. The rest are the standard
 # interface ioctls: 0x8913 SIOCGIFFLAGS, 0x8914 SIOCSIFFLAGS, 0x8946 SIOCETHTOOL,
 # 0x8994 SIOCGIFNAME. Sets are Google's verbatim, for the same reason as above.
-allowxperm barqd tun_device:chr_file ioctl { 0x54ca 0x54d2 };
-allowxperm barqd self:packet_socket ioctl { 0x8913 0x8927 0x8933 };
+allowxperm tarishd tun_device:chr_file ioctl { 0x54ca 0x54d2 };
+allowxperm tarishd self:packet_socket ioctl { 0x8913 0x8927 0x8933 };
 # 0x8910 is SIOCGIFNAME; seen denied on the first run that actually got this far.
-allowxperm barqd self:netlink_generic_socket ioctl { 0x8910 0x8946 };
-allowxperm barqd self:udp_socket ioctl { 0x8913-0x8914 0x8916 0x8922 0x8924 0x8936 0x8946 0x8994 0x89f1 };
-allowxperm barqd self:unix_dgram_socket ioctl { 0x8913-0x8914 0x8946 0x8994 };
+allowxperm tarishd self:netlink_generic_socket ioctl { 0x8910 0x8946 };
+allowxperm tarishd self:udp_socket ioctl { 0x8913-0x8914 0x8916 0x8922 0x8924 0x8936 0x8946 0x8994 0x89f1 };
+allowxperm tarishd self:unix_dgram_socket ioctl { 0x8913-0x8914 0x8946 0x8994 };
 
 # Reading the regulatory country from the platform's own properties.
 #
-# NOT cosmetic. Denied, barqd falls back to the world domain "00", which the
+# NOT cosmetic. Denied, tarishd falls back to the world domain "00", which the
 # vendor library accepts and then fails to bring the radio up on -- channel 149
 # is not permitted there. The symptom is mosey_start_5 returning NULL after the
 # vendor commands have already been logged, which looks like a transport fault
 # rather than a missing property read.
-get_prop(barqd, wifi_config_prop)
-get_prop(barqd, vendor_default_prop)
+get_prop(tarishd, wifi_config_prop)
+get_prop(tarishd, vendor_default_prop)
 # The SIM's country, which is where it comes from on a phone that has never joined
 # a Wi-Fi network. Both gsm.operator.iso-country and gsm.sim.operator.iso-country
 # carry telephony_status_prop. Without this the daemon reads nothing, decides there
 # is no regulatory domain, and refuses to bring the radio up on a device where the
 # platform reports "Wifi Country Code = QA" and lists channel 149 as permitted.
-get_prop(barqd, telephony_status_prop)
+get_prop(tarishd, telephony_status_prop)
 
-# The radio is held only while something wants it, and this is how barqd is told.
-# Read-only on purpose: barqd never writes it, so a bug here cannot make the
+# The radio is held only while something wants it, and this is how tarishd is told.
+# Read-only on purpose: tarishd never writes it, so a bug here cannot make the
 # privileged daemon assert a state the unprivileged one did not ask for.
-get_prop(barqd, barq_awdl_prop)
+get_prop(tarishd, tarish_awdl_prop)
 
-allow barqd sysfs_net:dir search;
-allow barqd sysfs_net:file r_file_perms;
-allow barqd sysfs_net:lnk_file r_file_perms;
+allow tarishd sysfs_net:dir search;
+allow tarishd sysfs_net:file r_file_perms;
+allow tarishd sysfs_net:lnk_file r_file_perms;
 
 # No exec rule. The link-local route is added over netlink (RTM_NEWROUTE) rather
 # than by running `ip`, precisely so this domain never needs to execute anything.

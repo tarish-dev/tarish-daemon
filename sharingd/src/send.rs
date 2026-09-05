@@ -187,7 +187,7 @@ fn connect(target: &Target) -> io::Result<SslStream<TcpStream>> {
         .verify_hostname(false);
 
     config
-        .connect("barq", tcp)
+        .connect("tarish", tcp)
         .map_err(|e| io::Error::other(format!("TLS handshake: {e}")))
 }
 

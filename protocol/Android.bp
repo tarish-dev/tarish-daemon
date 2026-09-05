@@ -1,11 +1,11 @@
-// libbarq_protocol — the Quick Share / Nearby Connections protocol, on its own.
+// libtarish_protocol — the Quick Share / Nearby Connections protocol, on its own.
 //
 // WHY A SEPARATE CRATE
 //
 // This is deliberately free of Android: no binder, no android_logger, no libc. That
 // buys two things.
 //
-// It can be TESTED WITHOUT A DEVICE. barqsharingd pulls in binder and the Android
+// It can be TESTED WITHOUT A DEVICE. tarishsharingd pulls in binder and the Android
 // logger, so anything living inside it can only be exercised on hardware. The crypto
 // here is exactly the code where that would hurt most: a wrong key derivation does
 // not crash, it surfaces three layers up as "the peer rejected us" with nothing
@@ -22,21 +22,21 @@
 //
 // It was declared rust_library_rlib first, on the reasoning that static linkage leaves
 // no separate .so to install or keep in step. Soong emitted a correct-looking
-// `--extern barq_protocol=<path>` to a valid rlib and rustc still reported "can't find
+// `--extern tarish_protocol=<path>` to a valid rlib and rustc still reported "can't find
 // crate", and the linkage variant was not worth more time than it had already taken.
-// Every other dependency here -- binder, openssl, cpio_archive, dev.barq -- is a dylib
+// Every other dependency here -- binder, openssl, cpio_archive, dev.tarish -- is a dylib
 // and links without argument, so this matches them.
 //
 // The staleness that shape invites is real and has already cost this project days
 // -- a device once kept answering against an AIDL library eight days old, reporting
 // UNKNOWN_TRANSACTION for every method added since while every older one worked. It is
 // handled where it belongs, in the deploy step: whatever ships this daemon must carry
-// every Barq library and verify each against the build. That is a better answer than
+// every Tarish library and verify each against the build. That is a better answer than
 // picking a link mode to dodge the problem.
 
 rust_library {
-    name: "libbarq_protocol",
-    crate_name: "barq_protocol",
+    name: "libtarish_protocol",
+    crate_name: "tarish_protocol",
     srcs: ["src/lib.rs"],
     edition: "2021",
     rustlibs: [
@@ -52,7 +52,7 @@ rust_library {
 // bootstrap failure that has nothing to do with your change:
 //
 //     source build/envsetup.sh && lunch <device>-cur-userdebug
-//     m barq_protocol_test
+//     m tarish_protocol_test
 //
 // Then run it. LD_LIBRARY_PATH is REQUIRED: the binary links host BoringSSL and
 // without it fails with
@@ -61,11 +61,11 @@ rust_library {
 //
 //     O=$(readlink -f $OUT_DIR)
 //     export LD_LIBRARY_PATH=$O/host/linux-x86/lib64:$O/host/linux-x86/lib
-//     $O/host/linux-x86/nativetest64/barq_protocol_test/barq_protocol_test
+//     $O/host/linux-x86/nativetest64/tarish_protocol_test/tarish_protocol_test
 //
 rust_test_host {
-    name: "barq_protocol_test",
-    crate_name: "barq_protocol",
+    name: "tarish_protocol_test",
+    crate_name: "tarish_protocol",
     srcs: ["src/lib.rs"],
     edition: "2021",
     rustlibs: [

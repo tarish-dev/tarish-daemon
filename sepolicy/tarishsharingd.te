@@ -1,22 +1,22 @@
-# barqsharingd — the unprivileged half of Barq.
+# tarishsharingd — the unprivileged half of Tarish.
 #
 # This domain deliberately has NO capabilities. Everything that parses input
 # from another device runs here, so the rule of thumb is: if a permission is
 # only needed to reconfigure the network or touch the radio, it belongs to
-# barqd, not to this domain. Compare barqd.te — it holds NET_ADMIN and NET_RAW
+# tarishd, not to this domain. Compare tarishd.te — it holds NET_ADMIN and NET_RAW
 # and parses nothing.
 #
 # Network access comes from group membership (`inet`) plus net_domain(), not
 # from a capability. That is the whole point: this process can talk to a peer
 # and can do nothing else.
 
-type barqsharingd, domain, coredomain;
-type barqsharingd_exec, file_type, exec_type, system_file_type;
+type tarishsharingd, domain, coredomain;
+type tarishsharingd_exec, file_type, exec_type, system_file_type;
 
 # The binder service the client app binds.
-type barq_service, service_manager_type;
+type tarish_service, service_manager_type;
 
-init_daemon_domain(barqsharingd)
+init_daemon_domain(tarishsharingd)
 
 # Ordinary sockets: TCP/UDP for the transfer, and the standard network access
 # an unprivileged networked daemon gets.
@@ -25,43 +25,43 @@ init_daemon_domain(barqsharingd)
 # tcp_socket and node_bind on the link-local address. No rule is added here
 # speculatively: if a denial shows up, it gets derived from the real AVC with
 # gos-selinux.sh rather than guessed at in advance.
-net_domain(barqsharingd)
+net_domain(tarishsharingd)
 
-# Publish IBarqService, and talk binder to the clients that bind it.
-binder_use(barqsharingd)
-add_service(barqsharingd, barq_service)
+# Publish ITarishService, and talk binder to the clients that bind it.
+binder_use(tarishsharingd)
+add_service(tarishsharingd, tarish_service)
 
-# The Barq app is a system app, so it lands in the system_app domain. Publishing the
+# The Tarish app is a system app, so it lands in the system_app domain. Publishing the
 # service is not enough on its own: a client also needs `call` on this domain and
 # `find` on the service name, and without them binder fails with a bare "remote
 # transaction failed" that says nothing about SELinux.
 #
 # binder_call both ways, because the daemon calls BACK into the app through
-# IBarqCallback to say files have arrived.
-binder_call(system_app, barqsharingd)
-binder_call(barqsharingd, system_app)
-allow system_app barq_service:service_manager find;
+# ITarishCallback to say files have arrived.
+binder_call(system_app, tarishsharingd)
+binder_call(tarishsharingd, system_app)
+allow system_app tarish_service:service_manager find;
 
 # /proc/net/if_inet6, to find our own link-local address for the AAAA record we
 # advertise. The alternative is getifaddrs(), which would mean ~30 lines of
-# unsafe pointer walking in the most exposed process in Barq -- a worse trade
+# unsafe pointer walking in the most exposed process in Tarish -- a worse trade
 # than one read-only proc file for a domain that already has network access.
-allow barqsharingd proc_net:file r_file_perms;
+allow tarishsharingd proc_net:file r_file_perms;
 
 # Read interface state, which is how this daemon knows the AWDL link is up
-# without talking to barqd or holding any privilege.
-allow barqsharingd sysfs_net:dir search;
-allow barqsharingd sysfs_net:file r_file_perms;
+# without talking to tarishd or holding any privilege.
+allow tarishsharingd sysfs_net:dir search;
+allow tarishsharingd sysfs_net:file r_file_perms;
 
 # Where received archives are stored, before the app collects them.
 #
 # The daemon writes files here and nothing else: it does not read them back, and it
-# cannot reach shared storage at all. Downloads/Barq is the app's job, because the app
+# cannot reach shared storage at all. Downloads/Tarish is the app's job, because the app
 # is the side with the standing to write there and to tell MediaStore about it -- and
 # because parsing a hostile archive must not happen in a process that has that standing.
-type barq_data_file, file_type, data_file_type, core_data_file_type;
-allow barqsharingd barq_data_file:dir { search write add_name getattr };
-allow barqsharingd barq_data_file:file { create write open getattr };
+type tarish_data_file, file_type, data_file_type, core_data_file_type;
+allow tarishsharingd tarish_data_file:dir { search write add_name getattr };
+allow tarishsharingd tarish_data_file:file { create write open getattr };
 
 # Listing the inbox, and reading an archive back to extract it.
 #
@@ -69,58 +69,58 @@ allow barqsharingd barq_data_file:file { create write open getattr };
 # read_dir needs `open` on the directory as well as `read`, and the extractor reopens
 # the .cpio it just wrote. The symptom was a transfer that arrived and then never
 # completed -- the bytes landed, extraction failed silently, and nothing appeared.
-allow barqsharingd barq_data_file:dir { read open };
-allow barqsharingd barq_data_file:file read;
+allow tarishsharingd tarish_data_file:dir { read open };
+allow tarishsharingd tarish_data_file:file read;
 
 # The client reads received files through a descriptor this daemon opens and passes
 # over binder. Handing over an already-open fd does NOT exempt the receiver from
 # needing permission on the file itself, which is what an earlier version of this
-# assumed: collection to Downloads/Barq failed silently and the transfer looked like it
+# assumed: collection to Downloads/Tarish failed silently and the transfer looked like it
 # arrived and vanished.
-allow system_app barq_data_file:file read;
-allow system_app barq_data_file:dir search;
+allow system_app tarish_data_file:file read;
+allow system_app tarish_data_file:dir search;
 
 # And the reverse, for sending: the client passes descriptors for files it opened from
 # MediaStore, so this daemon has to be allowed to use an fd that mediaprovider owns.
 # Without it, sharing anything from the gallery fails before a byte is read.
-allow barqsharingd mediaprovider_app:fd use;
+allow tarishsharingd mediaprovider_app:fd use;
 
 # ...and read the file behind that descriptor. Files the user picks live on the FUSE
 # view of external storage, so they are labelled `fuse` rather than anything of ours.
 # Being allowed to USE a descriptor is not the same as being allowed to READ what it
 # points at, which is the distinction that broke sending: the daemon took the fd and
 # then got EACCES on the first byte.
-allow barqsharingd fuse:file { read getattr };
+allow tarishsharingd fuse:file { read getattr };
 
 # Removing an archive once it is extracted, and a received file once the client has
 # stored it. Writing into a directory does not imply being allowed to take things out
 # of it -- unlink needs remove_name on the directory as well as the file.
-allow barqsharingd barq_data_file:dir remove_name;
-allow barqsharingd barq_data_file:file unlink;
+allow tarishsharingd tarish_data_file:dir remove_name;
+allow tarishsharingd tarish_data_file:file unlink;
 
 # NOT granted, and each absence is deliberate:
 #   no capability of any kind
-#   no netlink_generic_socket   -- driving the radio is barqd's job
-#   no packet_socket            -- raw frames are barqd's job
-#   no tun_device               -- creating mosey0 is barqd's job
+#   no netlink_generic_socket   -- driving the radio is tarishd's job
+#   no packet_socket            -- raw frames are tarishd's job
+#   no tun_device               -- creating mosey0 is tarishd's job
 #   no execute of anything
-#   no sdcard / media_rw access -- Downloads/Barq is reached by the app, never here
+#   no sdcard / media_rw access -- Downloads/Tarish is reached by the app, never here
 
-# Telling barqd whether the AWDL radio is wanted.
+# Telling tarishd whether the AWDL radio is wanted.
 #
 # This is the ONLY property this domain may set, and it carries one boolean. The
 # asymmetry is deliberate: the unprivileged half decides *whether* the radio is
 # needed, and the privileged half decides *how* to bring it up. Nothing about the
 # channel, the country or the interface crosses this boundary.
 #
-# Denied, barqd keeps the radio up and Barq still works -- see WANT_PROP. So a
+# Denied, tarishd keeps the radio up and Tarish still works -- see WANT_PROP. So a
 # missing rule here shows up as battery life, not as a broken transfer, which is
 # exactly the failure mode to prefer but also an easy one to miss.
-set_prop(barqsharingd, barq_awdl_prop)
+set_prop(tarishsharingd, tarish_awdl_prop)
 
 # The device name. The app cannot write this itself -- a persist property needs a
 # grant an app should not have -- so it arrives over binder and is written here.
-set_prop(barqsharingd, barq_name_prop)
+set_prop(tarishsharingd, tarish_name_prop)
 
 # Use a socket the APP connected and passed over binder.
 #
@@ -134,18 +134,18 @@ set_prop(barqsharingd, barq_name_prop)
 # read/write only. NOT create, connect or bind: this daemon must never be able to open a
 # socket of its own from a descriptor someone else handed it, and it has no reason to --
 # the app already connected it.
-allow barqsharingd system_app:unix_stream_socket { read write getattr };
+allow tarishsharingd system_app:unix_stream_socket { read write getattr };
 
 # set_prop() alone is NOT enough on this release. The macro grants
-# `barq_awdl_prop:property_service set` and `init:unix_stream_socket connectto`, but
+# `tarish_awdl_prop:property_service set` and `init:unix_stream_socket connectto`, but
 # libc still writes to /dev/socket/property_service first, and that write is checked
 # against the SOCKET's label, not the property's:
 #
-#   avc: denied { write } for name="property_service" scontext=u:r:barqsharingd:s0
+#   avc: denied { write } for name="property_service" scontext=u:r:tarishsharingd:s0
 #        tcontext=u:object_r:property_socket:s0 tclass=sock_file permissive=0
 #
 # Without this the radio gate fails exactly as the note above predicted: every flip is
-# refused, barq.awdl.wanted never changes, barqd holds the radio forever, and the only
-# symptom is battery. Measured on mustang under enforcing -- barqsharingd had never
+# refused, tarish.awdl.wanted never changes, tarishd holds the radio forever, and the only
+# symptom is battery. Measured on mustang under enforcing -- tarishsharingd had never
 # once logged a successful flip.
-allow barqsharingd property_socket:sock_file write;
+allow tarishsharingd property_socket:sock_file write;

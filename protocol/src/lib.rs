@@ -33,12 +33,12 @@
 //!
 //! What is NOT here, and where it belongs instead:
 //!
-//! - **the socket, and discovery** — barqsharingd, which needs an interface name and a
+//! - **the socket, and discovery** — tarishsharingd, which needs an interface name and a
 //!   multicast group. This crate never reads or writes a socket, which is why every
 //!   awkward case above is a unit test rather than something to reproduce with two
 //!   phones. mDNS discovery is done and verified against Google's Quick Share for
 //!   Windows; the captured vectors are in `docs/QUICKSHARE-VECTORS.md`.
-//! - **the filesystem** — barqsharingd. `payload` validates offsets and lengths but does
+//! - **the filesystem** — tarishsharingd. `payload` validates offsets and lengths but does
 //!   not sanitise names, because a path-traversal check belongs where the file is
 //!   actually opened; anywhere else it reads as protection while the real write happens
 //!   elsewhere.

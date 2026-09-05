@@ -1,8 +1,8 @@
-package dev.barq;
+package dev.tarish;
 
-/** Transport state, as barqsharingd sees it. */
-parcelable BarqStatus {
-    /** The AWDL link is up and barqd is holding it. */
+/** Transport state, as tarishsharingd sees it. */
+parcelable TarishStatus {
+    /** The AWDL link is up and tarishd is holding it. */
     boolean linkUp;
     /** Whether this device is currently discoverable. */
     boolean discoverable;

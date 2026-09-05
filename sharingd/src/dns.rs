@@ -1,7 +1,7 @@
 //! Just enough DNS wire format for mDNS.
 //!
 //! Deliberately hand-written and deliberately small: this parses packets from
-//! any device on the link, so it is the most exposed code in Barq. Everything
+//! any device on the link, so it is the most exposed code in Tarish. Everything
 //! here is bounds-checked, allocates nothing unbounded, and never trusts a
 //! length or an offset from the wire.
 //!
@@ -225,7 +225,7 @@ pub fn response(answers: &[Vec<u8>]) -> Vec<u8> {
 /// have — when a peer asks our host for an A record and we only publish AAAA,
 /// silence reads as "no such host" and the peer drops us, while an NSEC says
 /// "that host is mine, it has AAAA and nothing else". Mosey sends these for
-/// both its instance and its host; Barq did not, and that is a good candidate
+/// both its instance and its host; Tarish did not, and that is a good candidate
 /// for why an Apple peer resolved us and then gave up.
 ///
 /// Format: next-domain-name, then type bitmaps in (window, length, bits) blocks.

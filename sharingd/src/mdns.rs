@@ -221,7 +221,7 @@ impl Browser {
         let mut out = Vec::with_capacity(4);
 
         // Service enumeration: "this host offers _airdrop._tcp". Mosey sends it
-        // and Barq did not; a browser that enumerates services rather than
+        // and Tarish did not; a browser that enumerates services rather than
         // querying ours by name would never have seen us.
         out.push(dns::record(SERVICE_ENUM, dns::TYPE_PTR, ttl,
                              &dns::encode_name(AIRDROP_SERVICE), false));
@@ -501,7 +501,7 @@ fn short(instance: &str) -> &str {
 ///
 /// NOT stable across sessions, despite what an earlier version of this comment
 /// claimed: AWDL randomises the interface MAC every time the link comes up, so
-/// the name changes on every restart of barqd. Observed going from
+/// the name changes on every restart of tarishd. Observed going from
 /// c66a180ad90e to 92c8e169f34a across one reboot.
 ///
 /// That is arguably correct for privacy -- a fixed identifier is a tracking

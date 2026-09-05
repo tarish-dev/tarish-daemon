@@ -9,13 +9,13 @@ Raw capture: [apple-airdrop-discovery-capture.txt](apple-airdrop-discovery-captu
 > advertises `_airdrop._tcp.local`, and it interoperates. See
 > [What a working Android peer advertises](#what-a-working-android-peer-advertises)
 > below, which is the section to build from. What remains true is that the Mac
-> also runs two *pairing* services, and that Barq's TXT was wrong — just not for
+> also runs two *pairing* services, and that Tarish's TXT was wrong — just not for
 > the reason first concluded.
 
 ## The finding
 
 **`_airdrop._tcp.local` is not how modern macOS finds peers.** Advertising it and
-answering correctly is not enough, and that is exactly what Barq did for several
+answering correctly is not enough, and that is exactly what Tarish did for several
 build cycles while a Mac sat three feet away and never listed it.
 
 Attributing every packet in a 260-packet capture to its sender:
@@ -72,7 +72,7 @@ opaque id. The **host** is a UUID, and it also changes per session.
 Two ports, adjacent and ephemeral-looking: `55573` for pre-pair, `55574` for
 pairing. They differ between captures, so they are assigned, not fixed.
 
-## What this means for Barq
+## What this means for Tarish
 
 Advertising `_airdrop._tcp.local` alone cannot work. To be listed we must
 advertise both pairing services with `sn=com.apple.sharingd.AirDrop`, plus the
@@ -103,7 +103,7 @@ Captured from Google's Mosey on this phone, with a Mac as peer, 2026-08-23.
 Raw: [mosey-airdrop-advertisement.txt](mosey-airdrop-advertisement.txt).
 
 **This is the template to build against**, because Mosey is an Android
-implementation on the same radio and interface as Barq, and it demonstrably
+implementation on the same radio and interface as Tarish, and it demonstrably
 interoperates with Apple devices.
 
 ```
@@ -120,13 +120,13 @@ PTR   0.A.2.F...ip6.arpa -> Android_MHMQSTGX.local     (reverse)
 ### The TXT is `flags=489`
 
 One key, one value. **Not** the `sn`/`at`/`sid`/`dnm` set — those belong to the
-Mac's `_appsvcprepair` and `_applicationservicepairing` services, and Barq
+Mac's `_appsvcprepair` and `_applicationservicepairing` services, and Tarish
 briefly copied them onto `_airdrop._tcp`, which is a service they never appear
 on. 489 = `0x1E9`; the bit meanings are not yet known.
 
-### What Barq was missing
+### What Tarish was missing
 
-| | Mosey | Barq (before) |
+| | Mosey | Tarish (before) |
 |---|---|---|
 | `_services._dns-sd._udp` PTR | yes | **no** |
 | TXT | `flags=489` | `dnm=`/`sid=`/`_dc=` — wrong service's fields |
@@ -155,7 +155,7 @@ It injects the service name into AWDL's own synchronisation TLVs, so the service
 is announced at the AWDL layer as well as over mDNS. Whether an Apple peer
 *requires* that, or merely benefits from it, is not known.
 
-**Hypothesis, untested: this is what `mosey_update` is for.** Barq calls only
+**Hypothesis, untested: this is what `mosey_update` is for.** Tarish calls only
 `mosey_start_5` and `mosey_stop`. Google's daemon also calls `mosey_update`,
 which MOSEY-ABI records as taking four arguments — `x0` the session handle, `x1`
 a pointer, `x2`=1, `x3`=0 — with the pointer's contents never identified. A

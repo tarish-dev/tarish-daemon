@@ -49,7 +49,7 @@ else's. For pure observation `ath9k` is less work.
 **Bluetooth.** Any adapter that can do passive LE scanning with a raw HCI socket.
 Unlike the Wi-Fi side this is undemanding: `btmon` against the kernel's HCI monitor
 gives full advertising PDUs, and that is all we need. The phone can already do this —
-Barq's own scanner sees Apple beacons — but a Linux host gives the raw bytes rather
+Tarish's own scanner sees Apple beacons — but a Linux host gives the raw bytes rather
 than an Android `ScanRecord`.
 
 **OWL** ([owlink.org](https://owlink.org)) is the reference AWDL implementation for
@@ -84,15 +84,15 @@ debugged at the endpoints instead.
 | AWDL bring-up | working from our own process, no Google packages | grapheneos `docs/OWL-PATH.md` |
 | `libmosey` FFI | 5 symbols, `mosey_start_5` signature confirmed by calling it | grapheneos `docs/MOSEY-ABI.md` |
 | mDNS records | verified byte-for-byte against Mosey | [AIRDROP-DISCOVERY.md](AIRDROP-DISCOVERY.md) |
-| BLE beacon layout | Apple mfg data `0x004C`, type `0x05`, 4x 2-byte SHA-256 slots | barq-app `docs/BLE-DISCOVERY.md` |
-| BLE advertise + scan | working; two Apple devices observed beaconing | barq-app |
+| BLE beacon layout | Apple mfg data `0x004C`, type `0x05`, 4x 2-byte SHA-256 slots | tarish-app `docs/BLE-DISCOVERY.md` |
+| BLE advertise + scan | working; two Apple devices observed beaconing | tarish-app |
 | What triggers a peer to browse | **unknown** — the current blocker | — |
 | AirDrop HTTPS + TLS | **not started** | — |
 | cpio | **not started** | — |
 
 ## The goal
 
-Hardware independence. Today Barq depends on `libmosey`, a Google blob that happens to
+Hardware independence. Today Tarish depends on `libmosey`, a Google blob that happens to
 ride in the Pixel vendor image — pinned in `vendor/mosey/` precisely because a vendor
 bump could change the ABI underneath us with no warning. A protocol we actually
 understand can be implemented against OWL, against a monitor-mode adapter, or against

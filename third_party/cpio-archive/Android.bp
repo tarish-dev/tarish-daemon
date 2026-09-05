@@ -1,14 +1,14 @@
 // VENDORED, unmodified, from crates.io: cpio-archive-0.10.0
 //
-// Vendored inside Barq rather than added to external/rust/ so the daemon builds
+// Vendored inside Tarish rather than added to external/rust/ so the daemon builds
 // outside this tree -- on LineageOS or plain AOSP -- without the consumer having
-// to place dependencies for us. gos-barq.sh copies this whole checkout, so it
+// to place dependencies for us. gos-tarish.sh copies this whole checkout, so it
 // comes along on its own.
 //
-// Module names are suffixed _barq so they cannot collide if AOSP later carries
+// Module names are suffixed _tarish so they cannot collide if AOSP later carries
 // the same crate; crate_name stays real so the import path is unchanged.
 rust_library {
-    name: "libcpio_archive_barq",
+    name: "libcpio_archive_tarish",
     crate_name: "cpio_archive",
     srcs: ["src/lib.rs"],
     edition: "2021",
@@ -28,7 +28,7 @@ rust_library {
     rustlibs: [
         "libchrono",
         "libthiserror",
-        "libis_executable_barq",
-        "libsimple_file_manifest_barq",
+        "libis_executable_tarish",
+        "libsimple_file_manifest_tarish",
     ],
 }

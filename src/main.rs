@@ -1,10 +1,10 @@
-//! barqd — Barq AWDL transport daemon.
+//! tarishd — Tarish AWDL transport daemon.
 //!
 //! Holds the AWDL link up so nothing above it has to. This is the privileged
-//! half of Barq: it runs as `system` with CAP_NET_ADMIN and CAP_NET_RAW, drives
+//! half of Tarish: it runs as `system` with CAP_NET_ADMIN and CAP_NET_RAW, drives
 //! the vendor library, and **parses nothing from the network**. Everything that
 //! reads remote input — mDNS, TLS, HTTP, Apple plists, cpio — lives in the
-//! unprivileged `barqsharingd`, so a bug in a parser is not a bug in a process
+//! unprivileged `tarishsharingd`, so a bug in a parser is not a bug in a process
 //! holding those capabilities. See docs/ARCHITECTURE.md.
 //!
 //! Why a daemon at all: an Android app that wants to keep running must hold a
@@ -148,7 +148,7 @@ fn mosey_config(sta_freq_mhz: u32) -> Vec<u8> {
 /// nl80211.rs for the protocol reference. Reporting 0 means the radio never goes
 /// back to the AP.
 ///
-/// It used to come only from a property that barqsharingd publishes on behalf of the
+/// It used to come only from a property that tarishsharingd publishes on behalf of the
 /// client, which meant it was 0 whenever the app was closed -- i.e. nearly always,
 /// since closing it is what the radio gate is for. Measured on mustang: every single
 /// start logged `sta_channel_freq=0` while the phone sat associated at 5520 MHz, and
@@ -161,9 +161,9 @@ fn mosey_config(sta_freq_mhz: u32) -> Vec<u8> {
 /// build-push-test cycle is minutes; each hypothesis about a vendor blob's config is
 /// cheap and usually wrong, so the two should not be coupled. Unset in normal use.
 ///
-///     setprop persist.barq.mosey_config 0801109 02b28013001
+///     setprop persist.tarish.mosey_config 0801109 02b28013001
 fn config_override() -> Option<Vec<u8>> {
-    let hex = read_property("persist.barq.mosey_config")?;
+    let hex = read_property("persist.tarish.mosey_config")?;
     let hex: String = hex.chars().filter(|c| !c.is_whitespace()).collect();
     if hex.is_empty() || hex.len() % 2 != 0 {
         return None;
@@ -172,7 +172,7 @@ fn config_override() -> Option<Vec<u8>> {
     for i in (0..hex.len()).step_by(2) {
         out.push(u8::from_str_radix(&hex[i..i + 2], 16).ok()?);
     }
-    log::warn!("using persist.barq.mosey_config override: {hex}");
+    log::warn!("using persist.tarish.mosey_config override: {hex}");
     Some(out)
 }
 
@@ -181,7 +181,7 @@ fn config_override() -> Option<Vec<u8>> {
 /// Same reason as the config override: the channel is a coexistence variable and
 /// should be testable without a rebuild. Empty means pick by band.
 fn channel_override() -> Option<Vec<u8>> {
-    let v = read_property("persist.barq.channels")?;
+    let v = read_property("persist.tarish.channels")?;
     let list: Vec<u8> = v
         .split(',')
         .filter_map(|c| c.trim().parse::<u8>().ok())
@@ -189,27 +189,27 @@ fn channel_override() -> Option<Vec<u8>> {
     if list.is_empty() {
         return None;
     }
-    log::warn!("using persist.barq.channels override: {list:?}");
+    log::warn!("using persist.tarish.channels override: {list:?}");
     Some(list)
 }
 
 fn sta_frequency() -> u32 {
-    // barq.awdl.sta_freq is what barqsharingd publishes from the client, which is the
-    // only component that can see the Wi-Fi state at all -- barqd and barqsharingd are
+    // tarish.awdl.sta_freq is what tarishsharingd publishes from the client, which is the
+    // only component that can see the Wi-Fi state at all -- tarishd and tarishsharingd are
     // native daemons with no framework access, and nothing exposes the association
-    // frequency as a readable file. persist.barq.sta_freq stays as a manual override
+    // frequency as a readable file. persist.tarish.sta_freq stays as a manual override
     // for bench work.
     // An explicit bench override wins, so a frequency can be forced without a build.
-    if let Some(f) = read_property("persist.barq.sta_freq")
+    if let Some(f) = read_property("persist.tarish.sta_freq")
         .and_then(|v| v.trim().parse::<u32>().ok())
         .filter(|f| (2000..=7200).contains(f))
     {
-        log::warn!("using persist.barq.sta_freq override: {f} MHz");
+        log::warn!("using persist.tarish.sta_freq override: {f} MHz");
         return f;
     }
 
     // Then ask the kernel directly. This is the path that actually runs: the property
-    // below is published by barqsharingd from the client, and the client is closed for
+    // below is published by tarishsharingd from the client, and the client is closed for
     // almost all of the device's life by design.
     match nl80211::frequency_of(STA_IFACE) {
         Ok(f) if (2000..=7200).contains(&f) => return f,
@@ -217,7 +217,7 @@ fn sta_frequency() -> u32 {
         Err(e) => log::warn!("nl80211 could not report {STA_IFACE} frequency: {e}"),
     }
 
-    read_property("barq.awdl.sta_freq")
+    read_property("tarish.awdl.sta_freq")
         .and_then(|v| v.trim().parse::<u32>().ok())
         .filter(|f| (2000..=7200).contains(f))
         .unwrap_or(0)
@@ -225,7 +225,7 @@ fn sta_frequency() -> u32 {
 
 const MAX_MDNS: u32 = 0x7fff_ffff;
 
-/// Whether anything actually wants the radio. Written by barqsharingd, read here.
+/// Whether anything actually wants the radio. Written by tarishsharingd, read here.
 ///
 /// A property rather than binder or an init service control, for two reasons.
 ///
@@ -237,8 +237,8 @@ const MAX_MDNS: u32 = 0x7fff_ffff;
 /// the .rc's user, capabilities and seclabel regardless of who asked), but it
 /// would hand an unprivileged caller the ability to start and stop a privileged
 /// process. That is a new authority, and a battery optimisation is not worth
-/// creating one. barqd stays init-started, exactly once, at boot.
-const WANT_PROP: &str = "barq.awdl.wanted";
+/// creating one. tarishd stays init-started, exactly once, at boot.
+const WANT_PROP: &str = "tarish.awdl.wanted";
 
 /// How often to look at it. This is a shared-memory read, not a syscall, so the
 /// cost is far below the noise floor -- the session itself was measured at 6.5%
@@ -264,7 +264,7 @@ fn install_signal_handlers() {
 }
 
 /// Country code for the regulatory domain, read from the system property the
-/// platform already maintains so barqd does not invent its own notion of where
+/// platform already maintains so tarishd does not invent its own notion of where
 /// the device is. The vendor library rejects anything that is not two letters.
 ///
 /// Read through libc rather than a helper crate: this process holds
@@ -307,7 +307,7 @@ fn read_property(name: &str) -> Option<String> {
 /// The SIM is authoritative when Wi-Fi has not persisted anything, and it is where
 /// the platform's own WifiCountryCode looks too.
 ///
-///   1. `persist.barq.country`            explicit manual override
+///   1. `persist.tarish.country`            explicit manual override
 ///   2. `persist.vendor.wifi.country`     what the Wi-Fi stack persisted, if anything
 ///   3. `gsm.operator.iso-country`        the network the SIM is registered on
 ///   4. `gsm.sim.operator.iso-country`    the SIM's home country
@@ -317,7 +317,7 @@ fn read_property(name: &str) -> Option<String> {
 /// takes it, logs a bring-up that looks fine, and then returns NULL.
 fn country_code() -> Option<String> {
     for prop in [
-        "persist.barq.country",
+        "persist.tarish.country",
         "persist.vendor.wifi.country",
         "gsm.operator.iso-country",
         "gsm.sim.operator.iso-country",
@@ -344,8 +344,8 @@ fn country_code() -> Option<String> {
 /// Whether anything actually wants the radio right now.
 ///
 /// Defaults to ON when the property is absent, and the failure mode is why. If
-/// barqsharingd never writes it -- a policy denial, a crash, an older build --
-/// defaulting off would mean AWDL never comes up and Barq is silently dead.
+/// tarishsharingd never writes it -- a policy denial, a crash, an older build --
+/// defaulting off would mean AWDL never comes up and Tarish is silently dead.
 /// Defaulting on means the worst case is the battery cost we had before this
 /// existed, with sharing still working. Fail towards working.
 fn wants_radio() -> bool {
@@ -380,7 +380,7 @@ fn radio_modes() -> Vec<mosey::OpMode> {
     // Asked of /sys/class/net, which this domain can already read, and NOT of
     // /sys/class/ieee80211, which it cannot:
     //
-    //     avc: denied { read } name="ieee80211" scontext=u:r:barqd:s0
+    //     avc: denied { read } name="ieee80211" scontext=u:r:tarishd:s0
     //          tcontext=u:object_r:sysfs:s0 tclass=dir
     //
     // Granting that would mean read of generic sysfs for one hint that only decides
@@ -414,15 +414,15 @@ struct Link {
 impl Link {
     fn acquire() -> Result<Self, String> {
         // Read the country at ACQUIRE time, not at start-up. It comes from the SIM
-        // or from an AP, so at boot there may not be one yet -- barqd used to
+        // or from an AP, so at boot there may not be one yet -- tarishd used to
         // exit(1) in that case and rely on init to retry. Asking when we actually
         // need it removes that race entirely.
         let country = country_code().ok_or_else(|| {
-            "no regulatory country from any source: persist.barq.country, \
+            "no regulatory country from any source: persist.tarish.country, \
              persist.vendor.wifi.country, gsm.operator.iso-country, \
              gsm.sim.operator.iso-country, ro.boot.wificountrycode. With no SIM and no \
              Wi-Fi association there is nothing to read, and no channel is permitted in \
-             the world domain. Set one explicitly: setprop persist.barq.country <CC>"
+             the world domain. Set one explicitly: setprop persist.tarish.country <CC>"
                 .to_string()
         })?;
 
@@ -569,13 +569,13 @@ impl Drop for Link {
     }
 }
 
-/// Log verbosity, from `persist.barq.loglevel` (error|warn|info|debug|trace).
+/// Log verbosity, from `persist.tarish.loglevel` (error|warn|info|debug|trace).
 ///
 /// Hardcoding Info meant the one line explaining a Wi-Fi-killing channel fallback was
 /// compiled out on every shipped device, and recovering it needed a rebuild and a
 /// reflash. Info stays the default; this only makes the level answerable in the field.
 fn log_level() -> log::LevelFilter {
-    match read_property("persist.barq.loglevel")
+    match read_property("persist.tarish.loglevel")
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase()
@@ -592,7 +592,7 @@ fn log_level() -> log::LevelFilter {
 fn main() {
     android_logger::init_once(
         android_logger::Config::default()
-            .with_tag("barqd")
+            .with_tag("tarishd")
             .with_max_level(log_level()),
     );
 

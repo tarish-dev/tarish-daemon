@@ -4,7 +4,7 @@ One patch, and it is not optional.
 
 ## `packages_modules_Connectivity` — local network access for the sharing daemon
 
-`barqsharingd` runs as its own AID (7500, `system_ext_barq`) so that the process parsing
+`tarishsharingd` runs as its own AID (7500, `system_ext_tarish`) so that the process parsing
 input from strangers owns nothing else on the device. That decision has one consequence
 the platform does not let you fix from outside it.
 
@@ -25,14 +25,14 @@ It is applied at the policy layer rather than in the BPF program on purpose: `du
 connectivity` then shows the grant, so it is visible to anyone auditing the device rather
 than buried in a kernel map.
 
-**The patch hardcodes 7500 and so does `config/barq_aid.txt`.** If you change one, change
+**The patch hardcodes 7500 and so does `config/tarish_aid.txt`.** If you change one, change
 the other. They cannot disagree quietly — the daemon would start and never send.
 
 ### Applying it
 
 ```bash
 cd packages/modules/Connectivity
-git apply /path/to/barq-daemon/patches/packages_modules_Connectivity/*.patch
+git apply /path/to/tarish-daemon/patches/packages_modules_Connectivity/*.patch
 ```
 
 `repo sync` resets projects to their manifest revision and will silently discard it, so

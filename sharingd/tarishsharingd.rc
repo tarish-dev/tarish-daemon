@@ -1,29 +1,29 @@
-# barqsharingd — the unprivileged half of Barq.
+# tarishsharingd — the unprivileged half of Tarish.
 #
 # No capabilities at all. `inet` is a supplementary GROUP, not a capability: it is
 # what lets the process CREATE a socket, and nothing more.
 #
 # Creating one is not the same as being allowed to send on it. Since Android B,
 # reaching the LOCAL network additionally needs a per-uid bit in a BPF map that only
-# uid 0 and uid 1000 get for free -- see config/barq_aid.txt. Without it this daemon
+# uid 0 and uid 1000 get for free -- see config/tarish_aid.txt. Without it this daemon
 # starts, advertises, and every mDNS send fails with EPERM. `inet` alone is enough for
 # AirDrop, which rides mosey0 and is not gated; it is not enough for Quick Share.
 #
-# Started after barqd, though it does not require it: with no link up it simply
+# Started after tarishd, though it does not require it: with no link up it simply
 # reports linkUp=false rather than failing.
 
 # Received archives land here. Created by init rather than by the daemon so the
 # ownership and mode are set by something that has the standing to set them, and so
 # the directory exists before the first transfer rather than on the first write.
 #
-# 0700 system_ext_barq: only this daemon can read what a peer sent until the app collects it.
+# 0700 system_ext_tarish: only this daemon can read what a peer sent until the app collects it.
 # It was 0700 nobody, which is weaker than it looks -- `nobody` is shared, so every
 # other process running as it could read a received file before the app collected it.
 # The ownership MUST move with the uid: miss it and the daemon boots cleanly and then
 # cannot write its own inbox, which fails at the first transfer rather than at boot.
 on post-fs-data
-    mkdir /data/misc/barq 0700 system_ext_barq system_ext_barq
-    mkdir /data/misc/barq/inbox 0700 system_ext_barq system_ext_barq
+    mkdir /data/misc/tarish 0700 system_ext_tarish system_ext_tarish
+    mkdir /data/misc/tarish/inbox 0700 system_ext_tarish system_ext_tarish
     # mkdir SETS OWNERSHIP ONLY WHEN IT CREATES THE DIRECTORY.
     #
     # On a device upgrading from a build where this daemon ran as `nobody`, both
@@ -35,15 +35,15 @@ on post-fs-data
     # chown is idempotent and costs nothing on a fresh device, so it runs always.
     # Files left inside inbox by the old uid are fine: deleting them is governed by
     # write permission on the directory, which we now own.
-    chown system_ext_barq system_ext_barq /data/misc/barq
-    chown system_ext_barq system_ext_barq /data/misc/barq/inbox
-    chmod 0700 /data/misc/barq
-    chmod 0700 /data/misc/barq/inbox
+    chown system_ext_tarish system_ext_tarish /data/misc/tarish
+    chown system_ext_tarish system_ext_tarish /data/misc/tarish/inbox
+    chmod 0700 /data/misc/tarish
+    chmod 0700 /data/misc/tarish/inbox
 
-service barqsharingd /system_ext/bin/barqsharingd
+service tarishsharingd /system_ext/bin/tarishsharingd
     class late_start
-    user system_ext_barq
-    group system_ext_barq inet
+    user system_ext_tarish
+    group system_ext_tarish inet
     disabled
     # NOT oneshot -- and that is said by omitting the keyword, not by giving it an
     # argument. `oneshot false` is rejected outright ("oneshot requires 0 arguments"),
@@ -52,4 +52,4 @@ service barqsharingd /system_ext/bin/barqsharingd
     restart_period 10
 
 on property:sys.boot_completed=1
-    start barqsharingd
+    start tarishsharingd

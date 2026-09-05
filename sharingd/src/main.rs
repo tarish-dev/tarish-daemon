@@ -1,21 +1,21 @@
-//! barqsharingd — the unprivileged half of Barq.
+//! tarishsharingd — the unprivileged half of Tarish.
 //!
 //! Everything that reads bytes from another device lives here: mDNS, the
 //! AirDrop protocol, and the transfer itself. It runs as `nobody` with **no
 //! capabilities**, in its own SELinux domain, so a bug in a parser is not a bug
 //! in a process that can reconfigure the network.
 //!
-//! The privileged half is `barqd`: it holds the AWDL session and does nothing
+//! The privileged half is `tarishd`: it holds the AWDL session and does nothing
 //! else. See ../docs/ARCHITECTURE.md for why they are separate, and note the
-//! property that motivates it — barqd is ~500 lines that will barely change and
+//! property that motivates it — tarishd is ~500 lines that will barely change and
 //! can be audited exhaustively, while this daemon will churn for months.
 //!
-//! There is deliberately no IPC to barqd. Once the link is up, `mosey0` is an
-//! ordinary interface: this process opens sockets on it like any other. barqd's
+//! There is deliberately no IPC to tarishd. Once the link is up, `mosey0` is an
+//! ordinary interface: this process opens sockets on it like any other. tarishd's
 //! only job is to keep holding the handle, because the session dies with its
 //! holder.
 //!
-//! Skeleton: publishes IBarqService and answers, but implements no protocol yet.
+//! Skeleton: publishes ITarishService and answers, but implements no protocol yet.
 
 mod dns;
 mod framed;
@@ -29,27 +29,27 @@ use binder::{BinderFeatures, Interface, Result as BinderResult, Status, StatusCo
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use dev_barq::aidl::dev::barq::{
-    BarqPeer::BarqPeer,
-    BarqPolicy::BarqPolicy,
-    BarqStatus::BarqStatus,
-    IBarqCallback::IBarqCallback,
-    IBarqService::{BnBarqService, IBarqService},
+use dev_tarish::aidl::dev::tarish::{
+    TarishPeer::TarishPeer,
+    TarishPolicy::TarishPolicy,
+    TarishStatus::TarishStatus,
+    ITarishCallback::ITarishCallback,
+    ITarishService::{BnTarishService, ITarishService},
 };
 
-const SERVICE_NAME: &str = "dev.barq.IBarqService/default";
+const SERVICE_NAME: &str = "dev.tarish.ITarishService/default";
 
-/// The AWDL interface barqd brings up. Presence of a link-local address on it is
-/// how this process knows the transport is alive, without talking to barqd.
+/// The AWDL interface tarishd brings up. Presence of a link-local address on it is
+/// how this process knows the transport is alive, without talking to tarishd.
 const IFACE: &str = "mosey0";
 
-/// The property barqd watches to decide whether to hold the AWDL radio.
+/// The property tarishd watches to decide whether to hold the AWDL radio.
 /// Its default when absent is ON, so a policy denial here degrades to the old
 /// battery cost rather than to a device that cannot share at all.
-const WANT_PROP: &str = "barq.awdl.wanted";
+const WANT_PROP: &str = "tarish.awdl.wanted";
 
-/// The Wi-Fi frequency, published for barqd so it can choose the opposite band.
-const STA_FREQ_PROP: &str = "barq.awdl.sta_freq";
+/// The Wi-Fi frequency, published for tarishd so it can choose the opposite band.
+const STA_FREQ_PROP: &str = "tarish.awdl.sta_freq";
 
 /// Peers found by the discovery thread. Shared rather than owned by the service
 /// so discovery keeps running whether or not a client is bound — a device must
@@ -60,7 +60,7 @@ type PeerTable = Arc<Mutex<Vec<mdns::Peer>>>;
 /// which owns the socket. Daemon state on purpose: closing the client must not
 /// make the device vanish.
 type Discoverable = Arc<AtomicBool>;
-type Callbacks = Arc<Mutex<Vec<Strong<dyn IBarqCallback>>>>;
+type Callbacks = Arc<Mutex<Vec<Strong<dyn ITarishCallback>>>>;
 /// Names learned from /Discover, keyed by the peer's LINK-LOCAL ADDRESS.
 ///
 /// Kept outside the peer table because the browser republishes that table twice a
@@ -83,7 +83,7 @@ type PeerNames = Arc<Mutex<std::collections::HashMap<String, String>>>;
 type QueryNow = Arc<AtomicBool>;
 pub(crate) type Transfers = Arc<TransferState>;
 
-// Transfer outcomes reported through IBarqCallback.onTransferFinished.
+// Transfer outcomes reported through ITarishCallback.onTransferFinished.
 //
 // Declined is deliberately distinct from failed. Someone pressing Decline on the other
 // device is a normal answer, not an error, and telling a user "could not send" when the
@@ -258,9 +258,9 @@ impl TransferState {
 /// This is the one place a person actually reads our identity, so it prefers something
 /// they set over something the vendor did.
 pub(crate) fn device_name() -> String {
-    read_property("persist.barq.name")
+    read_property("persist.tarish.name")
         .or_else(|| read_property("ro.product.model"))
-        .unwrap_or_else(|| "Barq".to_string())
+        .unwrap_or_else(|| "Tarish".to_string())
 }
 
 /// Persist the advertised name, or clear it back to the device-model default.
@@ -288,14 +288,14 @@ pub(crate) fn device_name() -> String {
 fn set_device_name(name: &str) {
     let cleaned = clean_name(name);
     if cleaned.is_empty() {
-        write_property("persist.barq.name", "");
+        write_property("persist.tarish.name", "");
         log::info!("device name cleared — falling back to {:?}", device_name());
         return;
     }
-    if write_property("persist.barq.name", &cleaned) {
+    if write_property("persist.tarish.name", &cleaned) {
         log::info!("device name set to {cleaned:?}");
     } else {
-        log::warn!("could not write persist.barq.name");
+        log::warn!("could not write persist.tarish.name");
     }
 }
 
@@ -389,7 +389,7 @@ fn write_property(name: &str, value: &str) -> bool {
     unsafe { __system_property_set(n.as_ptr(), v.as_ptr()) == 0 }
 }
 
-/// Tell barqd whether the AWDL radio is wanted.
+/// Tell tarishd whether the AWDL radio is wanted.
 ///
 /// WHY A THREAD AND NOT A WRITE AT EACH CALL SITE
 ///
@@ -475,8 +475,8 @@ fn start_radio_gate(active: Arc<AtomicBool>, transfers: Transfers, discoverable:
                     // enough for that and quick enough that nobody notices the other.
                     if !warned {
                         log::warn!(
-                            "could not set {WANT_PROP} — check set_prop(barqsharingd, \
-                             barq_awdl_prop); barqd will keep the radio up"
+                            "could not set {WANT_PROP} — check set_prop(tarishsharingd, \
+                             tarish_awdl_prop); tarishd will keep the radio up"
                         );
                         warned = true;
                     }
@@ -495,7 +495,7 @@ fn start_radio_gate(active: Arc<AtomicBool>, transfers: Transfers, discoverable:
     });
 }
 
-struct BarqService {
+struct TarishService {
     // Callbacks are held weakly in spirit: a client that is not running is the
     // normal case, so nothing here may assume one exists.
     callbacks: Callbacks,
@@ -519,7 +519,7 @@ struct BarqService {
     /// carries the protocol that found it.
     ble_peers: Arc<Mutex<std::collections::HashMap<String, BlePeer>>>,
     /// What this device is permitted to do. Starts DENIED -- see setPolicy in the AIDL.
-    policy: Arc<Mutex<BarqPolicy>>,
+    policy: Arc<Mutex<TarishPolicy>>,
     /// Mirrors policy.requireConfirmation for the accept loop, which runs on the httpd
     /// threads and must not take the policy lock on every offer.
     auto_accept: Arc<AtomicBool>,
@@ -568,13 +568,13 @@ const BLE_PEER_TTL: Duration = Duration::from_secs(20);
 /// an RFCOMM bootstrap is to stay on Bluetooth -- so claiming it costs a declined
 /// negotiation, not a broken transfer.
 ///
-/// `persist.barq.qs_mediums` overrides it with a comma-separated list of raw enum values
+/// `persist.tarish.qs_mediums` overrides it with a comma-separated list of raw enum values
 /// (2 BLUETOOTH, 4 BLE, 5 WIFI_LAN, 6 WIFI_AWARE, 8 WIFI_DIRECT). That exists because
 /// this is being settled against one real phone one attempt at a time, and a rebuild per
 /// guess costs minutes and a reboot. It is read per transfer, so a `setprop` takes effect
 /// on the next send.
 fn quickshare_mediums() -> Vec<u64> {
-    use barq_protocol::frames::Medium;
+    use tarish_protocol::frames::Medium;
     // BLUETOOTH *and* WIFI_LAN. Measured against a stock Pixel, one send per row:
     //
     //   [BLUETOOTH]                 RFCOMM accepted, closed 209 ms later
@@ -586,7 +586,7 @@ fn quickshare_mediums() -> Vec<u64> {
     // from the schema; the receiver wants both entries present and refuses the request
     // in under a fifth of a second otherwise. Do not simplify this to either one alone.
     let default = vec![Medium::Bluetooth as u64, Medium::WifiLan as u64];
-    let Some(raw) = read_property("persist.barq.qs_mediums") else {
+    let Some(raw) = read_property("persist.tarish.qs_mediums") else {
         return default;
     };
     if raw.trim().is_empty() {
@@ -597,10 +597,10 @@ fn quickshare_mediums() -> Vec<u64> {
         .filter_map(|f| f.trim().parse::<u64>().ok())
         .collect();
     if parsed.is_empty() {
-        log::warn!("persist.barq.qs_mediums={raw:?} parsed to nothing; using the default");
+        log::warn!("persist.tarish.qs_mediums={raw:?} parsed to nothing; using the default");
         return default;
     }
-    log::info!("quickshare: advertising mediums {parsed:?} from persist.barq.qs_mediums");
+    log::info!("quickshare: advertising mediums {parsed:?} from persist.tarish.qs_mediums");
     parsed
 }
 
@@ -632,7 +632,7 @@ struct TransferProgress {
     id: i64,
     transfers: Transfers,
     callbacks: Callbacks,
-    /// Snapshotted when the transfer began. See `BarqService::require_pin`.
+    /// Snapshotted when the transfer began. See `TarishService::require_pin`.
     require_pin: bool,
 }
 
@@ -697,8 +697,8 @@ impl quickshare::outbound::Progress for TransferProgress {
 }
 
 /// Deny everything. A daemon that has never heard from the app shares nothing.
-fn denied_policy() -> BarqPolicy {
-    BarqPolicy {
+fn denied_policy() -> TarishPolicy {
+    TarishPolicy {
         airdrop: MODE_OFF,
         quickshare: MODE_OFF,
         requireConfirmation: true,
@@ -714,7 +714,7 @@ fn denied_policy() -> BarqPolicy {
     }
 }
 
-// Mirrors the constants in IBarqService.aidl. Kept as plain consts because the Rust
+// Mirrors the constants in ITarishService.aidl. Kept as plain consts because the Rust
 // backend does not expose interface constants in a form that can be matched on.
 const PROTOCOL_AIRDROP: i32 = 0;
 const PROTOCOL_QUICKSHARE: i32 = 1;
@@ -732,7 +732,7 @@ fn allows_send(mode: i32) -> bool {
     mode == MODE_SEND || mode == MODE_BOTH
 }
 
-impl BarqService {
+impl TarishService {
     fn new(peers: PeerTable, discoverable: Discoverable) -> Self {
         Self {
             callbacks: Arc::new(Mutex::new(Vec::new())),
@@ -764,7 +764,7 @@ impl BarqService {
         self.policy.lock().map(|p| p.quickshare).unwrap_or(MODE_OFF)
     }
 
-    /// Is the AWDL link up? Asked of the kernel rather than of barqd, so this
+    /// Is the AWDL link up? Asked of the kernel rather than of tarishd, so this
     /// process needs no privilege and no IPC to answer it.
     fn link_up(&self) -> bool {
         std::fs::read_to_string(format!("/sys/class/net/{IFACE}/operstate"))
@@ -773,9 +773,9 @@ impl BarqService {
     }
 }
 
-impl Interface for BarqService {}
+impl Interface for TarishService {}
 
-impl BarqService {
+impl TarishService {
     /// Turn a peer id from the client back into something we can connect to.
     ///
     /// A peer is only sendable once its SRV and AAAA records have both been seen: the
@@ -807,9 +807,9 @@ impl BarqService {
     }
 }
 
-impl IBarqService for BarqService {
-    fn getStatus(&self) -> BinderResult<BarqStatus> {
-        Ok(BarqStatus {
+impl ITarishService for TarishService {
+    fn getStatus(&self) -> BinderResult<TarishStatus> {
+        Ok(TarishStatus {
             linkUp: self.link_up(),
             discoverable: self.discoverable.load(Ordering::SeqCst),
             channel: 0,
@@ -857,16 +857,16 @@ impl IBarqService for BarqService {
     }
 
     fn setActive(&self, active: bool, sta_frequency_mhz: i32) -> BinderResult<()> {
-        // Publish the Wi-Fi frequency for barqd BEFORE flipping the active flag, so
+        // Publish the Wi-Fi frequency for tarishd BEFORE flipping the active flag, so
         // the gate can never ask for the radio while the band is still unknown --
-        // barqd would then pick 5 GHz and take the association down, which is the
+        // tarishd would then pick 5 GHz and take the association down, which is the
         // exact bug this exists to prevent.
         let f = if (2000..=7200).contains(&sta_frequency_mhz) { sta_frequency_mhz } else { 0 };
         if self.sta_freq.swap(f, Ordering::SeqCst) != f {
             if write_property(STA_FREQ_PROP, &f.to_string()) {
                 log::info!("Wi-Fi is on {f} MHz");
             } else {
-                log::warn!("could not publish {STA_FREQ_PROP} — barqd will guess the band");
+                log::warn!("could not publish {STA_FREQ_PROP} — tarishd will guess the band");
             }
         }
 
@@ -877,7 +877,7 @@ impl IBarqService for BarqService {
         Ok(())
     }
 
-    fn setPolicy(&self, policy: &BarqPolicy) -> BinderResult<()> {
+    fn setPolicy(&self, policy: &TarishPolicy) -> BinderResult<()> {
         log::info!(
             "policy: airdrop={} quickshare={} confirm={} name={:?} (managed: a={} q={} c={} n={})",
             policy.airdrop,
@@ -922,7 +922,7 @@ impl IBarqService for BarqService {
         Ok(())
     }
 
-    fn getPolicy(&self) -> BinderResult<BarqPolicy> {
+    fn getPolicy(&self) -> BinderResult<TarishPolicy> {
         let p = self
             .policy
             .lock()
@@ -949,7 +949,7 @@ impl IBarqService for BarqService {
     }
 
     fn reportBlePeer(&self, address: &str, rssi: i32, service_data: &[u8]) -> BinderResult<()> {
-        let Some(a) = barq_protocol::ble::parse_advertisement(service_data) else {
+        let Some(a) = tarish_protocol::ble::parse_advertisement(service_data) else {
             return Ok(()); // not an advertisement we understand; nothing to report
         };
         // A peer with no address is discoverable and not reachable, which is worse than
@@ -1054,7 +1054,7 @@ impl IBarqService for BarqService {
         Ok(())
     }
 
-    fn getPeers(&self) -> BinderResult<Vec<BarqPeer>> {
+    fn getPeers(&self) -> BinderResult<Vec<TarishPeer>> {
         // Someone is looking, so make discovery work rather than serving whatever the
         // last ten-second sweep happened to leave behind.
         self.query_now.store(true, Ordering::SeqCst);
@@ -1114,17 +1114,17 @@ impl IBarqService for BarqService {
 
         // Quick Share peers, from BLE, appended to the AirDrop ones.
         //
-        // Two protocols in one list is the whole reason BarqPeer carries `protocol`: a
+        // Two protocols in one list is the whole reason TarishPeer carries `protocol`: a
         // person picking a device is picking a protocol, and an Apple peer found over
         // AWDL cannot be reached the way an Android one over BLE can.
-        let mut quickshare: Vec<BarqPeer> = Vec::new();
+        let mut quickshare: Vec<TarishPeer> = Vec::new();
         if let Ok(mut ble) = self.ble_peers.lock() {
             let now = std::time::Instant::now();
             // Expire here as well as on report: a peer that walks away stops advertising,
             // and nothing else would ever notice it had gone.
             ble.retain(|_, p| now.duration_since(p.seen) < BLE_PEER_TTL);
             for (id, p) in ble.iter() {
-                quickshare.push(BarqPeer {
+                quickshare.push(TarishPeer {
                     id: id.clone(),
                     // A contacts-only peer publishes no name in the clear, and we have no
                     // certificate to decrypt one. The endpoint id is what we honestly
@@ -1146,7 +1146,7 @@ impl IBarqService for BarqService {
 
         Ok(out
             .into_iter()
-            .map(|p| BarqPeer {
+            .map(|p| TarishPeer {
                 id: p.instance.clone(),
                 // Apple advertises a 12-hex-character identifier, never a name -- its
                 // TXT record carries only `flags`. The real name comes from asking the
@@ -1231,7 +1231,7 @@ impl IBarqService for BarqService {
         // Sending happens off the binder thread: a transfer runs for as long as it runs,
         // and holding a binder worker for that would block every other call into us.
         std::thread::spawn(move || {
-            let announce = |f: &dyn Fn(&Strong<dyn IBarqCallback>) -> binder::Result<()>| {
+            let announce = |f: &dyn Fn(&Strong<dyn ITarishCallback>) -> binder::Result<()>| {
                 if let Ok(cbs) = callbacks.lock() {
                     for cb in cbs.iter() {
                         let _ = f(cb);
@@ -1338,13 +1338,13 @@ impl IBarqService for BarqService {
         })
     }
 
-    fn registerCallback(&self, cb: &Strong<dyn IBarqCallback>) -> BinderResult<()> {
+    fn registerCallback(&self, cb: &Strong<dyn ITarishCallback>) -> BinderResult<()> {
         self.callbacks.lock().unwrap().push(cb.clone());
         log::info!("client registered");
         Ok(())
     }
 
-    fn unregisterCallback(&self, cb: &Strong<dyn IBarqCallback>) -> BinderResult<()> {
+    fn unregisterCallback(&self, cb: &Strong<dyn ITarishCallback>) -> BinderResult<()> {
         let mut cbs = self.callbacks.lock().unwrap();
         cbs.retain(|c| c.as_binder() != cb.as_binder());
         log::info!("client unregistered");
@@ -1355,7 +1355,7 @@ impl IBarqService for BarqService {
 /// Browse for AirDrop peers on the AWDL interface, forever.
 ///
 /// Runs whether or not a client is bound, because discoverability is daemon
-/// state. Waits for the link rather than failing at start: barqd may still be
+/// state. Waits for the link rather than failing at start: tarishd may still be
 /// bringing it up, and a restart loop over a missing interface helps nobody.
 /// Ask a peer what it is called, once, in the background.
 ///
@@ -1401,7 +1401,7 @@ fn start_discovery(
         // peer on every pass, which is a TLS connection each time.
         let mut probed: std::collections::HashSet<String> = std::collections::HashSet::new();
         // Which instance of the interface we are bound to. The table id IS the index,
-        // and barqd recreates mosey0 with a new one every time it re-acquires the
+        // and tarishd recreates mosey0 with a new one every time it re-acquires the
         // radio, so this is the identity that matters -- not the name.
         let mut bound_idx = mdns::ifindex_of(IFACE).unwrap_or(0);
         let mut waiting_logged = false;
@@ -1410,7 +1410,7 @@ fn start_discovery(
         let mut since_announce = Duration::ZERO;
         let mut was_advertising = false;
         loop {
-            // barqd holds AWDL only while something wants it, so mosey0 genuinely
+            // tarishd holds AWDL only while something wants it, so mosey0 genuinely
             // disappears and comes back with a new index. Two things follow.
             //
             // With no interface there is nothing to browse: polling a dead socket at
@@ -1540,7 +1540,7 @@ fn start_discovery(
 
             // Rebind when the interface goes out from under us.
             //
-            // barqd recreates mosey0 with a NEW interface index whenever it restarts,
+            // tarishd recreates mosey0 with a NEW interface index whenever it restarts,
             // and a socket bound to the old one is dead for good: every send returns
             // ENETUNREACH and this loop would log that forever while discovery quietly
             // returned nothing. Nothing else notices, because the daemon is up, the
@@ -1582,9 +1582,9 @@ fn start_discovery(
 ///
 /// Without this a peer that browses, resolves and reaches us gets connection-refused
 /// and shows nothing -- being listed requires a real answer to POST /Discover, not a
-/// correct mDNS record. Barq advertised 8770 with nothing bound to it for a long time.
+/// correct mDNS record. Tarish advertised 8770 with nothing bound to it for a long time.
 ///
-/// mosey0 may not exist or may have no address yet when we start, since barqd brings
+/// mosey0 may not exist or may have no address yet when we start, since tarishd brings
 /// the link up independently. Retry rather than give up: failing here permanently
 /// would mean a daemon that is running, looks healthy, and can never be discovered.
 fn start_airdrop_server(
@@ -1594,9 +1594,9 @@ fn start_airdrop_server(
     auto_accept: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
-        let name = read_property("persist.barq.name")
+        let name = read_property("persist.tarish.name")
             .or_else(|| read_property("ro.product.model"))
-            .unwrap_or_else(|| "Barq".to_string());
+            .unwrap_or_else(|| "Tarish".to_string());
         let model = read_property("ro.product.model").unwrap_or_else(|| "Android".to_string());
 
         loop {
@@ -1620,7 +1620,7 @@ fn start_airdrop_server(
             }
             // Two very different waits behind one failure.
             //
-            // If mosey0 exists, barqd has just brought it up and the address is
+            // If mosey0 exists, tarishd has just brought it up and the address is
             // moments away -- retrying slowly here is dead time a person spends
             // looking at a device that cannot yet receive. If it does not exist, the
             // radio is released and nothing is coming; polling fast would be a wakeup
@@ -1707,7 +1707,7 @@ fn start_quickshare_discovery() {
 fn main() {
     android_logger::init_once(
         android_logger::Config::default()
-            .with_tag("barqsharingd")
+            .with_tag("tarishsharingd")
             .with_max_level(log::LevelFilter::Debug),
     );
     // Build marker. The AIDL surface has grown twice without the device appearing to
@@ -1719,20 +1719,20 @@ fn main() {
 
     // Off by default. A device that advertises itself the moment it boots is a
     // privacy decision, not a default, and it belongs to the user through the
-    // client. persist.barq.discoverable exists so the transport can be tested
+    // client. persist.tarish.discoverable exists so the transport can be tested
     // before a client exists to turn it on.
     // Default OFF. Being discoverable is the user's decision, made by opening the app;
     // a device that advertises itself from boot is a privacy choice nobody made. The
     // property remains only so the transport can be exercised without a client.
-    let initial = read_property("persist.barq.discoverable")
+    let initial = read_property("persist.tarish.discoverable")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     if initial {
-        log::warn!("persist.barq.discoverable is set — advertising without a client asking");
+        log::warn!("persist.tarish.discoverable is set — advertising without a client asking");
     }
     let discoverable: Discoverable = Arc::new(AtomicBool::new(initial));
 
-    let service = BarqService::new(peers.clone(), discoverable.clone());
+    let service = TarishService::new(peers.clone(), discoverable.clone());
     start_discovery(
         peers,
         service.names.clone(),
@@ -1753,7 +1753,7 @@ fn main() {
         service.transfers.clone(),
         discoverable,
     );
-    let binder = BnBarqService::new_binder(service, BinderFeatures::default());
+    let binder = BnTarishService::new_binder(service, BinderFeatures::default());
 
     if let Err(e) = binder::add_service(SERVICE_NAME, binder.as_binder()) {
         log::error!("could not publish {SERVICE_NAME}: {e:?}");
@@ -1769,7 +1769,7 @@ fn main() {
     binder::ProcessState::join_thread_pool();
 }
 
-impl BarqService {
+impl TarishService {
     /// Drive a Quick Share send over a socket the app already connected.
     ///
     /// `multiplexed` says which kind of socket it is, and the app knows because the

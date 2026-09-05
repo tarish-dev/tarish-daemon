@@ -1,6 +1,6 @@
 //! One inbound Quick Share connection, from TCP accept to the last byte on disk.
 //!
-//! This is the I/O loop around `libbarq_protocol`. Everything it decides is in the
+//! This is the I/O loop around `libtarish_protocol`. Everything it decides is in the
 //! crate; everything it *does* -- read, write, ask, create a file -- is here, which is
 //! why the protocol is testable without a socket and this is testable without a phone.
 //!
@@ -30,14 +30,14 @@
 //! They are different protos.
 
 use crate::{Callbacks, Transfers};
-use barq_protocol::channel::SecureChannel;
-use barq_protocol::d2d::{self, Role};
-use barq_protocol::frames::{self, Frame as OfflineFrame, PayloadChunk, PayloadHeader, PayloadType};
-use barq_protocol::framing;
-use barq_protocol::fsm::{Effect, Event, Inbound};
-use barq_protocol::payload::{Assembler, Event as PayloadEvent};
-use barq_protocol::sharing::{self, FileMetadata};
-use barq_protocol::ukey2::handshake::ServerHandshake;
+use tarish_protocol::channel::SecureChannel;
+use tarish_protocol::d2d::{self, Role};
+use tarish_protocol::frames::{self, Frame as OfflineFrame, PayloadChunk, PayloadHeader, PayloadType};
+use tarish_protocol::framing;
+use tarish_protocol::fsm::{Effect, Event, Inbound};
+use tarish_protocol::payload::{Assembler, Event as PayloadEvent};
+use tarish_protocol::sharing::{self, FileMetadata};
+use tarish_protocol::ukey2::handshake::ServerHandshake;
 use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -65,7 +65,7 @@ pub trait Host {
 /// failures are logged and skipped rather than propagated.
 fn notify<F>(callbacks: &Callbacks, f: F)
 where
-    F: Fn(&binder::Strong<dyn crate::IBarqCallback>) -> binder::Result<()>,
+    F: Fn(&binder::Strong<dyn crate::ITarishCallback>) -> binder::Result<()>,
 {
     let Ok(cbs) = callbacks.lock() else {
         warn!("quickshare: callback list poisoned");
@@ -450,6 +450,6 @@ pub(crate) fn bad(e: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
 }
 
-pub(crate) fn chan(e: barq_protocol::channel::Error) -> io::Error {
+pub(crate) fn chan(e: tarish_protocol::channel::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
 }

@@ -1,6 +1,6 @@
 //! FFI to the vendor AWDL library.
 //!
-//! This is the only place in barqd that talks to `libmosey_daemon_ffi.so`, and
+//! This is the only place in tarishd that talks to `libmosey_daemon_ffi.so`, and
 //! the only place a vendor ABI change can break us. Everything unsafe about the
 //! transport lives here so the rest of the daemon can be ordinary safe Rust.
 //!
@@ -12,7 +12,7 @@
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::ptr;
 
-/// Where the library might be. barqd does not own it and does not care which of
+/// Where the library might be. tarishd does not own it and does not care which of
 /// these it finds — shipping and pinning it is the integrator's job. The bare
 /// soname comes first so the dynamic linker's own search applies.
 const CANDIDATES: &[&str] = &[
@@ -21,7 +21,7 @@ const CANDIDATES: &[&str] = &[
     "/vendor/lib64/libmosey_daemon_ffi.so",
     "/system/lib64/libmosey_daemon_ffi.so",
 ];
-const LIB_ENV: &str = "BARQ_MOSEY_LIB";
+const LIB_ENV: &str = "TARISH_MOSEY_LIB";
 
 const RTLD_NOW: c_int = 2;
 
@@ -60,7 +60,7 @@ pub enum OpMode {
 /// A live AWDL session.
 ///
 /// The session lives exactly as long as this value: the vendor library tears the
-/// interface down when its holder goes away. That is why barqd's whole job is to
+/// interface down when its holder goes away. That is why tarishd's whole job is to
 /// hold one, and why a client app must never be the holder.
 pub struct Session {
     handle: *mut c_void,
@@ -69,7 +69,7 @@ pub struct Session {
 }
 
 // SAFETY: the handle is only ever touched from the thread that made it, or on
-// shutdown. barqd creates, holds and drops a Session entirely on its main thread --
+// shutdown. tarishd creates, holds and drops a Session entirely on its main thread --
 // the acquire/release loop never moves one across threads -- so this impl is not
 // actually exercised today. It exists so a Session can be owned by a struct that
 // something else wants to move.
@@ -182,7 +182,7 @@ impl Session {
 
         Err(format!(
             "no AWDL library found (tried {}). Set {LIB_ENV} to override. \
-             barqd requires libmosey_daemon_ffi.so to be present — shipping it is \
+             tarishd requires libmosey_daemon_ffi.so to be present — shipping it is \
              the integrator's job, not this daemon's.",
             tried.join(", ")
         ))

@@ -6,16 +6,16 @@ to reverse afterwards.
 ## Two processes, split by privilege
 
 ```
-barqd                                  barqsharingd
+tarishd                                  tarishsharingd
   privileged                             unprivileged
-  user system                            user barq
+  user system                            user tarish
   CAP_NET_ADMIN, CAP_NET_RAW             no capabilities
   own SELinux domain                     own SELinux domain
 
   holds the AWDL session                 mDNS on mosey0
   drives wonder.ko via libmosey          AirDrop protocol: TLS, HTTP, plist, cpio
   adds the link-local route              the actual file transfer
-                                         publishes IBarqService to the app
+                                         publishes ITarishService to the app
 ```
 
 **Why split.** Everything in the right-hand column parses input from a remote
@@ -30,20 +30,20 @@ calls a vendor library and adds a route. Keeping it that way is the point.
 
 Measured, not asserted (2026-08-25):
 
-| | `barqd` | `barqsharingd` |
+| | `tarishd` | `tarishsharingd` |
 |---|---|---|
 | code | **509 lines** — 16% of the Rust here | 2,689 lines |
 | `CapEff` at runtime | `0x3000` — NET_ADMIN + NET_RAW, exactly two | `0x0000` — none |
 | declared dependencies | 3 | 8 |
 | network parsers | none | mDNS, TLS, HTTP, plist, cpio, gzip |
 
-`barqd` reads bytes from outside itself in exactly two places, and neither is
+`tarishd` reads bytes from outside itself in exactly two places, and neither is
 network input: one property read into a 128-byte buffer against a 92-byte
 `PROP_VALUE_MAX`, and one netlink ACK into a fixed 512-byte buffer, length-checked
 before any indexing, from the kernel. Everything `unsafe` is at an FFI boundary.
 
 **The honest caveat: our code is not the risk in that process — `libmosey` is.**
-`barqd` holds no persistent sockets of its own; its netlink socket is opened and
+`tarishd` holds no persistent sockets of its own; its netlink socket is opened and
 closed per call. Every socket in its fd table, plus `/dev/tun` and the epoll and
 eventfd, belongs to the vendor library — which parses hostile over-the-air AWDL
 frames inside a process holding `CAP_NET_ADMIN` and `CAP_NET_RAW`.
@@ -53,24 +53,24 @@ to drive `wonder.ko`, so it cannot be moved to the unprivileged half without
 giving up AWDL entirely. What the split still buys is real — a cpio or TLS bug is
 not a privileged compromise — but "the privileged half is 500 auditable lines" is
 true and incomplete: those lines are auditable in an hour and the blob sharing
-their address space is not auditable at all. It is confined to `barqd`'s SELinux
+their address space is not auditable at all. It is confined to `tarishd`'s SELinux
 domain and reached through five FFI functions in one file, and that is the whole
 of the mitigation.
 
 Replacing `libmosey` with an open implementation is the only thing that changes
 this, which is why the FFI is isolated to `src/mosey.rs`.
 
-The client app talks to `barqsharingd`, not to `barqd`. The app never needs the
-privileged process, and `barqd` publishes no binder service — which is why its
+The client app talks to `tarishsharingd`, not to `tarishd`. The app never needs the
+privileged process, and `tarishd` publishes no binder service — which is why its
 SELinux domain deliberately grants no `servicemanager` access.
 
-**The names are deliberately not `barqd`/`barqsd`.** One-letter-apart daemon
+**The names are deliberately not `tarishd`/`tarishsd`.** One-letter-apart daemon
 names are easy to misread in a log or a `ps` listing, which is exactly when you
 are least able to afford it.
 
 ## Rust, not C
 
-`barqd` began as ~200 lines of C — a `dlopen` shim, which C is fine for. The
+`tarishd` began as ~200 lines of C — a `dlopen` shim, which C is fine for. The
 sharing daemon will be thousands of lines of parsing untrusted network input:
 Apple property lists, cpio archives, HTTP framing, TLS records.
 
@@ -91,13 +91,13 @@ Not available: `plist`, `quick-xml`. Apple's AirDrop uses **binary** plists, whi
 we would parse ourselves regardless.
 
 **The FFI stays unsafe and stays small.** `libmosey_daemon_ffi.so` is a C ABI, so
-calling it needs `unsafe`. That is confined to one module in `barqd`, which is
+calling it needs `unsafe`. That is confined to one module in `tarishd`, which is
 also the only place a vendor ABI change can break us.
 
 ## Order of work — done
 
-1. ~~Port `barqd` to Rust.~~ Done. The C prototype is gone.
-2. ~~`barqsharingd`: its own user, SELinux domain, `IBarqService`.~~ Done.
+1. ~~Port `tarishd` to Rust.~~ Done. The C prototype is gone.
+2. ~~`tarishsharingd`: its own user, SELinux domain, `ITarishService`.~~ Done.
 3. ~~mDNS on `mosey0`.~~ Done, including withdrawal.
 4. ~~The AirDrop protocol.~~ Done, both directions, with a consent prompt.
 
@@ -106,16 +106,16 @@ Each step was tested on hardware before the next, which is why it works.
 
 ## The radio is held on demand
 
-`barqd` no longer holds the AWDL session from boot to shutdown. It holds it while
-something wants it, and `barq.awdl.wanted` is how it is told.
+`tarishd` no longer holds the AWDL session from boot to shutdown. It holds it while
+something wants it, and `tarish.awdl.wanted` is how it is told.
 
 ```
-app  --binder-->  barqsharingd  --property-->  barqd  --dlopen-->  libmosey
-     setActive()                barq.awdl.wanted        mosey_start_5 / mosey_stop
+app  --binder-->  tarishsharingd  --property-->  tarishd  --dlopen-->  libmosey
+     setActive()                tarish.awdl.wanted        mosey_start_5 / mosey_stop
 ```
 
 An idle session costs 6.5% of a core continuously — libmosey runs its own threads inside
-whichever process holds the handle — so this is worth doing. Released, `barqd` costs
+whichever process holds the handle — so this is worth doing. Released, `tarishd` costs
 0.05%.
 
 **The gate is not visibility.** A client that is sending is not discoverable and needs the
@@ -130,22 +130,22 @@ second. So the daemon ORs three inputs and applies its own hold-off:
 
 Rising edges apply at once. Falling edges wait out a 30-second linger.
 
-**`barqd` is never restarted to do this.** It stays init-started, once, at boot, and keeps
+**`tarishd` is never restarted to do this.** It stays init-started, once, at boot, and keeps
 its capabilities for its whole life; only the session comes and goes. `ctl.start`/
 `ctl.stop` would not have leaked privilege — init applies the `.rc`, not the caller's
 context — but it would have given an unprivileged domain the power to start and stop a
 privileged process, and that is not a trade worth making for battery life. A property is
-read-only from `barqd`'s side and carries one boolean, which is the smallest channel that
+read-only from `tarishd`'s side and carries one boolean, which is the smallest channel that
 does the job.
 
-**It fails towards working.** With the property absent, `barqd` holds the radio up. A
+**It fails towards working.** With the property absent, `tarishd` holds the radio up. A
 missing `set_prop` rule therefore costs battery rather than breaking the transport.
 
 ### What this means for anything bound to `mosey0`
 
 The interface now genuinely disappears and returns **with a new index and a new
 link-local address**. Anything holding a socket on it must notice and rebind. Both places
-that do are in `barqsharingd`:
+that do are in `tarishsharingd`:
 
 - the mDNS browser compares the index every pass
 - the HTTPS listener uses a non-blocking accept and compares address and index, because

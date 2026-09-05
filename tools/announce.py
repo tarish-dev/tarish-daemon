@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Send an mDNS announcement for _airdrop._tcp.local out of a chosen interface.
 
-Tests barqsharingd's browser without depending on macOS actually having AirDrop
+Tests tarishsharingd's browser without depending on macOS actually having AirDrop
 open: this is the same PTR/SRV/AAAA shape a real peer announces.
 """
 import socket, struct, sys, time

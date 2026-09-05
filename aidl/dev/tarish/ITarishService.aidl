@@ -1,26 +1,26 @@
-package dev.barq;
+package dev.tarish;
 
-import dev.barq.IBarqCallback;
-import dev.barq.BarqPeer;
-import dev.barq.BarqPolicy;
-import dev.barq.BarqStatus;
+import dev.tarish.ITarishCallback;
+import dev.tarish.TarishPeer;
+import dev.tarish.TarishPolicy;
+import dev.tarish.TarishStatus;
 
 /**
- * The contract between barqd and its clients.
+ * The contract between tarishd and its clients.
  *
  * It lives with the DAEMON because the daemon is the server: it defines the
  * protocol, and a client is written against it. The app repo consumes this file
  * rather than declaring its own copy, so the two cannot drift apart silently.
  *
  * Everything expensive — holding the AWDL link, discovery, mDNS, the transfer
- * itself — happens in barqd. A client is expected to be an ordinary app that is
+ * itself — happens in tarishd. A client is expected to be an ordinary app that is
  * NOT running most of the time: it binds when the user is looking at it, and
  * receives nothing when it is closed. That is the whole reason for the split, so
  * no method here should require the client to stay alive.
  */
-interface IBarqService {
+interface ITarishService {
     /** Current transport state: link up, channel, country, peer count. */
-    BarqStatus getStatus();
+    TarishStatus getStatus();
 
     /**
      * Make this device discoverable. durationSeconds of 0 means indefinitely.
@@ -63,7 +63,7 @@ interface IBarqService {
     void setActive(boolean active, int staFrequencyMhz);
 
     /** Peers currently known. Fresh as of the last discovery round. */
-    BarqPeer[] getPeers();
+    TarishPeer[] getPeers();
 
 
     /**
@@ -106,8 +106,8 @@ interface IBarqService {
      * working when no client is bound — an unanswered incoming offer is surfaced
      * by the daemon itself, not by requiring a client to be running.
      */
-    void registerCallback(IBarqCallback cb);
-    void unregisterCallback(IBarqCallback cb);
+    void registerCallback(ITarishCallback cb);
+    void unregisterCallback(ITarishCallback cb);
 
     /**
      * Forget every discovered peer and browse again from scratch.
@@ -141,7 +141,7 @@ interface IBarqService {
     /**
      * Install the policy this device is to enforce.
      *
-     * ENFORCEMENT LIVES HERE, NOT IN THE APP. barqsharingd is what advertises, browses,
+     * ENFORCEMENT LIVES HERE, NOT IN THE APP. tarishsharingd is what advertises, browses,
      * accepts connections and writes files, so it has to be the thing that refuses. An
      * app that merely hides the affordance is bypassed by killing the app and talking to
      * the daemon directly, which is not a policy control at all.
@@ -155,15 +155,15 @@ interface IBarqService {
      * The app calls this on every bind, not only on change: the daemon holds policy in
      * memory and a restart must not leave it running on a stale grant.
      */
-    void setPolicy(in BarqPolicy policy);
+    void setPolicy(in TarishPolicy policy);
 
     /** What the daemon is currently enforcing, for the settings screen to render. */
-    BarqPolicy getPolicy();
+    TarishPolicy getPolicy();
 
     /**
      * Change the advertised name, persisting it across reboots.
      *
-     * The app cannot write this itself: the name lives in `persist.barq.name`, and
+     * The app cannot write this itself: the name lives in `persist.tarish.name`, and
      * setting a persist property needs a policy grant the app does not have and should
      * not be given. Passing empty restores the device-model default.
      */
@@ -177,7 +177,7 @@ interface IBarqService {
      *
      * THE APP OWNS THE RADIO; THE DAEMON OWNS THE PROTOCOL. A native daemon cannot reach
      * framework Bluetooth, so the app scans -- but it forwards the raw service data
-     * rather than decoding it, because the decoder lives in libbarq_protocol with test
+     * rather than decoding it, because the decoder lives in libtarish_protocol with test
      * vectors captured from real devices. Parsing it a second time in Java would be a
      * second thing to get wrong, and the two would drift.
      *
@@ -228,7 +228,7 @@ interface IBarqService {
      * requested and accepted first, and a peer will not answer a single frame until it
      * has been. The daemon does that handshake here and nowhere else.
      *
-     * Which one to open is decided by BarqPeer.psm, which the peer itself published.
+     * Which one to open is decided by TarishPeer.psm, which the peer itself published.
      *
      * APPENDED LAST -- transaction codes are positional.
      */

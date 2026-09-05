@@ -15,12 +15,12 @@ share sheet is up, so "no peers found" is ambiguous between *our bug* and
 PTR + SRV + AAAA shape a real peer does, on demand, from any machine with an
 AWDL interface.
 
-Used to verify barqsharingd's browser end to end:
+Used to verify tarishsharingd's browser end to end:
 
 ```
 Mac awdl0  --[ff02::fb]-->  phone mosey0
-barqsharingd::mdns: peer discovered: beefcafe1234
+tarishsharingd::mdns: peer discovered: beefcafe1234
 ```
 
-It is a **test** tool, not a Barq component: it does not implement AirDrop and
+It is a **test** tool, not a Tarish component: it does not implement AirDrop and
 the service it announces answers nothing.

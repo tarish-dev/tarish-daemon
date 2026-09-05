@@ -2,11 +2,11 @@
 //!
 //! A sender does not show a device because it answered mDNS. It resolves the SRV
 //! record, opens **TLS** to that port and sends `POST /Discover`; the device appears in
-//! the AirDrop UI only if that returns a valid plist. Barq advertised port 8770 with
+//! the AirDrop UI only if that returns a valid plist. Tarish advertised port 8770 with
 //! nothing bound to it, so no peer could ever have listed us regardless of how correct
 //! the mDNS side was.
 //!
-//! This lives in `barqsharingd`, which holds no capabilities, because everything here
+//! This lives in `tarishsharingd`, which holds no capabilities, because everything here
 //! parses input from any device on the link.
 //!
 //! **Scope: everyone-mode only.** Contacts-only AirDrop proves identity with an
@@ -46,8 +46,8 @@ const MAX_HEAD: usize = 16 * 1024;
 const MAX_BODY: usize = 8 * 1024 * 1024;
 
 /// Where received archives land. Private to this daemon, which cannot reach shared
-/// storage: the app moves them to Downloads/Barq, where Quick Share puts its own.
-const INBOX: &str = "/data/misc/barq/inbox";
+/// storage: the app moves them to Downloads/Tarish, where Quick Share puts its own.
+const INBOX: &str = "/data/misc/tarish/inbox";
 
 /// Report progress at most once per this many bytes.
 const PROGRESS_STEP: u64 = 256 * 1024;
@@ -85,7 +85,7 @@ pub struct Httpd {
     /// Rebuilt per request from the CURRENT name, not cached.
     ///
     /// It was precomputed once, which meant renaming the device in settings changed
-    /// nothing peers could see until barqsharingd restarted -- the name is what a
+    /// nothing peers could see until tarishsharingd restarted -- the name is what a
     /// person picks it for. These are two small plists; building them per request costs
     /// nothing next to the TLS handshake that just happened.
     model: String,
@@ -188,7 +188,7 @@ impl Httpd {
         // the rebind loop outside waited for it to come back, and receiving would stay
         // dead until the daemon was restarted by hand.
         //
-        // That mattered little while barqd held the link from boot to shutdown. Now
+        // That mattered little while tarishd held the link from boot to shutdown. Now
         // that the radio is released whenever nothing wants it, mosey0 disappears and
         // returns with a NEW index routinely, so this is the difference between a
         // stack that survives the second transfer and one that does not.
@@ -499,12 +499,12 @@ impl Httpd {
     ///
     /// The archive lands in this daemon's private directory and stays there. We are
     /// `nobody` with no capabilities and deliberately cannot reach shared storage;
-    /// moving files to Downloads/Barq -- where Quick Share puts its own -- is the app's
+    /// moving files to Downloads/Tarish -- where Quick Share puts its own -- is the app's
     /// job, because that is the side with the standing to write there and to tell
     /// MediaStore about it.
     /// Tell clients a transfer has been accepted and is about to send.
     ///
-    /// The file names are not known yet: they live in the /Ask plist, and Barq has a
+    /// The file names are not known yet: they live in the /Ask plist, and Tarish has a
     /// plist writer but no reader. Sending an empty list is honest -- the UI shows
     /// "receiving" without inventing names it does not have.
     /// What a peer is told when it asks who we are.
@@ -543,7 +543,7 @@ impl Httpd {
 
     fn each_callback<F>(&self, f: F)
     where
-        F: Fn(&binder::Strong<dyn crate::IBarqCallback>) -> binder::Result<()>,
+        F: Fn(&binder::Strong<dyn crate::ITarishCallback>) -> binder::Result<()>,
     {
         let cbs = match self.callbacks.lock() {
             Ok(c) => c,
@@ -644,7 +644,7 @@ impl Httpd {
     }
 
     fn receive_upload<S: Read>(&self, s: &mut S, head: &str, id: i64) -> std::io::Result<String> {
-        // No create_dir_all here: init makes /data/misc/barq/inbox at post-fs-data,
+        // No create_dir_all here: init makes /data/misc/tarish/inbox at post-fs-data,
         // and calling it anyway cost a real transfer. create_dir_all stats the path
         // first, `getattr` on the directory was not in our policy, so it could not tell
         // the directory existed, tried to create it, and returned EEXIST -- reported as
@@ -1149,7 +1149,7 @@ fn build_acceptor() -> Result<SslAcceptor, openssl::error::ErrorStack> {
     let key = PKey::from_rsa(rsa)?;
 
     let mut name = X509NameBuilder::new()?;
-    name.append_entry_by_text("CN", "Barq")?;
+    name.append_entry_by_text("CN", "Tarish")?;
     let name = name.build();
 
     let mut serial = BigNum::new()?;

@@ -1,23 +1,23 @@
-# Whether anything wants the AWDL radio. Written by barqsharingd, read by barqd.
+# Whether anything wants the AWDL radio. Written by tarishsharingd, read by tarishd.
 #
-# A property rather than binder: barqd holds CAP_NET_ADMIN and CAP_NET_RAW, and a
+# A property rather than binder: tarishd holds CAP_NET_ADMIN and CAP_NET_RAW, and a
 # property read is a shared-memory load of one boolean -- no parser, no IPC surface
-# in the privileged process. See barqd's WANT_PROP comment for why this is also not
+# in the privileged process. See tarishd's WANT_PROP comment for why this is also not
 # ctl.start/ctl.stop.
 # Prefix, not one exact key: the namespace now carries the Wi-Fi frequency as well
 # as the wanted flag, and an exact rule for one leaves the other on default_prop --
 # where set_prop on our own type is still denied, which fails silently.
-barq.awdl.          u:object_r:barq_awdl_prop:s0
+tarish.awdl.          u:object_r:tarish_awdl_prop:s0
 
-# The advertised device name. EXACT KEY, not the `persist.barq.` prefix.
+# The advertised device name. EXACT KEY, not the `persist.tarish.` prefix.
 #
-# The prefix argument above is right for `barq.awdl.`, where one process owns every key
-# in the namespace. It is wrong here: `persist.barq.` is SHARED. barqd reads
-# persist.barq.mosey_config, .channels, .sta_freq and .country as manual overrides,
-# and labelling the prefix pulled all four onto a type barqd has no grant for -- so
+# The prefix argument above is right for `tarish.awdl.`, where one process owns every key
+# in the namespace. It is wrong here: `persist.tarish.` is SHARED. tarishd reads
+# persist.tarish.mosey_config, .channels, .sta_freq and .country as manual overrides,
+# and labelling the prefix pulled all four onto a type tarishd has no grant for -- so
 # every one of them silently stopped working, including the regulatory country
-# override, while the log filled with barqd read denials.
+# override, while the log filled with tarishd read denials.
 #
 # One key needs a label because one process must SET it. The rest are read-only knobs
 # that were working on the default label; leave them there.
-persist.barq.name   u:object_r:barq_name_prop:s0
+persist.tarish.name   u:object_r:tarish_name_prop:s0

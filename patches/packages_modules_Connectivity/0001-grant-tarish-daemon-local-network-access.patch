@@ -6,11 +6,11 @@ index bf68eba401..1d3cff614f 100755
  
      private static final int SYSTEM_APPID = SYSTEM_UID;
  
-+    // barq: barqsharingd runs as a dedicated native AID declared in
-+    // vendor/barq/config/barq_aid.txt. It has no package, so it never appears in the
++    // tarish: tarishsharingd runs as a dedicated native AID declared in
++    // vendor/tarish/config/tarish_aid.txt. It has no package, so it never appears in the
 +    // package-derived permission list below and would otherwise hold no chunk
-+    // permissions at all. Keep this value in step with barq_aid.txt.
-+    private static final int AID_SYSTEM_EXT_BARQ = 7500;
++    // permissions at all. Keep this value in step with tarish_aid.txt.
++    private static final int AID_SYSTEM_EXT_TARISH = 7500;
 +
      private static final int MAX_PERMISSION_UPDATE_LOGS = 40;
      private final SharedLog mPermissionUpdateLogs = new SharedLog(MAX_PERMISSION_UPDATE_LOGS, TAG);
@@ -19,16 +19,16 @@ index bf68eba401..1d3cff614f 100755
                                              chunkPermissions);
                                  }
                              }
-+                            // barq: grant the barq sharing daemon LOCAL NETWORK access.
++                            // tarish: grant the tarish sharing daemon LOCAL NETWORK access.
 +                            // Since Android B, is_local_network_access_blocked() in bpf/progs/netd.c
 +                            // exempts only uid 0 and uid 1000 (is_system_or_root); every other uid must
 +                            // carry PERMISSION_BIT_ACCESS_LOCAL_NETWORK in this map, or its packets to
-+                            // local destinations are dropped with EPERM at sendto(). barqsharingd needs
++                            // local destinations are dropped with EPERM at sendto(). tarishsharingd needs
 +                            // mDNS on wlan0 (224.0.0.251:5353) for Quick Share discovery. This grants
 +                            // that one bit and nothing else -- notably NOT NO_INTERNET, which leaves the
 +                            // uid's internet access exactly as it already was.
 +                            allUidsPermissionBits.put(
-+                                    AID_SYSTEM_EXT_BARQ, PERMISSION_BIT_ACCESS_LOCAL_NETWORK);
++                                    AID_SYSTEM_EXT_TARISH, PERMISSION_BIT_ACCESS_LOCAL_NETWORK);
                              mBpfNetMaps.setChunkPermListForUids(allUidsPermissionBits);
                          } catch (ServiceSpecificException e) {
                              Log.e(TAG, "Send uid traffic permission failed." + e);

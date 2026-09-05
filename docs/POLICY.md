@@ -6,7 +6,7 @@ Two related pieces of control, agreed 2026-09-01, neither implemented yet.
 - **What happens when "Block connections without VPN" is enabled**, which is the harder
   half and the one with a security argument attached.
 
-They connect at one point: the administrator decides whether Barq may operate under
+They connect at one point: the administrator decides whether Tarish may operate under
 lockdown at all.
 
 ---
@@ -52,7 +52,7 @@ safe one.
 
 ### Enforcement belongs in the daemon, not the UI
 
-A hidden button is not a policy control. `barqsharingd` is what advertises, browses,
+A hidden button is not a policy control. `tarishsharingd` is what advertises, browses,
 accepts connections and writes files, so policy has to reach it and it has to be the
 thing that refuses. An app that merely hides the affordance is bypassed by killing the
 app or connecting to the daemon directly.
@@ -61,13 +61,13 @@ The daemon cannot read managed configuration itself — it is native, uid 7500, 
 framework access, for the same reason it cannot do BLE. So:
 
 ```
-MDM -> DPC -> app (RestrictionsManager) -> AIDL -> barqsharingd enforces
+MDM -> DPC -> app (RestrictionsManager) -> AIDL -> tarishsharingd enforces
 ```
 
 and the daemon **defaults to denied**, opening only on being told. A daemon that has
 never heard from the app shares nothing.
 
-Note this is the opposite of the radio gate, where an unset `barq.awdl.wanted` means
+Note this is the opposite of the radio gate, where an unset `tarish.awdl.wanted` means
 radio-ON. That default is right there — a missing property should not silently disable
 sharing — and wrong here, where a missing policy must not silently permit it. Do not
 copy the pattern across.
@@ -143,7 +143,7 @@ packages" — measured:
 | 1001 `radio` | has packages | **no** |
 | 1002 `bluetooth` | has packages | **yes** |
 | 1027 `nfc` | has packages | **yes** |
-| 7500 `system_ext_barq` | no package | **no** |
+| 7500 `system_ext_tarish` | no package | **no** |
 | 10000+ | apps | **yes** |
 
 1000 and 1001 have packages and escape; 1002 and 1027 have packages and are caught. So
@@ -173,13 +173,13 @@ existed. What creates the exemption is the decision that the untrusted half is a
 
 Stated plainly, because it is the reason this work matters: a person enables "Block
 connections without VPN", believes their device cannot move data off itself outside
-the tunnel, and Barq can still advertise, discover and transfer files to a device
+the tunnel, and Tarish can still advertise, discover and transfer files to a device
 across the room. That is a data-exfiltration path under a control they deliberately
 switched on. Narrower than a rogue app phoning home, since it is local rather than
 internet-facing, but data still leaves on a path the user believes is closed.
 
-So the session model is **remediation, not a feature**. Its priority is not "make Barq
-usable under lockdown" but "stop Barq being the thing that undermines lockdown".
+So the session model is **remediation, not a feature**. Its priority is not "make Tarish
+usable under lockdown" but "stop Tarish being the thing that undermines lockdown".
 
 ### So the work is to honour lockdown, not to bypass it
 
@@ -188,7 +188,7 @@ enabling "Block connections without VPN" believes traffic is blocked; a daemon t
 keeps advertising and answering mDNS because it happens to have no package is not
 something to quietly benefit from.
 
-So: **no framework patch, and none should be written.** Barq detects lockdown and
+So: **no framework patch, and none should be written.** Tarish detects lockdown and
 disables itself, and the session model below is what re-enables it after
 authentication. Everything is enforced in our own code, which also means it is
 fail-closed by construction rather than by asking netd nicely.
@@ -229,7 +229,7 @@ would let a clock change extend a session, and `CLOCK_MONOTONIC` stops across su
 which would let one survive a night in a pocket.
 
 **DISABLED means silent**, not "visible but refusing": no advertising, no browsing, no
-accepting connections. Under lockdown Barq is not on the air at all until a human opens
+accepting connections. Under lockdown Tarish is not on the air at all until a human opens
 it. Easier to reason about and easier to verify.
 
 **The cost, which the app must state rather than let people discover:** under lockdown

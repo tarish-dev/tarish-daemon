@@ -74,7 +74,7 @@ impl QsBrowser {
         //     17000: from all iif lo oif wlan0 lookup wlan0
         //
         // which has no uid range, so naming the interface is enough and no capability
-        // is required. barqsharingd holds none and must keep it that way.
+        // is required. tarishsharingd holds none and must keep it that way.
         set_multicast_if_v4(&sock, ifindex)?;
         sock.set_read_timeout(Some(Duration::from_millis(500)))?;
 

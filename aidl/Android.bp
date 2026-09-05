@@ -1,11 +1,11 @@
-// The Barq client contract.
+// The Tarish client contract.
 //
-// Built with both a Rust backend (barqsharingd implements it) and a Java one
+// Built with both a Rust backend (tarishsharingd implements it) and a Java one
 // (the app consumes it). Marked unstable while the interface is still moving;
 // it should be frozen once the app ships against it.
 aidl_interface {
-    name: "dev.barq",
-    srcs: ["dev/barq/*.aidl"],
+    name: "dev.tarish",
+    srcs: ["dev/tarish/*.aidl"],
     unstable: true,
     backend: {
         rust: { enabled: true },

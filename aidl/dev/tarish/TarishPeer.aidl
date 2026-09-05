@@ -1,7 +1,7 @@
-package dev.barq;
+package dev.tarish;
 
 /** A peer discovered on the AWDL link. */
-parcelable BarqPeer {
+parcelable TarishPeer {
     /** Stable within a session; what sendFiles() takes. */
     String id;
     /** Human-readable, as advertised by the peer. */
@@ -11,9 +11,9 @@ parcelable BarqPeer {
     /** Signal strength in dBm; 0 if unknown. */
     int rssi;
     /**
-     * Which protocol found this peer — one of IBarqService.PROTOCOL_*.
+     * Which protocol found this peer — one of ITarishService.PROTOCOL_*.
      *
-     * Barq speaks two protocols to two different worlds, and they are not
+     * Tarish speaks two protocols to two different worlds, and they are not
      * interchangeable: an Apple device reachable over AirDrop cannot be sent to over
      * Quick Share, and the reverse. A person choosing a device is choosing a protocol
      * whether or not the UI admits it, so the UI says it.

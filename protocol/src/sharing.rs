@@ -21,7 +21,7 @@
 //! **We have no certificate store, and that is a deliberate position rather than a gap.**
 //! A stock Quick Share sender proves it belongs to one of your contacts by signing the
 //! receiver's UKEY2 token with a private key rooted in a Google account, and sending a
-//! hash of the certificate's secret id alongside. Barq has no Google account by design,
+//! hash of the certificate's secret id alongside. Tarish has no Google account by design,
 //! so it cannot produce either value and does not want to. Filling both fields with
 //! random bytes of the right length is what NearDrop does and what real Android peers
 //! tolerate: the peer looks for a matching certificate, finds none, falls through to its

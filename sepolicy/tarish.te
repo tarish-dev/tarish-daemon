@@ -1,14 +1,14 @@
-# Types shared between the two Barq domains.
+# Types shared between the two Tarish domains.
 #
-# Kept out of barqd.te and barqsharingd.te because a type declared in one and used
+# Kept out of tarishd.te and tarishsharingd.te because a type declared in one and used
 # by the other reads as though it belongs to that domain. This one belongs to
 # neither: it is the channel between them.
 
-# Whether the AWDL radio is wanted. barqsharingd sets it, barqd reads it.
-type barq_awdl_prop, property_type;
+# Whether the AWDL radio is wanted. tarishsharingd sets it, tarishd reads it.
+type tarish_awdl_prop, property_type;
 
 # The advertised device name, set from the settings screen.
 #
 # A `persist.` property so the name survives a reboot without this daemon keeping a
 # file of its own, and so init restores it before anything advertises.
-type barq_name_prop, property_type;
+type tarish_name_prop, property_type;

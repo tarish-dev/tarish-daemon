@@ -177,7 +177,7 @@ fn nl80211_family() -> io::Result<u16> {
 ///     nl80211 said 2412 MHz, and `iw dev wlan0 info` said channel 44 (5220 MHz)
 ///     moments later -- two different bands, neither of them an association
 ///
-/// Acting on that is worse than knowing nothing: barqd would withhold a band to
+/// Acting on that is worse than knowing nothing: tarishd would withhold a band to
 /// protect an association that does not exist, and could refuse every candidate.
 ///
 /// operstate is the discriminator. Linux reports `dormant` for a wireless interface

@@ -1,4 +1,4 @@
-//! Quick Share — the Android-to-Android side of Barq.
+//! Quick Share — the Android-to-Android side of Tarish.
 //!
 //! WHY THIS EXISTS SEPARATELY FROM THE AIRDROP CODE
 //!
@@ -22,7 +22,7 @@
 //!
 //! Written from the protocol, not from anyone's source. Bada is unlicensed, so it is
 //! read here as a specification exactly as OpenDrop was for AirDrop; see
-//! barq-app/docs/CREDITS.md. Byte offsets, bit positions, hash prefixes and alphabets
+//! tarish-app/docs/CREDITS.md. Byte offsets, bit positions, hash prefixes and alphabets
 //! are protocol facts and are nobody's expression.
 
 // The identity layer lands before the socket that uses it. These are consumed by

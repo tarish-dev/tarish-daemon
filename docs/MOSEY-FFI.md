@@ -1,8 +1,8 @@
-# The vendor AWDL ABI that `barqd` calls
+# The vendor AWDL ABI that `tarishd` calls
 
 `libmosey_daemon_ffi.so` ships in the Pixel vendor image and contains the AWDL
 protocol: master election, availability-window synchronisation, peer tables and
-action frames. `barqd` `dlopen`s it and calls five functions.
+action frames. `tarishd` `dlopen`s it and calls five functions.
 
 This file is the reference a maintainer needs. It is **not** a header shipped by
 the vendor — every line below was recovered by observation, and the vendor is
@@ -92,7 +92,7 @@ takes seven arguments. That implies at least five prior revisions, so treat the
 ABI as versioned and unstable across vendor images: `dlsym` the exact name and
 fail loudly rather than degrade.
 
-`barqd` isolates every call to this library in `src/barqd.c` for that reason.
+`tarishd` isolates every call to this library in `src/tarishd.c` for that reason.
 
 ## Provenance
 

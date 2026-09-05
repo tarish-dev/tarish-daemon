@@ -1,17 +1,17 @@
-package dev.barq;
+package dev.tarish;
 
-import dev.barq.BarqPeer;
+import dev.tarish.TarishPeer;
 
-/** Events from barqd to a bound client. All calls are oneway: the daemon must
+/** Events from tarishd to a bound client. All calls are oneway: the daemon must
  *  never block on a UI process, which may be slow, frozen or about to die. */
-oneway interface IBarqCallback {
-    void onPeerFound(in BarqPeer peer);
+oneway interface ITarishCallback {
+    void onPeerFound(in TarishPeer peer);
     void onPeerLost(String peerId);
 
     /**
      * An incoming transfer is being offered. Answer with respondToOffer().
      *
-     * `protocol` is one of IBarqService.PROTOCOL_*. The prompt names it, because
+     * `protocol` is one of ITarishService.PROTOCOL_*. The prompt names it, because
      * "someone wants to send you a file" is a different decision depending on whether
      * it arrived over AirDrop or Quick Share, and the sender's name alone does not say.
      */
@@ -42,7 +42,7 @@ oneway interface IBarqCallback {
      * direction.
      *
      * Arrives after the introduction has gone out, because that is when the receiver
-     * puts its PIN on screen. Answer with IBarqService.confirmTransferPin; nothing is
+     * puts its PIN on screen. Answer with ITarishService.confirmTransferPin; nothing is
      * sent until it matches.
      *
      * APPENDED LAST, and any future method must be too: the Rust and Java stubs map

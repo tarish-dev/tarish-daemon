@@ -610,7 +610,7 @@ mod tests {
         UpgradePath {
             medium: Medium::WifiHotspot,
             wifi: Some(WifiCredentials {
-                ssid: "DIRECT-xy-Barq".into(),
+                ssid: "DIRECT-xy-Tarish".into(),
                 password: "hunter2hunter2".into(),
                 port: 45123,
                 gateway: "192.168.49.1".into(),
@@ -640,7 +640,7 @@ mod tests {
             [Effect::Join(p)] => p.clone(),
             other => panic!("unexpected: {other:?}"),
         };
-        assert_eq!(joined.wifi.as_ref().unwrap().ssid, "DIRECT-xy-Barq");
+        assert_eq!(joined.wifi.as_ref().unwrap().ssid, "DIRECT-xy-Tarish");
         assert_eq!(joined.wifi.as_ref().unwrap().port, 45123);
 
         // Caller joins and reports back; joiner introduces itself on the NEW channel.

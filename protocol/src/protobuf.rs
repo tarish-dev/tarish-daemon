@@ -3,7 +3,7 @@
 //! No protobuf crate is vendored in the AOSP tree, and adding one is a chore that buys
 //! little here: the messages are small, the wire format is four rules, and hand-rolling
 //! keeps this crate dependency-free — which is what lets it build outside the tree at
-//! all. barqd already encodes StartMoseyConfig the same way.
+//! all. tarishd already encodes StartMoseyConfig the same way.
 //!
 //! Only the two wire types Quick Share uses are constructed: varint (0) and
 //! length-delimited (2). The other three are SKIPPED rather than rejected when reading,

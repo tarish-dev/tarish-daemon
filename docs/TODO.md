@@ -40,7 +40,7 @@ and the transfer is reported failed with every byte delivered, which is what the
   malformed offer, adopt timeout). After `LAST_WRITE` it is terminal -- the old channel is
   no longer safe to stream on.
 
-**The protocol half is already written and tested**: `barq_protocol::upgrade`, including
+**The protocol half is already written and tested**: `tarish_protocol::upgrade`, including
 `a_whole_upgrade_completes_on_both_sides`. What is missing is the radio.
 
 **Do WIFI_LAN first.** When both devices are on the same network the upgrade is a TCP
@@ -145,7 +145,7 @@ Each of those was found by being wrong first, and each wrong version failed sile
 LEGACY means one service per channel, so the first thing after the introduction is the
 ordinary Nearby CONNECTION_REQUEST. A MultiplexFrame there is acknowledged by byte count
 and the socket then closed, which from the sending side is indistinguishable from being
-refused. `barq_protocol::multiplex` is kept and tested for peers that do multiplex.
+refused. `tarish_protocol::multiplex` is kept and tested for peers that do multiplex.
 
 **And the endpoint id must be FOUR CHARACTERS.** Ours was the mDNS instance label --
 `instance_name()` base64url-encodes a ten-byte structure and yields fourteen. Windows
@@ -265,7 +265,7 @@ with no foreign-implementation vector.
 
 ### Quick Share: what is left is the socket, not the protocol
 
-`libbarq_protocol` is complete and covered by 127 tests, including one that runs a whole
+`libtarish_protocol` is complete and covered by 127 tests, including one that runs a whole
 share between two peers in-process — UKEY2 handshake, key derivation, encrypted channel,
 paired-key exchange, introduction, acceptance, a 300 KB file in 64 KiB chunks,
 reassembled and compared byte for byte. `quickshare::connection::serve` is the I/O loop
@@ -293,9 +293,9 @@ Three things stand between that and receiving a file on hardware:
 Only (3) is real protocol work; (1) and (2) are plumbing. Sending — the outbound
 direction — needs the same three plus `fsm::Outbound`, which is written and tested.
 
-**Not blocking, but worth knowing:** `libbarq_protocol` is a dylib rather than an rlib.
+**Not blocking, but worth knowing:** `libtarish_protocol` is a dylib rather than an rlib.
 It was declared `rust_library_rlib` first and Soong emitted a correct-looking
-`--extern barq_protocol=<valid rlib>` that rustc still could not resolve. Worth another
+`--extern tarish_protocol=<valid rlib>` that rustc still could not resolve. Worth another
 look if someone wants the static link; it is not worth blocking on, and `gos-push.sh`
 carries the .so and verifies it.
 
@@ -330,7 +330,7 @@ the transaction was accepted rather than rejected.
 Next, and untested because the device on the cable is a prod build without this code:
 
 ```
-service call dev.barq.IBarqService/default 13
+service call dev.tarish.ITarishService/default 13
 ```
 
 If the daemon logs on that, the daemon is fine and the app is sending something else.
@@ -367,7 +367,7 @@ Ruled out by measurement:
 **A dead beacon is NOT the cause — tested.** The service had a real bug (it never
 recovered after a Bluetooth cycle, and `am stopservice`/`startservice` killed
 advertising without restarting it, which invalidated several measurements taken
-during this investigation). That is fixed in barq-app 2d19065. With the beacon then
+during this investigation). That is fixed in tarish-app 2d19065. With the beacon then
 verified advertising, the radio up and Bluetooth on:
 
 ```
@@ -381,7 +381,7 @@ Unchanged. So the beacon being absent does not explain it.
 phone in receive mode:
 
 ```
-barqsharingd::mdns: answered 8 record(s) to ["_airdrop._tcp.local/12"]
+tarishsharingd::mdns: answered 8 record(s) to ["_airdrop._tcp.local/12"]
 ```
 
 So the peer's queries reach us, we answer them, and it finds us — that is why
@@ -406,11 +406,11 @@ Found while testing the above. With Bluetooth toggled off and on:
 
 - `settings get global bluetooth_on` returns 1, so the adapter is up
 - no `advertising AirDrop beacon` line appears again
-- an explicit `am startservice .../.BarqBleService` produces no line either, though
+- an explicit `am startservice .../.TarishBleService` produces no line either, though
   the same command logged one before the cycle
 
 So anything that cycles the adapter — airplane mode, a system event, the user
-toggling Bluetooth — appears to leave Barq silently not advertising, with no error
+toggling Bluetooth — appears to leave Tarish silently not advertising, with no error
 and no recovery. That would break both directions, not just sending.
 
 Not yet isolated: whether the advertiser fails, throws, or is never re-issued. The
@@ -430,7 +430,7 @@ when AWDL stops, survives a Wi-Fi toggle, and needs a reboot. Full measurements 
 BUILD-NOTES 40 of the OS integration.
 
 The difference is `wondertap`. 4390 exposes it, so `wonder.ko` binds and the Netlink
-path drives a real `wonder` wiphy. 4383 does not, so barqd falls back to driving
+path drives a real `wonder` wiphy. 4383 does not, so tarishd falls back to driving
 `radiotap0` — a monitor interface, which takes the physical radio with it whatever
 channel is requested.
 
@@ -514,13 +514,13 @@ honour lockdown voluntarily rather than to bypass it.
 
 Android's *Block connections without VPN* (always-on VPN lockdown) is a good setting
 and enterprises rightly turn it on. It also breaks every peer-to-peer transfer that
-works by IP — AirDrop, Quick Share and Barq alike — because the traffic is on a
+works by IP — AirDrop, Quick Share and Tarish alike — because the traffic is on a
 link-local address that is not the VPN, so it is dropped. Nothing tells the person
 why. The device simply stops being able to send or receive, and the app looks broken.
 
 **Behaviour we want**
 
-1. **Detect** that lockdown is on. Barq is platform-signed and privileged, so the
+1. **Detect** that lockdown is on. Tarish is platform-signed and privileged, so the
    hidden setting is readable; that is a starting point, not a design.
 2. **Under lockdown, every transfer is individually authorised by the person** —
    biometric or device PIN, per send and per receive. Not a setting, not a
@@ -528,13 +528,13 @@ why. The device simply stops being able to send or receive, and the app looks br
    the only defensible way to make a hole in it is a human opening it once, knowingly,
    for one transfer.
 3. **Open the path for that transfer only, then close it again.** Fail closed: if
-   barqd or barqsharingd dies mid-transfer, or the app is killed, the exemption must
+   tarishd or tarishsharingd dies mid-transfer, or the app is killed, the exemption must
    not outlive it. An exemption that survives a crash is precisely the hole the
    setting exists to prevent.
 4. **No device credential, no transfer.** If there is no PIN and no enrolled
-   biometric there is nothing to authorise with, so under lockdown Barq refuses to
+   biometric there is nothing to authorise with, so under lockdown Tarish refuses to
    send or receive at all. Refusing is the correct answer here, not a fallback.
-5. **Say so in the app.** Barq behaves differently under lockdown and the UI should
+5. **Say so in the app.** Tarish behaves differently under lockdown and the UI should
    state that plainly — the same reasoning as the "AirDrop radio is not running"
    card: an app that silently does less is indistinguishable from one that is broken.
 
@@ -546,14 +546,14 @@ stack does not work either**. Same setting, same outcome.
 
 Three things follow, and they matter more than the original framing:
 
-1. **This is not a Barq deficiency.** The whole peer-to-peer class is blocked, and a
+1. **This is not a Tarish deficiency.** The whole peer-to-peer class is blocked, and a
    privileged, system-integrated, Google-signed implementation is blocked with it.
    Anyone hitting this on stock Android hits it too.
 2. **There is no app-level workaround to copy.** Google, with a privileged app and
    every platform integration available to them, did not solve it — so we should not
    expect to find a supported API that quietly exempts us. If one existed, theirs
    would use it.
-3. **The fix is therefore a platform change, and we can make one.** Barq ships inside
+3. **The fix is therefore a platform change, and we can make one.** Tarish ships inside
    an OS we build. Google's app could not modify netd, the bpf rules or
    ConnectivityService; we can. That is a real advantage and it cuts both ways: we
    would be putting a hole in a security control *in our own OS*, for our own app,
@@ -564,7 +564,7 @@ Three things follow, and they matter more than the original framing:
 **Still to measure**
 
 - The test above used Google's stack, which runs as a privileged *app* uid.
-  `barqsharingd` is a native daemon with its own uid, and lockdown is applied over uid
+  `tarishsharingd` is a native daemon with its own uid, and lockdown is applied over uid
   ranges. It is possible the daemon is already outside them and only the app-side
   traffic was blocked — that would change what needs building. **Answer this first.**
 - Which layer actually drops the packet: the bpf owner match, an iptables rule, or
@@ -586,16 +586,16 @@ specific transfer, just now", the transfer does not happen.
   (5745 MHz, U-NII-3). Permitted in Qatar, the US and much of Asia; largely **not**
   permitted for Wi-Fi in the EU. The country is now read correctly and follows the
   device, but in a region where 149 is barred the vendor library will refuse to bring
-  the radio up and Barq will fail closed with a correct country in the log -- which
+  the radio up and Tarish will fail closed with a correct country in the log -- which
   will read as a different bug than it is.
 
   Apple picks per region (2.4 GHz ch 6, or 5 GHz 44/149), so the fix is a channel
   table keyed on the regulatory domain rather than a constant. Until then the honest
-  statement is: Barq works where channel 149 is permitted.
+  statement is: Tarish works where channel 149 is permitted.
 
 - **Drop `android_logger` from the privileged half — before any production build.**
 
-  `barqd`'s own header states the rule: *"every dependency is part of its threat
+  `tarishd`'s own header states the rule: *"every dependency is part of its threat
   model, and one property read does not justify one."* It then links a full regex
   engine for log filtering. Confirmed in its runtime maps:
 
@@ -605,11 +605,11 @@ specific transfer, just now", the transfer does not happen.
 
   AOSP builds `libandroid_logger` with the `regex` feature and `libenv_filter`
   baked in, and ships no regex-free variant, so this arrives whether or not it is
-  wanted. `barqd` never uses filter strings — it sets a tag and a max level — so
+  wanted. `tarishd` never uses filter strings — it sets a tag and a max level — so
   the whole engine is dead weight in the one process holding `CAP_NET_ADMIN` and
   `CAP_NET_RAW`.
 
-  Fix is ~20 lines calling `__android_log_write` through libc, leaving `barqd`
+  Fix is ~20 lines calling `__android_log_write` through libc, leaving `tarishd`
   linking only libc and the `log` facade. **Deliberately deferred:** convenient
   logging is worth more than the dependency while the daemon is still being
   developed, and swapping the logger mid-development trades a real debugging aid
@@ -638,7 +638,7 @@ specific transfer, just now", the transfer does not happen.
 receiver lists the sender **once**, not twice. Something correlates the two
 advertisements, and we do not know what.
 
-This has to be understood **before** the Quick Share migration starts, because Barq
+This has to be understood **before** the Quick Share migration starts, because Tarish
 will be exactly such a device -- speaking AirDrop to Apple peers and Quick Share to
 Android ones -- and getting it wrong means every Android peer sees us twice.
 
@@ -660,7 +660,7 @@ mDNS layer.
 scanner groups them by source address before either protocol is involved. That would
 explain dedup with no shared identifier anywhere above the link layer.
 
-**The experiment**, using what already exists: `BarqBleService` logs the source address
+**The experiment**, using what already exists: `TarishBleService` logs the source address
 of every AirDrop beacon it sees. Add a second scan filter for `0xFE2C` and log the same
 way, then watch the two phones that actually exhibit the behaviour. If both payloads
 appear from one address at any given moment, the hypothesis holds.
@@ -700,13 +700,13 @@ Two places it could live, and we do not know which:
 Apple also broadcasts a separate **NearbyInfo** message (type `0x10`) alongside
 AirDrop's `0x05`, which is a third candidate.
 
-**The experiment**, cheap and using what exists: `BarqBleService` already scans Apple
+**The experiment**, cheap and using what exists: `TarishBleService` already scans Apple
 beacons and logs the sender address. Log the full manufacturer payload instead, then
 lock and unlock an iPhone while it advertises and diff the bytes. The same method
 decoded the framed cpio container in one capture.
 
 **Why it matters beyond curiosity:** if Apple already models "device present but screen
-off", then Barq's app-open visibility rule maps onto something the protocol expects
+off", then Tarish's app-open visibility rule maps onto something the protocol expects
 rather than being our own invention, and a peer could show us accurately instead of
 listing a device that will refuse.
 
@@ -750,7 +750,7 @@ briefly looked like a regulatory restriction. The real check showed 50 channels 
 20 dBm and country QA.
 
 
-### barqsharingd could not send on wlan0 — SOLVED, and not by the uid alone
+### tarishsharingd could not send on wlan0 — SOLVED, and not by the uid alone
 
 The daemon advertised AirDrop happily and every Quick Share mDNS query died with
 EPERM at `sendto`, while `socket`, `bind` and `IP_MULTICAST_IF` all succeeded.
@@ -770,10 +770,10 @@ recently got narrower, not one we had misread.
 
 Two parts, both shipped:
 
-- the daemon runs as its own AID, `system_ext_barq` (7500), declared through
+- the daemon runs as its own AID, `system_ext_tarish` (7500), declared through
   `TARGET_FS_CONFIG_GEN`. This buys isolation and legibility, not network access.
 - the integrator grants the bit:
-  `grapheneos/patches/packages_modules_Connectivity/0001-grant-barq-daemon-local-network-access.patch`
+  `grapheneos/patches/packages_modules_Connectivity/0001-grant-tarish-daemon-local-network-access.patch`
 
 Why this never affected AirDrop, which had been doing mDNS for weeks: the access map
 is keyed by INTERFACE, and `mosey0` is not a managed network. The gate is wlan0-only.
@@ -821,7 +821,7 @@ blocker".
       `/Discover` and `/Ask` bodies are flat dicts of strings and data blobs
 - [ ] TLS via `libopenssl` (BoringSSL-backed, already in the tree). No HTTP crate
       exists either, but the surface is four routes and hand-writing it matches how
-      barqsharingd already hand-parses DNS.
+      tarishsharingd already hand-parses DNS.
 
 Only once something answers on that port does the question below become testable at all.
 
@@ -834,7 +834,7 @@ advertising is now live and correct, and it did not by itself change that.
 Two device-side tests, neither yet run, that separate "our beacon is wrong" from "the
 test setup was never valid":
 
-- [ ] **Confirm the Mac is set to "Everyone", not "Contacts Only".** Barq's beacon
+- [ ] **Confirm the Mac is set to "Everyone", not "Contacts Only".** Tarish's beacon
       carries zeroed identifier hashes — an honest "no identity". A Contacts-Only
       receiver is *supposed* to ignore that, so on that setting the result is expected
       and proves nothing.
@@ -845,7 +845,7 @@ test setup was never valid":
 
 Then, if both are clean and it still does not appear:
 
-- [ ] **Trace `mosey_update`.** Barq calls only `mosey_start_5` and `mosey_stop`.
+- [ ] **Trace `mosey_update`.** Tarish calls only `mosey_start_5` and `mosey_stop`.
       Google's daemon also calls `mosey_update(handle, ptr, 1, 0)`, and the pointer's
       contents were never identified. It is the leading candidate for populating the
       AWDL service-response TLVs that Mosey's state dump reports.

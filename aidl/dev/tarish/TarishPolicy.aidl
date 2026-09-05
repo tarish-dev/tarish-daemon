@@ -1,4 +1,4 @@
-package dev.barq;
+package dev.tarish;
 
 /**
  * What this device is permitted to do, per protocol and per direction.
@@ -17,10 +17,10 @@ package dev.barq;
 // The Rust backend derives nothing by default, and the daemon holds this behind a
 // Mutex and hands copies out of getPolicy.
 @RustDerive(Clone=true, PartialEq=true)
-parcelable BarqPolicy {
-    /** One of IBarqService.MODE_*. */
+parcelable TarishPolicy {
+    /** One of ITarishService.MODE_*. */
     int airdrop;
-    /** One of IBarqService.MODE_*. */
+    /** One of ITarishService.MODE_*. */
     int quickshare;
     /** Ask before accepting an incoming transfer. Defaults on; an admin may turn it off. */
     boolean requireConfirmation;
