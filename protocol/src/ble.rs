@@ -292,6 +292,10 @@ pub const SERVICE_ID_HASH: [u8; 3] = [0xFC, 0x9F, 0x5E];
 pub const ENDPOINT_ID_LEN: usize = 4;
 /// Bluetooth Classic MAC, in the regular form only.
 const MAC_LEN: usize = 6;
+/// Two bytes of device token sit between the body and the optional trailing fields.
+const DEVICE_TOKEN_LEN: usize = 2;
+/// Bit 0 of the trailing-field mask: an L2CAP PSM follows.
+const EXTRA_FIELD_PSM: u8 = 0x01;
 /// Where the name length sits inside EndpointInfo: after flags, a 2-byte salt and a
 /// 14-byte encrypted metadata key.
 const NAME_LEN_AT: usize = 17;
@@ -322,6 +326,18 @@ pub struct Advertisement {
     /// the fast form, and `None` when the advertiser zeroed it, which means it has no
     /// BR/EDR listener to connect to.
     pub bluetooth_mac: Option<String>,
+    /// The L2CAP connection-oriented-channel PSM the peer is listening on, if it
+    /// published one.
+    ///
+    /// **This is a peer saying where to connect, and it is not decoration.** A stock
+    /// Pixel advertising a PSM refuses an RFCOMM connection on the Nearby service --
+    /// accepted and closed inside 200 ms, no frame either way -- while a Windows peer,
+    /// which publishes no PSM, accepts RFCOMM and completes a whole transfer. Same
+    /// sender, same code, opposite outcome; the PSM is what tells them apart.
+    ///
+    /// It sits in the OPTIONAL trailing fields, after the frame's own device token, so
+    /// it is easy to advertise and easy to never notice.
+    pub psm: Option<u16>,
 }
 
 /// Pull the device name out of endpoint info, if it is there in the clear.
@@ -360,9 +376,18 @@ fn format_mac(b: &[u8]) -> Option<String> {
 /// what it finds. Returning a wrong endpoint id would be worse than returning nothing --
 /// it produces a connection attempt to something that will never answer.
 pub fn parse_advertisement(data: &[u8]) -> Option<Advertisement> {
-    // The REGULAR form, identified by the service-id hash with a version byte in front.
-    // Scanned for rather than read at a fixed offset: the hash appears twice in the
-    // captured Windows advertisement, and only one of them starts a real body.
+    // The framed read FIRST, because it is the only one that can find the trailing
+    // fields. The body is length-delimited, so the extras start at a known offset; the
+    // scan below cannot know where the body ended and so can never see a PSM.
+    if let Some(a) = framed(data) {
+        return Some(a);
+    }
+
+    // FALLBACK: find the body by its own internal consistency.
+    //
+    // Kept because it is what worked before the frame header was understood, and a
+    // wrapper we have not characterised should degrade to "a peer with no PSM" rather
+    // than to "no peer". A peer found this way is still reachable over Bluetooth.
     for i in 1..data.len().saturating_sub(SERVICE_ID_HASH.len()) {
         if data[i..i + SERVICE_ID_HASH.len()] != SERVICE_ID_HASH {
             continue;
@@ -371,9 +396,67 @@ pub fn parse_advertisement(data: &[u8]) -> Option<Advertisement> {
             return Some(a);
         }
     }
-
-    // The FAST form: no hash, no MAC. The body follows a two-byte frame header.
     body_at(data, 2, false)
+}
+
+/// Nearby's Mediums frame: a header, a length-delimited body, a device token, and
+/// optional trailing fields.
+///
+/// ```text
+///   fast     0x4A | len:1  | body | token:2 | [mask:1 [psm:2] [rx_len:1 rx:n]]
+///   regular  0x48 | hash:3 | len:4 | body | token:2 | [mask ...]
+/// ```
+///
+/// Format credit: Bada's `BleAdvertisement.kt` (Apache 2.0). Reconstructing this from
+/// captures got as far as the body and stopped there -- the trailing bytes read as
+/// padding, and a PSM is two of them.
+fn framed(data: &[u8]) -> Option<Advertisement> {
+    let header = *data.first()?;
+    let version = (header & 0xE0) >> 5;
+    let socket_version = (header & 0x1C) >> 2;
+    let fast = header & 0x02 != 0;
+    // Refuses anything whose header is not a version this format has ever had, which is
+    // what stops an unrelated 0xFEF3 service being read as a peer.
+    if !(1..=2).contains(&version) || !(1..=2).contains(&socket_version) {
+        return None;
+    }
+
+    let mut o = 1usize;
+    let body_len = if fast {
+        let n = *data.get(o)? as usize;
+        o += 1;
+        n
+    } else {
+        if data.get(o..o + SERVICE_ID_HASH.len())? != SERVICE_ID_HASH {
+            return None;
+        }
+        o += SERVICE_ID_HASH.len();
+        let n = u32::from_be_bytes(data.get(o..o + 4)?.try_into().ok()?) as usize;
+        o += 4;
+        n
+    };
+
+    let body_start = o;
+    let body_end = o.checked_add(body_len)?;
+    if body_end > data.len() {
+        return None;
+    }
+    let mut advert = body_at(data, body_start, !fast)?;
+
+    // Past the body: two bytes of device token, then the optional fields.
+    let mut p = body_end.checked_add(DEVICE_TOKEN_LEN)?;
+    if let Some(&mask) = data.get(p) {
+        p += 1;
+        if mask & EXTRA_FIELD_PSM != 0 {
+            let raw = data.get(p..p + 2)?;
+            let psm = u16::from_be_bytes([raw[0], raw[1]]);
+            // Zero is "no listener", not PSM 0.
+            if psm != 0 {
+                advert.psm = Some(psm);
+            }
+        }
+    }
+    Some(advert)
 }
 
 /// Read a body starting at `at`, where `at` is the version byte.
@@ -409,12 +492,69 @@ fn body_at(data: &[u8], at: usize, regular: bool) -> Option<Advertisement> {
         endpoint_info: info,
         verified: regular,
         bluetooth_mac,
+        // Filled by `framed`, which is the only caller that knows where the body ended.
+        psm: None,
     })
 }
 
 #[cfg(test)]
 mod advertisement_tests {
     use super::*;
+
+    /// Captured 2026-09-05, side by side, on the same scan.
+    ///
+    /// These two decide which socket a sender opens, and they disagree. The Pixel
+    /// publishes an L2CAP PSM and REFUSES an RFCOMM connection on the Nearby service --
+    /// accepted, then closed within 200 ms, not a frame in either direction. The Windows
+    /// machine publishes no PSM and completes a whole transfer over RFCOMM. Same sender,
+    /// same code.
+    const PIXEL_WITH_PSM: &str = "48fc9f5e0000002723fc9f5e574c545116223113fb32e346953\
+6c622a25dd0711d85044b2d4e36541fcd6972640000e6a50100b1";
+    const WINDOWS_NO_PSM: &str = "48fc9f5e0000002b23fc9f5e443742301a06ce1b46b462fc3fd\
+d42301dd5ac4eed5c084b2d50726f4172749cc7d3e40de9000064ea";
+
+    #[test]
+    fn a_pixel_publishes_the_l2cap_psm_it_listens_on() {
+        let a = parse_advertisement(&unhex(PIXEL_WITH_PSM)).expect("should parse");
+        assert_eq!(a.endpoint_id, "WLTQ");
+        assert_eq!(a.device_name.as_deref(), Some("K-N6"));
+        assert_eq!(a.bluetooth_mac.as_deref(), Some("54:1F:CD:69:72:64"));
+        assert!(a.verified);
+        assert_eq!(a.psm, Some(177), "the PSM is the whole point of this vector");
+    }
+
+    /// The other half of the pair. A peer with no PSM must report None rather than a
+    /// stray number read out of the token bytes -- connecting L2CAP to a made-up PSM
+    /// fails in exactly the way that looks like the peer being asleep.
+    #[test]
+    fn a_windows_peer_publishes_no_psm() {
+        let a = parse_advertisement(&unhex(WINDOWS_NO_PSM)).expect("should parse");
+        assert_eq!(a.endpoint_id, "D7B0");
+        assert_eq!(a.device_name.as_deref(), Some("K-ProArt"));
+        assert_eq!(a.bluetooth_mac.as_deref(), Some("9C:C7:D3:E4:0D:E9"));
+        assert_eq!(a.psm, None);
+    }
+
+    /// The fast form carries no trailing fields at all, and reading past its body must
+    /// not invent one.
+    #[test]
+    fn the_fast_form_reports_no_psm() {
+        for v in CAPTURED {
+            let a = parse_advertisement(&unhex(v)).expect("should parse");
+            assert_eq!(a.psm, None, "fast form should carry no PSM: {v}");
+        }
+    }
+
+    /// Truncation anywhere must not panic and must not produce a half-read PSM.
+    #[test]
+    fn a_truncated_advertisement_yields_no_psm() {
+        let full = unhex(PIXEL_WITH_PSM);
+        for cut in 0..full.len() - 1 {
+            if let Some(a) = parse_advertisement(&full[..cut]) {
+                assert_eq!(a.psm, None, "partial PSM read at {cut} bytes");
+            }
+        }
+    }
 
     /// Captured 2026-09-03 from two devices running stock Quick Share, on 0xFEF3.
     /// See docs/QUICKSHARE-VECTORS.md.

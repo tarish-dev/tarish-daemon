@@ -113,6 +113,12 @@ pub(crate) struct TransferState {
     current: std::sync::atomic::AtomicI64,
     cancelled: std::sync::atomic::AtomicI64,
     next: std::sync::atomic::AtomicI64,
+    /// The real confirmation PIN for the transfer being set up, and the transfer it
+    /// belongs to. Never leaves this process.
+    pin: Mutex<Option<(i64, String)>>,
+    /// Set to a transfer id once someone typed its PIN correctly.
+    pin_ok: Mutex<Option<i64>>,
+    pin_confirmed: std::sync::Condvar,
 }
 
 impl TransferState {
@@ -141,6 +147,81 @@ impl TransferState {
     }
 
     /// Record a person's answer to an offer and wake whoever is waiting for it.
+    /// Park the real PIN for a transfer so `confirm_pin` can check against it.
+    ///
+    /// It lives here and nowhere else: not in the app, not in a callback argument, not
+    /// in a log at info level. A sender that can see its own copy can confirm a transfer
+    /// without looking at the other device, which is the whole thing the PIN prevents.
+    pub(crate) fn set_pin(&self, id: i64, pin: &str) {
+        if let Ok(mut p) = self.pin.lock() {
+            *p = Some((id, pin.to_string()));
+        }
+    }
+
+    /// Check what the user typed. True once, on a match.
+    ///
+    /// A mismatch is NOT fatal and does not clear anything: mistyping four digits is the
+    /// ordinary case, and tearing the connection down would make the person start the
+    /// whole transfer again.
+    pub(crate) fn confirm_pin(&self, id: i64, typed: &str) -> bool {
+        let matched = match self.pin.lock() {
+            Ok(p) => match p.as_ref() {
+                Some((parked, real)) => *parked == id && real == typed,
+                None => false,
+            },
+            Err(_) => false,
+        };
+        if matched {
+            if let Ok(mut c) = self.pin_ok.lock() {
+                *c = Some(id);
+            }
+            self.pin_confirmed.notify_all();
+        }
+        matched
+    }
+
+    /// Block until the right digits arrive, the transfer is cancelled, or we give up.
+    pub(crate) fn await_pin(&self, id: i64, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut guard = match self.pin_ok.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        loop {
+            if *guard == Some(id) {
+                *guard = None;
+                return true;
+            }
+            if self.is_cancelled(id) {
+                return false;
+            }
+            let left = match deadline.checked_duration_since(std::time::Instant::now()) {
+                Some(l) => l,
+                None => return false,
+            };
+            // Woken periodically rather than only on notify, so a cancel while nobody is
+            // typing is noticed instead of sitting here for the full timeout.
+            guard = match self.pin_confirmed.wait_timeout(guard, left.min(Duration::from_millis(500))) {
+                Ok(g) => g.0,
+                Err(_) => return false,
+            };
+        }
+    }
+
+    /// Forget the parked PIN. Called when a transfer ends, however it ended.
+    pub(crate) fn clear_pin(&self, id: i64) {
+        if let Ok(mut p) = self.pin.lock() {
+            if p.as_ref().map(|(parked, _)| *parked == id).unwrap_or(false) {
+                *p = None;
+            }
+        }
+        if let Ok(mut c) = self.pin_ok.lock() {
+            if *c == Some(id) {
+                *c = None;
+            }
+        }
+    }
+
     pub(crate) fn answer(&self, id: i64, accept: bool) {
         if let Ok(mut d) = self.decision.lock() {
             *d = Some((id, accept));
@@ -460,9 +541,56 @@ struct BlePeer {
 /// explanation.
 const BLE_PEER_TTL: Duration = Duration::from_secs(20);
 
-/// BLUETOOTH, from the ConnectionRequest medium enum.
-fn frames_medium_bluetooth() -> u64 {
-    barq_protocol::frames::Medium::Bluetooth as u64
+/// What we tell a peer we could upgrade to, when the socket arrived over Bluetooth.
+///
+/// **This field decides whether a stock Android receiver answers us at all**, and it has
+/// now been wrong in two different directions against a real phone:
+///
+/// - BLUETOOTH alone: RFCOMM accepted, DISC 209 ms later, not one frame in between.
+/// - BLUETOOTH + WIFI_LAN: the connection stays open and the peer never speaks.
+///
+/// The set below is the one Bada sends on a Bluetooth transport, and it is neither of
+/// those: `supportedMediumsForCurrentTransport` filters WIFI_LAN out unless the current
+/// transport IS Wi-Fi LAN, and leaves WIFI_DIRECT in. WIFI_DIRECT is the medium a stock
+/// receiver actually upgrades to when there is no shared network, which is exactly the
+/// case we are in. We decline the offer it then makes, and Bada's own failure policy for
+/// an RFCOMM bootstrap is to stay on Bluetooth -- so claiming it costs a declined
+/// negotiation, not a broken transfer.
+///
+/// `persist.barq.qs_mediums` overrides it with a comma-separated list of raw enum values
+/// (2 BLUETOOTH, 4 BLE, 5 WIFI_LAN, 6 WIFI_AWARE, 8 WIFI_DIRECT). That exists because
+/// this is being settled against one real phone one attempt at a time, and a rebuild per
+/// guess costs minutes and a reboot. It is read per transfer, so a `setprop` takes effect
+/// on the next send.
+fn quickshare_mediums() -> Vec<u64> {
+    use barq_protocol::frames::Medium;
+    // BLUETOOTH *and* WIFI_LAN. Measured against a stock Pixel, one send per row:
+    //
+    //   [BLUETOOTH]                 RFCOMM accepted, closed 209 ms later
+    //   [BLUETOOTH, WIFI_DIRECT]    closed 94 ms later
+    //   [WIFI_LAN]                  closed ~100 ms later
+    //   [BLUETOOTH, WIFI_LAN]       held open  <- only combination that gets past the gate
+    //
+    // So it is not "the mediums we could upgrade to" in any sense we can reason about
+    // from the schema; the receiver wants both entries present and refuses the request
+    // in under a fifth of a second otherwise. Do not simplify this to either one alone.
+    let default = vec![Medium::Bluetooth as u64, Medium::WifiLan as u64];
+    let Some(raw) = read_property("persist.barq.qs_mediums") else {
+        return default;
+    };
+    if raw.trim().is_empty() {
+        return default;
+    }
+    let parsed: Vec<u64> = raw
+        .split(',')
+        .filter_map(|f| f.trim().parse::<u64>().ok())
+        .collect();
+    if parsed.is_empty() {
+        log::warn!("persist.barq.qs_mediums={raw:?} parsed to nothing; using the default");
+        return default;
+    }
+    log::info!("quickshare: advertising mediums {parsed:?} from persist.barq.qs_mediums");
+    parsed
 }
 
 /// A coarse MIME type from a file name, for the introduction's file metadata.
@@ -495,6 +623,25 @@ struct TransferProgress {
     callbacks: Callbacks,
 }
 
+impl TransferProgress {
+    /// Tell the client the transfer ended, and how.
+    ///
+    /// **Not optional, and its absence is invisible from here.** Without it the daemon
+    /// finishes the send, logs "transfer N complete", clears its slot -- and the app is
+    /// still showing a full progress bar with a Cancel button, because nothing ever told
+    /// it otherwise. The AirDrop path has announced this since it was written; the Quick
+    /// Share send path was built alongside it and never did.
+    fn finished(&self, status: i32) {
+        let cbs = match self.callbacks.lock() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        for cb in cbs.iter() {
+            let _ = cb.onTransferFinished(self.id, status);
+        }
+    }
+}
+
 impl quickshare::outbound::Progress for TransferProgress {
     fn progress(&self, done: u64, total: u64) {
         let cbs = match self.callbacks.lock() {
@@ -508,6 +655,24 @@ impl quickshare::outbound::Progress for TransferProgress {
 
     fn cancelled(&self) -> bool {
         self.transfers.is_cancelled(self.id)
+    }
+
+    fn confirm_pin(&self, pin: &str) -> bool {
+        self.transfers.set_pin(self.id, pin);
+        {
+            let cbs = match self.callbacks.lock() {
+                Ok(c) => c,
+                Err(_) => return false,
+            };
+            for cb in cbs.iter() {
+                let _ = cb.onTransferPinRequired(self.id);
+            }
+        }
+        // Long, because the person has to pick up the other device and read it. Shorter
+        // than the receiver's own accept window would make us the reason it failed.
+        let ok = self.transfers.await_pin(self.id, Duration::from_secs(120));
+        self.transfers.clear_pin(self.id);
+        ok
     }
 }
 
@@ -864,60 +1029,41 @@ impl IBarqService for BarqService {
                 &device,
                 &endpoint,
                 // The mediums we are WILLING TO UPGRADE TO, which is not the same as
-                // the one we connected over.
-                //
-                // This listed BLUETOOTH alone, reasoning that claiming a medium we
-                // cannot carry would fail later. That reading was wrong: the field
-                // advertises upgrade candidates, so listing only Bluetooth tells a stock
-                // peer there is no way to get the file off Bluetooth at all -- and
-                // nothing sends a file over Bluetooth alone, because it would crawl.
-                // Windows completed the handshake, took the introduction, and then said
-                // it could not complete the transfer.
-                //
-                // WIFI_LAN was removed here after Windows offered an upgrade path at
-                // 172.20.9.166:58151 the instant the file finished, which we could not
-                // adopt, and then reported the transfer failed with every byte already
-                // delivered. Right diagnosis, wrong fix -- and it cost every Android
-                // peer.
-                //
-                // ADVERTISING BLUETOOTH ALONE IS A SET OF ONE THAT NO RECEIVER SHARES.
-                // A stock Android receiver intersects our advertised mediums with its
-                // own upgrade mediums before it dispatches the connection, and Bluetooth
-                // Classic is not in that set -- a stock stack does not register it as an
-                // upgrade medium at all. The intersection comes out EMPTY, the request
-                // is never dispatched, and the socket closes with nothing on the wire.
-                // Nobody is ever asked to accept anything. Measured against a real
-                // phone: RFCOMM accepted, DISC 209 ms later, not one frame in between.
-                // Windows is laxer and completed the same handshake, which is why this
-                // read as working.
-                //
-                // WIFI_LAN is the entry that fixes it, and specifically WIFI_LAN rather
-                // than a Wi-Fi Direct or hotspot medium: to a receiver, WIFI_LAN in the
-                // intersection means STAY ON THE SOCKET WE ARE ALREADY ON. It gives the
-                // peer a non-empty set whose best outcome is not to upgrade at all,
-                // which is the only outcome we can honour. That is also why NearDrop has
-                // hardcoded it since day one.
-                //
-                // What made the Windows failure go away was the other half of the same
-                // change: the UPGRADE_PATH_AVAILABLE arm in `outbound.rs` that answers
-                // UPGRADE_FAILURE. Declining an offer closes the negotiation and keeps
-                // the payload where it is. Advertising nothing worth offering stops the
-                // transfer before it starts.
-                &[
-                    frames_medium_bluetooth(),
-                    barq_protocol::frames::Medium::WifiLan as u64,
-                ],
+                // the one we connected over. See `quickshare_mediums`, which records
+                // what each wrong answer did to a real Android phone.
+                &quickshare_mediums(),
                 out_files,
                 &progress,
             ) {
-                Ok(true) => log::info!("quickshare: transfer {id} complete"),
-                Ok(false) => log::info!("quickshare: transfer {id} was not accepted"),
-                Err(e) => log::warn!("quickshare: transfer {id} failed: {e}"),
+                Ok(true) => {
+                    log::info!("quickshare: transfer {id} complete");
+                    progress.finished(STATUS_OK);
+                }
+                // Not an error: someone on the other device said no. Reporting it as a
+                // failure invites a retry that will be refused again.
+                Ok(false) => {
+                    log::info!("quickshare: transfer {id} was not accepted");
+                    progress.finished(STATUS_DECLINED);
+                }
+                Err(e) => {
+                    log::warn!("quickshare: transfer {id} failed: {e}");
+                    progress.finished(STATUS_FAILED);
+                }
             }
             transfers.finish(id);
         });
 
         Ok(id)
+    }
+
+    fn confirmTransferPin(&self, transfer_id: i64, pin: &str) -> BinderResult<bool> {
+        // No logging of the value, right or wrong. A rejected guess in a log is still a
+        // guess someone can read, and the near-misses narrow it down.
+        let ok = self.transfers.confirm_pin(transfer_id, pin.trim());
+        if !ok {
+            log::info!("quickshare: PIN rejected for transfer {transfer_id}");
+        }
+        Ok(ok)
     }
 
     fn refreshPeers(&self) -> BinderResult<()> {

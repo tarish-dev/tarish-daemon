@@ -55,6 +55,13 @@ pub struct OutFile {
 pub trait Progress {
     fn progress(&self, done: u64, total: u64);
     fn cancelled(&self) -> bool;
+    /// Have a person confirm the PIN before anything is sent, and say whether they got
+    /// it right. Blocks: the answer comes from a human reading the other device.
+    ///
+    /// The value is passed IN, not out. Whoever implements this must check it without
+    /// showing it -- a sender that displays its own copy lets someone confirm a transfer
+    /// without ever looking at the receiver, which is the one thing this prevents.
+    fn confirm_pin(&self, pin: &str) -> bool;
 }
 
 /// Drive a whole send. Returns `Ok(true)` if the peer accepted and every file went.
@@ -184,10 +191,14 @@ where
         &result.server_init_msg,
     )
     .map_err(|_| bad("could not derive session keys"))?;
-    debug!(
-        "quickshare: session pin {:04}",
-        u16::from_be_bytes([secrets.auth_string[0], secrets.auth_string[1]]) % 10_000
-    );
+    // The whole auth string, through the real derivation -- see `barq_protocol::pin`.
+    // This was the first two bytes as a big-endian u16 mod 10000, which produces a
+    // four-digit number that is stable and session-specific and simply not the peer's.
+    let session_pin = barq_protocol::pin::derive(&secrets.auth_string);
+    // Deliberately not logged. `logcat` is readable by anything with the log group on a
+    // userdebug build, and a PIN sitting in a log is a PIN nobody had to read off the
+    // other device.
+    debug!("quickshare: session pin derived");
     let mut channel = SecureChannel::new(keys, Role::Client);
     info!("quickshare: encrypted channel up, offering {} file(s)", files.len());
 
@@ -229,6 +240,10 @@ where
     let mut fsm = Outbound::new(introduction);
     let mut next_payload_id: i64 = 1;
     let mut pending = fsm.start();
+    // The PIN is confirmed AFTER the introduction goes out, not before, because the
+    // receiver only puts its copy on screen once it has one. Nothing that matters has
+    // been sent by then -- the files wait behind the peer's acceptance either way.
+    let mut pin_checked = false;
 
     loop {
         // DRAIN EVERY EFFECT BEFORE READING AGAIN.
@@ -273,6 +288,19 @@ where
                 Effect::Failed(why) => return Err(bad(format!("sharing refused: {why}"))),
                 // A sender is never asked and never receives.
                 Effect::AskUser(_) | Effect::BeginReceiving(_) => {}
+            }
+        }
+
+        if !pin_checked {
+            pin_checked = true;
+            if !progress.confirm_pin(&session_pin) {
+                warn!("quickshare: the PIN was not confirmed; sending nothing");
+                let bye = frames::disconnection(peer_safe_disconnect, false);
+                let _ = channel
+                    .encrypt(&bye)
+                    .map_err(chan)
+                    .and_then(|w| write_frame(&mut out, &w));
+                return Ok(false);
             }
         }
 

@@ -30,4 +30,24 @@ oneway interface IBarqCallback {
      * again.
      */
     void onTransferFinished(long transferId, int status);
+
+    /**
+     * Ask the person sending to type the PIN shown on the RECEIVING device.
+     *
+     * **The PIN itself is deliberately not in this call.** Both ends derive the same
+     * four digits from the UKEY2 auth string, so a sender that displayed its own copy
+     * would let someone confirm a transfer without ever looking at the other screen --
+     * which is the one thing the PIN exists to prevent. The daemon keeps the value and
+     * checks what the user typed, so it never crosses this interface in either
+     * direction.
+     *
+     * Arrives after the introduction has gone out, because that is when the receiver
+     * puts its PIN on screen. Answer with IBarqService.confirmTransferPin; nothing is
+     * sent until it matches.
+     *
+     * APPENDED LAST, and any future method must be too: the Rust and Java stubs map
+     * transaction codes by position, so inserting a method above this one silently
+     * renumbers every method after it.
+     */
+    void onTransferPinRequired(long transferId);
 }

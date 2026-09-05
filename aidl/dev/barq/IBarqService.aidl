@@ -207,4 +207,16 @@ interface IBarqService {
      */
     long sendFilesOnSocket(String peerId, in ParcelFileDescriptor socket,
             in ParcelFileDescriptor[] files, in String[] names);
+
+    /**
+     * Submit the PIN the user read off the receiving device.
+     *
+     * Returns true if it matches the one this transfer derived, in which case the
+     * transfer proceeds. False means wrong digits -- the transfer stays parked and the
+     * user can try again, because a typo is the common case and dropping the connection
+     * would make them start over.
+     *
+     * APPENDED LAST -- transaction codes are positional.
+     */
+    boolean confirmTransferPin(long transferId, String pin);
 }
