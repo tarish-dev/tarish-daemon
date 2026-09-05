@@ -31,4 +31,26 @@ parcelable BarqPeer {
      * Always empty for AirDrop peers, which are reached over AWDL by link-local address.
      */
     String bluetoothMac;
+
+    /**
+     * The address the peer is ADVERTISING from, which is not its Bluetooth MAC.
+     *
+     * An L2CAP connection-oriented channel rides the LE link, so it is opened to this
+     * address rather than to bluetoothMac. It is usually a resolvable private address
+     * and ROTATES -- we have seen three in as many minutes for one phone -- so it is
+     * only good for as long as the advertisement that carried it. Dial promptly and do
+     * not cache it.
+     */
+    String bleAddress;
+
+    /**
+     * The L2CAP PSM the peer is listening on, or 0 if it published none.
+     *
+     * **This decides which socket to open, and it is not a preference.** A peer that
+     * publishes a PSM refuses an RFCOMM connection on the Nearby service -- accepted and
+     * closed inside 200 ms, no frame either way. A peer that publishes none accepts
+     * RFCOMM and completes whole transfers. Measured on a Pixel and a Windows machine
+     * side by side, with both off Wi-Fi.
+     */
+    int psm;
 }

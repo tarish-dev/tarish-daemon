@@ -45,7 +45,10 @@ service barqsharingd /system_ext/bin/barqsharingd
     user system_ext_barq
     group system_ext_barq inet
     disabled
-    oneshot false
+    # NOT oneshot -- and that is said by omitting the keyword, not by giving it an
+    # argument. `oneshot false` is rejected outright ("oneshot requires 0 arguments"),
+    # so the line was doing nothing except putting an error in every boot log. The
+    # default is already what this daemon wants: long-running, restarted if it dies.
     restart_period 10
 
 on property:sys.boot_completed=1

@@ -530,6 +530,11 @@ struct BlePeer {
     name: Option<String>,
     /// How to reach it with no network. None when the peer advertised no address.
     mac: Option<String>,
+    /// The LE address the advertisement came from. An L2CAP channel is opened to this,
+    /// not to `mac` -- and it rotates, so it is only as fresh as `seen`.
+    ble_address: String,
+    /// The peer's L2CAP PSM, 0 when it published none. Decides RFCOMM vs L2CAP.
+    psm: u16,
     seen: std::time::Instant,
 }
 
@@ -943,11 +948,31 @@ impl IBarqService for BarqService {
                 a.bluetooth_mac.as_deref().unwrap_or("<not reachable>")
             );
         }
+        // ONE ROW PER PHYSICAL DEVICE, keyed on the only thing that does not rotate.
+        //
+        // A stock Android peer rotates its endpoint id, its BLE address AND its L2CAP
+        // PSM together, every advertisement set. Keyed by endpoint id alone, one phone
+        // becomes a new row every rotation and the stale ones linger for the whole TTL:
+        // six rows called "K-N6", five of them holding an address that no longer exists.
+        // Tapping one of those blocks in connect() until the socket gives up, which
+        // looks like the transfer hanging at "starting".
+        //
+        // The BR/EDR MAC is stable across all of it, so an advertisement carrying one
+        // replaces every earlier row for the same device. Peers with no MAC -- the fast
+        // form -- keep the old behaviour, since there is nothing better to key on.
+        if let Some(mac) = a.bluetooth_mac.as_deref() {
+            peers.retain(|id, p| id == &a.endpoint_id || p.mac.as_deref() != Some(mac));
+        }
         peers.insert(
             a.endpoint_id,
             BlePeer {
                 name: a.device_name,
                 mac: a.bluetooth_mac,
+                // The LE address this advertisement arrived from, kept because an L2CAP
+                // channel is opened to it and not to the BR/EDR MAC. It rotates, so the
+                // newest advertisement always wins -- which is what this insert does.
+                ble_address: address.to_string(),
+                psm: a.psm.unwrap_or(0),
                 seen: now,
             },
         );
@@ -961,99 +986,17 @@ impl IBarqService for BarqService {
         files: &[binder::ParcelFileDescriptor],
         names: &[String],
     ) -> BinderResult<i64> {
-        if !allows_send(self.quickshare_mode()) {
-            log::warn!("sendFilesOnSocket refused — policy does not permit Quick Share send");
-            return Err(Status::from(StatusCode::PERMISSION_DENIED));
-        }
-        if files.len() != names.len() {
-            log::warn!("sendFilesOnSocket: {} descriptors but {} names", files.len(), names.len());
-            return Err(Status::from(StatusCode::BAD_VALUE));
-        }
+        self.send_common(peer_id, socket, files, names, false)
+    }
 
-        // Duplicate everything before returning: the parcel closes its descriptors when
-        // this transaction ends, and the transfer runs on another thread. Reading from a
-        // closed fd presents as a truncated file rather than an error, which is the worst
-        // way for this to fail.
-        let sock = dup_file(socket).map_err(|e| {
-            log::warn!("sendFilesOnSocket: could not dup the socket: {e}");
-            Status::from(StatusCode::BAD_VALUE)
-        })?;
-        let mut out_files = Vec::with_capacity(files.len());
-        for (f, n) in files.iter().zip(names) {
-            let file = dup_file(f).map_err(|e| {
-                log::warn!("sendFilesOnSocket: could not dup {n}: {e}");
-                Status::from(StatusCode::BAD_VALUE)
-            })?;
-            let size = file.metadata().map(|m| m.len() as i64).unwrap_or(0);
-            out_files.push(quickshare::outbound::OutFile {
-                name: n.clone(),
-                mime: mime_of(n),
-                size,
-                reader: Box::new(file),
-            });
-        }
-
-        let id = self.transfers.begin();
-        let device = device_name();
-        let endpoint = quickshare::random_endpoint_id();
-        let endpoint = quickshare::instance_name(&endpoint)
-            .split('.')
-            .next()
-            .unwrap_or("BARQ")
-            .to_string();
-        let peer = peer_id.to_string();
-        let transfers = self.transfers.clone();
-        let callbacks = self.callbacks.clone();
-
-        std::thread::spawn(move || {
-            // Two handles on the same socket. `send` wants a reader and a writer, and a
-            // socket is both -- but it must be ONE socket, not two, or the peer's replies
-            // arrive on a descriptor nobody is reading.
-            let reader = match sock.try_clone() {
-                Ok(r) => r,
-                Err(e) => {
-                    log::warn!("quickshare: could not clone the socket: {e}");
-                    transfers.finish(id);
-                    return;
-                }
-            };
-            let progress = TransferProgress {
-                id,
-                transfers: transfers.clone(),
-                callbacks,
-            };
-            log::info!("quickshare: sending {} file(s) to {peer}", out_files.len());
-            match quickshare::outbound::send(
-                reader,
-                sock,
-                &device,
-                &endpoint,
-                // The mediums we are WILLING TO UPGRADE TO, which is not the same as
-                // the one we connected over. See `quickshare_mediums`, which records
-                // what each wrong answer did to a real Android phone.
-                &quickshare_mediums(),
-                out_files,
-                &progress,
-            ) {
-                Ok(true) => {
-                    log::info!("quickshare: transfer {id} complete");
-                    progress.finished(STATUS_OK);
-                }
-                // Not an error: someone on the other device said no. Reporting it as a
-                // failure invites a retry that will be refused again.
-                Ok(false) => {
-                    log::info!("quickshare: transfer {id} was not accepted");
-                    progress.finished(STATUS_DECLINED);
-                }
-                Err(e) => {
-                    log::warn!("quickshare: transfer {id} failed: {e}");
-                    progress.finished(STATUS_FAILED);
-                }
-            }
-            transfers.finish(id);
-        });
-
-        Ok(id)
+    fn sendFilesOnL2capSocket(
+        &self,
+        peer_id: &str,
+        socket: &binder::ParcelFileDescriptor,
+        files: &[binder::ParcelFileDescriptor],
+        names: &[String],
+    ) -> BinderResult<i64> {
+        self.send_common(peer_id, socket, files, names, true)
     }
 
     fn confirmTransferPin(&self, transfer_id: i64, pin: &str) -> BinderResult<bool> {
@@ -1164,6 +1107,8 @@ impl IBarqService for BarqService {
                     rssi: 0,
                     protocol: PROTOCOL_QUICKSHARE,
                     bluetoothMac: p.mac.clone().unwrap_or_default(),
+                    bleAddress: p.ble_address.clone(),
+                    psm: p.psm as i32,
                 });
             }
         }
@@ -1188,6 +1133,10 @@ impl IBarqService for BarqService {
                 // AirDrop peers are reached over AWDL by link-local address, never
                 // over Bluetooth.
                 bluetoothMac: String::new(),
+                // AirDrop never uses either of these; they exist for the Quick Share
+                // rows above, where they decide which socket the app opens.
+                bleAddress: String::new(),
+                psm: 0,
                 // Everything getPeers returns today came from the AirDrop browser.
                 // Quick Share discovery runs on wlan0 and is not folded into this
                 // table yet; when it is, this is the field that keeps the two apart.
@@ -1790,4 +1739,153 @@ fn main() {
 
     // One thread is plenty for a skeleton; the transfer work will want more.
     binder::ProcessState::join_thread_pool();
+}
+
+impl BarqService {
+    /// Drive a Quick Share send over a socket the app already connected.
+    ///
+    /// `multiplexed` says which kind of socket it is, and the app knows because the
+    /// peer's advertisement told it: an L2CAP channel carries a virtual socket that has
+    /// to be opened first, an RFCOMM one is a plain stream. Getting it wrong is not
+    /// subtle -- multiplex frames on RFCOMM are unparseable to the peer, and raw frames
+    /// on L2CAP are ignored entirely.
+    fn send_common(
+        &self,
+        peer_id: &str,
+        socket: &binder::ParcelFileDescriptor,
+        files: &[binder::ParcelFileDescriptor],
+        names: &[String],
+        multiplexed: bool,
+    ) -> BinderResult<i64> {
+        if !allows_send(self.quickshare_mode()) {
+            log::warn!("sendFilesOnSocket refused — policy does not permit Quick Share send");
+            return Err(Status::from(StatusCode::PERMISSION_DENIED));
+        }
+        if files.len() != names.len() {
+            log::warn!("sendFilesOnSocket: {} descriptors but {} names", files.len(), names.len());
+            return Err(Status::from(StatusCode::BAD_VALUE));
+        }
+
+        // Duplicate everything before returning: the parcel closes its descriptors when
+        // this transaction ends, and the transfer runs on another thread. Reading from a
+        // closed fd presents as a truncated file rather than an error, which is the worst
+        // way for this to fail.
+        let sock = dup_file(socket).map_err(|e| {
+            log::warn!("sendFilesOnSocket: could not dup the socket: {e}");
+            Status::from(StatusCode::BAD_VALUE)
+        })?;
+        let mut out_files = Vec::with_capacity(files.len());
+        for (f, n) in files.iter().zip(names) {
+            let file = dup_file(f).map_err(|e| {
+                log::warn!("sendFilesOnSocket: could not dup {n}: {e}");
+                Status::from(StatusCode::BAD_VALUE)
+            })?;
+            let size = file.metadata().map(|m| m.len() as i64).unwrap_or(0);
+            out_files.push(quickshare::outbound::OutFile {
+                name: n.clone(),
+                mime: mime_of(n),
+                size,
+                reader: Box::new(file),
+            });
+        }
+
+        let id = self.transfers.begin();
+        let device = device_name();
+        let endpoint = quickshare::random_endpoint_id();
+        let endpoint = quickshare::instance_name(&endpoint)
+            .split('.')
+            .next()
+            .unwrap_or("BARQ")
+            .to_string();
+        let peer = peer_id.to_string();
+        let transfers = self.transfers.clone();
+        let callbacks = self.callbacks.clone();
+
+        std::thread::spawn(move || {
+            // Two handles on the same socket. `send` wants a reader and a writer, and a
+            // socket is both -- but it must be ONE socket, not two, or the peer's replies
+            // arrive on a descriptor nobody is reading.
+            let reader = match sock.try_clone() {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!("quickshare: could not clone the socket: {e}");
+                    transfers.finish(id);
+                    return;
+                }
+            };
+            let progress = TransferProgress {
+                id,
+                transfers: transfers.clone(),
+                callbacks,
+            };
+            log::info!("quickshare: sending {} file(s) to {peer}", out_files.len());
+            // The virtual socket, opened before anything above it says a word.
+            // The mediums we are WILLING TO UPGRADE TO, which is not the same as the
+            // one we connected over. See `quickshare_mediums`, which records what each
+            // wrong answer did to a real Android phone.
+            let mediums = quickshare_mediums();
+
+            // On L2CAP the peer will not speak until a virtual socket has been asked for
+            // and accepted, so that handshake happens here, before the protocol above it
+            // writes anything. On RFCOMM there is nothing to open: it is already a
+            // stream. Both arms hand `send` a reader and a writer and it never learns
+            // which it got.
+            let outcome = if multiplexed {
+                // THREE handles on one socket: read, write, and a third the reader uses
+                // to acknowledge packets. Acknowledging is part of receiving, so the
+                // read side has to be able to write, and giving it its own handle avoids
+                // locking the send path behind it.
+                let acks = match sock.try_clone() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        log::warn!("quickshare: could not clone the socket for acks: {e}");
+                        progress.finished(STATUS_FAILED);
+                        transfers.finish(id);
+                        return;
+                    }
+                };
+                match quickshare::mux::open(reader, sock, acks) {
+                    Ok((r, w)) => quickshare::outbound::send(
+                        r,
+                        w,
+                        &device,
+                        &endpoint,
+                        &mediums,
+                        out_files,
+                        &progress,
+                    ),
+                    Err(e) => Err(e),
+                }
+            } else {
+                quickshare::outbound::send(
+                    reader,
+                    sock,
+                    &device,
+                    &endpoint,
+                    &mediums,
+                    out_files,
+                    &progress,
+                )
+            };
+            match outcome {
+                Ok(true) => {
+                    log::info!("quickshare: transfer {id} complete");
+                    progress.finished(STATUS_OK);
+                }
+                // Not an error: someone on the other device said no. Reporting it as a
+                // failure invites a retry that will be refused again.
+                Ok(false) => {
+                    log::info!("quickshare: transfer {id} was not accepted");
+                    progress.finished(STATUS_DECLINED);
+                }
+                Err(e) => {
+                    log::warn!("quickshare: transfer {id} failed: {e}");
+                    progress.finished(STATUS_FAILED);
+                }
+            }
+            transfers.finish(id);
+        });
+
+        Ok(id)
+    }
 }

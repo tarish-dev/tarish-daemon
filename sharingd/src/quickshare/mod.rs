@@ -34,6 +34,7 @@
 
 pub mod connection;
 pub mod discovery;
+pub mod mux;
 pub mod outbound;
 pub mod endpoint;
 

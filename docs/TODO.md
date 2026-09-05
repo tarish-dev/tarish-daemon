@@ -9,6 +9,59 @@ did not exist, and the live work was two hundred lines down.
 
 ## Open
 
+### Quick Share to a stock Android peer: everything but the multiplex request
+
+Windows works end to end over RFCOMM. A stock Pixel does not, and the reason is that it
+does not accept RFCOMM at all -- **its advertisement says so, and that took far too long
+to notice.**
+
+    PHONE    endpoint='WLTQ' name='K-N6'      EXTRA FIELDS mask=0x01 -> L2CAP PSM 177
+    WINDOWS  endpoint='D7B0' name='K-ProArt'  no extra fields
+
+A peer publishing a PSM refuses RFCOMM -- accepted, closed inside 200 ms, no frame either
+way. A peer publishing none accepts it. Verified with both devices off Wi-Fi entirely, so
+none of this is about the network.
+
+**The L2CAP stack, as far as it is understood.** Every packet is
+`[len:4][service_id_hash:3][payload]`, where `000000` is the control channel and `fc9f5e`
+is ours. In order:
+
+| step | packet | peer's answer |
+|---|---|---|
+| data connection | `[3][fc9f5e]` | `[23]` ready |
+| socket introduction | control `SocketControlFrame{INTRODUCTION, {fc9f5e, V2}}` | accepted |
+| multiplex request | data `[len][MultiplexFrame{CONTROL, CONNECTION_REQUEST}]` | **ack, then DISCONNECTION** |
+
+Each of those was found by being wrong first, and each wrong version failed silently:
+
+- a bare `[3]` with no service hash is answered `[24]`, a refusal
+- asking `[1]` first gets the channel closed without a word
+- skipping the introduction gets every data packet ignored and the channel dropped ~20 s
+  later
+- writing multiplex frames without the `fc9f5e` packet prefix does the same
+
+**Where it stands.** The peer now parses everything we send. Its last two packets,
+decoded:
+
+    type=3  080322070a03fc9f5e1028   PACKET_ACKNOWLEDGEMENT { fc9f5e, received_size: 40 }
+    type=2  08021a050a03fc9f5e       DISCONNECTION          { fc9f5e }
+
+40 bytes is exactly our data payload, so it read the multiplex CONNECTION_REQUEST, counted
+it, and closed the service socket instead of answering CONNECTION_RESPONSE. Framing is
+right; the request's CONTENT is not accepted.
+
+**Do not guess the next byte.** Four rounds of inference got the framing right and the
+fifth is where it stopped paying: the remaining candidates -- the salt as hex text vs raw
+bytes, whether the salted hash is computed over the same service string the peer used,
+whether a socket already introduced for a service may then request a multiplex socket for
+it -- are indistinguishable from here. The evidence that would settle it is a capture of
+stock-to-stock over L2CAP, which is where Bada's own notes came from; failing that, the
+`BleGattInitialControlClient` route is fully specified in Bada and is what its runbook
+says stock Android actually uses.
+
+Credit for the whole layer: Bada's `BleL2capInitialControlClient`, `NearbyBleSocketFrames`
+and `ble_frames.proto`.
+
 ### Quick Share offline: RFCOMM is the right door — the request was the wrong shape
 
 Established by testing against two real peers 2026-09-04, then by reading Bada 2026-09-05.

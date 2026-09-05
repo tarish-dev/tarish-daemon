@@ -219,4 +219,19 @@ interface IBarqService {
      * APPENDED LAST -- transaction codes are positional.
      */
     boolean confirmTransferPin(long transferId, String pin);
+
+    /**
+     * Same as sendFilesOnSocket, but the socket is an L2CAP connection-oriented channel.
+     *
+     * The difference is not cosmetic. An RFCOMM socket is a byte stream the protocol can
+     * be written to directly; an L2CAP channel carries a virtual socket that has to be
+     * requested and accepted first, and a peer will not answer a single frame until it
+     * has been. The daemon does that handshake here and nowhere else.
+     *
+     * Which one to open is decided by BarqPeer.psm, which the peer itself published.
+     *
+     * APPENDED LAST -- transaction codes are positional.
+     */
+    long sendFilesOnL2capSocket(String peerId, in ParcelFileDescriptor socket,
+            in ParcelFileDescriptor[] files, in String[] names);
 }
