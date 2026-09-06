@@ -2288,6 +2288,13 @@ fn report_outcome(id: i64, outcome: std::io::Result<bool>, progress: &TransferPr
             log::info!("quickshare: transfer {id} complete");
             progress.finished(STATUS_OK);
         }
+        // A cancel of our own is NOT the peer declining, and saying so put "the other
+        // device turned it down" on screen after the user pressed Cancel themselves.
+        // Both end the transfer the same way; only one is somebody else's decision.
+        Ok(false) if progress.transfers.is_cancelled(id) => {
+            log::info!("quickshare: transfer {id} cancelled");
+            progress.finished(STATUS_FAILED);
+        }
         Ok(false) => {
             log::info!("quickshare: transfer {id} was not accepted");
             progress.finished(STATUS_DECLINED);

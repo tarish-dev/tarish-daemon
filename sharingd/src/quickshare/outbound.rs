@@ -348,10 +348,21 @@ where
                     }
                     info!("quickshare: peer accepted, sending");
                     let mut done: u64 = 0;
+                    let mut finished = true;
                     for (f, id) in files.iter_mut().zip(payload_ids.iter()) {
-                        send_one(&mut out, &mut channel, f, *id, &mut done, total, progress)?;
+                        if !send_one(&mut out, &mut channel, f, *id, &mut done, total, progress)? {
+                            finished = false;
+                            break;
+                        }
                     }
-                    pending.extend(fsm.on(Event::TransferComplete));
+                    // UserCancelled rather than TransferComplete, so the FSM sends the
+                    // peer its cancel frame instead of claiming the transfer finished.
+                    // Telling it nothing leaves it waiting for bytes that stopped coming.
+                    pending.extend(fsm.on(if finished {
+                        Event::TransferComplete
+                    } else {
+                        Event::UserCancelled
+                    }));
                 }
                 Effect::Done => {
                     finish_cleanly(&mut out, &mut channel, peer_safe_disconnect)?;
@@ -484,6 +495,7 @@ where
 }
 
 /// Stream one file out as a sequence of chunks.
+/// Stream one file. `Ok(false)` means the user cancelled part-way through.
 fn send_one<W: Write, P: Progress>(
     out: &mut W,
     channel: &mut SecureChannel,
@@ -492,7 +504,7 @@ fn send_one<W: Write, P: Progress>(
     done: &mut u64,
     total: u64,
     progress: &P,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let header = PayloadHeader {
         id: payload_id,
         payload_type: PayloadType::File,
@@ -505,6 +517,20 @@ fn send_one<W: Write, P: Progress>(
     let mut offset: i64 = 0;
     let mut buf = vec![0u8; CHUNK];
     loop {
+        // CANCEL IS CHECKED HERE, NOT ONLY BETWEEN FILES.
+        //
+        // The main loop tests this once per iteration, but this function does not return
+        // until the whole file has gone -- so over Bluetooth at 148 KB/s a 21 MB file made
+        // Cancel do nothing for 142 seconds. The daemon was working as written; the button
+        // was dead, the app never got onTransferFinished, and the only way out was to kill
+        // it. Per chunk is cheap: one atomic load per 64 KB.
+        if progress.cancelled() {
+            warn!(
+                "quickshare: cancelled {} bytes into {}",
+                offset, file.name
+            );
+            return Ok(false);
+        }
         // read() may return short without being at EOF, so this fills the buffer rather
         // than treating one short read as the end of the file -- which would send a
         // LAST_CHUNK flag partway through and truncate what the peer receives.
@@ -576,7 +602,7 @@ fn send_one<W: Write, P: Progress>(
         secs,
         offset as f64 / 1024.0 / secs
     );
-    Ok(())
+    Ok(true)
 }
 
 fn random_i64() -> io::Result<i64> {
