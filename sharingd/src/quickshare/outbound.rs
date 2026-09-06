@@ -485,6 +485,7 @@ where
                     &mut out,
                     &mut channel,
                     progress,
+                    &mut deferred,
                 )?;
                 // Whatever came of it, stop holding the payload for one.
                 upgrade_deadline = None;
@@ -701,6 +702,19 @@ fn finish_cleanly<W: Write>(
 /// until the peer answers, so a peer that declines promptly costs nothing.
 const UPGRADE_OFFER_WAIT: Duration = Duration::from_secs(12);
 
+/// How long to wait for the peer to release the OLD channel after we say we are done.
+///
+/// Short: a stock peer starts its teardown as soon as our introduction lands on the new
+/// socket, so this normally returns at once. It exists so a peer that never answers costs
+/// five seconds rather than the whole transfer.
+const SAFE_TO_CLOSE_WAIT: Duration = Duration::from_secs(5);
+
+/// How long the peer has to acknowledge our introduction on the NEW socket.
+///
+/// Only waited for when the peer said it sends one. The socket is already connected by
+/// then, so this is a round trip on a fresh Wi-Fi link and ten seconds is generous.
+const INTRODUCTION_ACK_WAIT: Duration = Duration::from_secs(10);
+
 /// Hold the payload until the peer answers the upgrade request, or the deadline passes.
 ///
 /// Anything the peer says that is NOT about the upgrade is queued for the main loop rather
@@ -738,7 +752,7 @@ where
         let plain = channel.decrypt(&wire).map_err(chan)?;
         match frames::parse(&plain).map_err(bad)? {
             OfflineFrame::BandwidthUpgrade(body) => {
-                on_upgrade_frame(&body, endpoint_id, input, out, channel, progress)?;
+                on_upgrade_frame(&body, endpoint_id, input, out, channel, progress, deferred)?;
                 return Ok(());
             }
             // Not ours. Hand the PLAINTEXT to the main loop -- decrypting it again there
@@ -765,13 +779,14 @@ fn on_upgrade_frame<P>(
     out: &mut Writer,
     channel: &mut SecureChannel,
     progress: &P,
+    deferred: &mut std::collections::VecDeque<Vec<u8>>,
 ) -> io::Result<()>
 where
     P: Progress,
 {
     match upgrade::parse(body) {
         Ok(upgrade::Frame::PathAvailable(path)) => {
-            match adopt(&path, endpoint_id, input, out, channel, progress) {
+            match adopt(&path, endpoint_id, input, out, channel, progress, deferred) {
                 Ok(true) => info!(
                     "quickshare: upgraded to {:?}; the rest goes over that",
                     path.medium
@@ -861,6 +876,7 @@ fn adopt<P>(
     out: &mut Writer,
     channel: &mut SecureChannel,
     progress: &P,
+    deferred: &mut std::collections::VecDeque<Vec<u8>>,
 ) -> io::Result<bool>
 where
     P: Progress,
@@ -873,7 +889,12 @@ where
     // The frames here are small and request/response; Nagle would add a round trip to
     // each one for no benefit.
     let _ = sock.set_nodelay(true);
-    sock.set_read_timeout(Some(Duration::from_secs(10)))?;
+    // DELIBERATELY NO SO_RCVTIMEO. This set a 10s read timeout for the introduction ack
+    // below, and the timeout then STAYED ON THE SOCKET for the whole transfer -- so the
+    // main loop's wait for the peer's acceptance, which is a human tapping a button, would
+    // fail the transfer after ten seconds. next_within bounds the one read that needs
+    // bounding and leaves the socket blocking, which is what every read after the handover
+    // wants.
 
     let mut new_out: Writer = Box::new(sock.try_clone()?);
     let mut new_in = Frames::new(Box::new(sock) as Reader);
@@ -884,7 +905,9 @@ where
     // 2. the ack, only when the peer said it would send one. Waiting for one that is
     //    not coming stalls until the read timeout and then abandons a working upgrade.
     if path.supports_introduction_ack {
-        let reply = new_in.next()?;
+        let Some(reply) = new_in.next_within(INTRODUCTION_ACK_WAIT)? else {
+            return Err(bad("the new socket never acknowledged our introduction"));
+        };
         let body = frames::upgrade_body(&reply)
             .ok_or_else(|| bad("the new socket answered with something else"))?;
         match upgrade::parse(&body).map_err(bad)? {
@@ -898,17 +921,42 @@ where
     let last = frames::bandwidth_upgrade(&upgrade::last_write_to_prior());
     write_frame(out, &channel.encrypt(&last).map_err(chan)?)?;
 
-    // A stock peer starts its own teardown as soon as our introduction lands, so this
-    // usually arrives immediately. Bounded reads: anything else on the old socket is
-    // application traffic that will be re-read on the new one.
-    for _ in 0..8 {
-        let wire = input.next()?;
+    // BOUNDED IN TIME, and every other frame KEPT.
+    //
+    // This was bounded only in count -- eight reads -- on a socket with no read timeout,
+    // so a peer that said nothing here blocked the transfer thread forever: the group was
+    // joined, the socket was connected, and nothing moved again. Which is what happened.
+    //
+    // And the frames it read were decrypted and thrown away, under a comment claiming they
+    // would "be re-read on the new one". They would not: a frame consumed here is gone, and
+    // decrypting it has already advanced the sequence numbers. The peer's acceptance can
+    // arrive in this window -- it is the same channel -- and discarding it leaves the FSM
+    // waiting for an answer that was received and dropped.
+    let deadline = std::time::Instant::now() + SAFE_TO_CLOSE_WAIT;
+    let mut released = false;
+    while !released {
+        let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            break;
+        };
+        let Some(wire) = input.next_within(left)? else {
+            break;
+        };
         let plain = channel.decrypt(&wire).map_err(chan)?;
-        if let Ok(OfflineFrame::BandwidthUpgrade(b)) = frames::parse(&plain) {
-            if let Ok(upgrade::Frame::SafeToClosePrior { .. }) = upgrade::parse(&b) {
-                break;
+        match frames::parse(&plain) {
+            Ok(OfflineFrame::BandwidthUpgrade(b))
+                if matches!(upgrade::parse(&b), Ok(upgrade::Frame::SafeToClosePrior { .. })) =>
+            {
+                released = true;
             }
+            // Anything else belongs to the conversation, not to the handover.
+            _ => deferred.push_back(plain),
         }
+    }
+    if !released {
+        // Swap anyway. The peer has our CLIENT_INTRODUCTION, so from its side the new
+        // channel is the live one -- staying on the old socket after introducing ourselves
+        // on the new one is the worse of the two guesses.
+        warn!("quickshare: no safe-to-close from the peer; switching over regardless");
     }
 
     // 4. the swap. Same channel, same keys, same sequence numbers -- different fd.
