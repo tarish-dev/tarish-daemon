@@ -404,7 +404,7 @@ impl Httpd {
                 // A new transfer starts here, not at /Upload: /Ask is the first point
                 // the peer commits, and the UI should show something before any bytes
                 // arrive rather than sitting idle through the whole handshake.
-                let id = self.transfers.begin();
+                let id = self.transfers.begin(true);
                 let (from, names) = describe_offer(&body);
                 info!("offer {id} from {from:?}: {} file(s) {names:?}", names.len());
                 self.offered(id, &from, &names);

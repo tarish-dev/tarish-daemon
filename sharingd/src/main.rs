@@ -119,13 +119,32 @@ pub(crate) struct TransferState {
     /// Set to a transfer id once someone typed its PIN correctly.
     pin_ok: Mutex<Option<i64>>,
     pin_confirmed: std::sync::Condvar,
+    /// Whether the transfer in flight actually rides the AWDL link.
+    ///
+    /// AirDrop does; Quick Share never does -- it runs over Bluetooth, Wi-Fi LAN or
+    /// Wi-Fi Direct and has no use for mosey0. The radio gate needs to tell them
+    /// apart, because on a BCM4383 device AWDL cannot coexist with Wi-Fi (BUILD-NOTES
+    /// 40, 42): bringing it up for a Quick Share transfer drops wlan0 and kills the
+    /// very transfer that asked for it.
+    needs_awdl: AtomicBool,
 }
 
 impl TransferState {
-    pub(crate) fn begin(&self) -> i64 {
+    /// Claim the transfer slot.
+    ///
+    /// `needs_awdl` says whether this transfer rides the AWDL link -- true for AirDrop,
+    /// false for Quick Share. Stored BEFORE the id is published, so the radio gate can
+    /// never observe a live transfer still carrying the previous one's answer.
+    pub(crate) fn begin(&self, needs_awdl: bool) -> i64 {
         let id = self.next.fetch_add(1, Ordering::SeqCst) + 1;
+        self.needs_awdl.store(needs_awdl, Ordering::SeqCst);
         self.current.store(id, Ordering::SeqCst);
         id
+    }
+
+    /// True while a transfer that genuinely needs the AWDL link is in flight.
+    pub(crate) fn current_needs_awdl(&self) -> bool {
+        self.current.load(Ordering::SeqCst) != 0 && self.needs_awdl.load(Ordering::SeqCst)
     }
 
     pub(crate) fn current(&self) -> i64 {
@@ -402,12 +421,29 @@ fn write_property(name: &str, value: &str) -> bool {
 /// The three inputs are OR-ed because each is independently sufficient:
 ///
 ///   active        a client is in the foreground and may send or receive at any moment
-///   transfer      bytes are moving; releasing the link here would kill it outright
+///   transfer      AirDrop bytes are moving; releasing the link would kill it outright
 ///   discoverable  we are advertising, and advertising without a link is a lie
 ///
 /// Rising edges apply immediately -- that is the latency a person actually feels,
 /// staring at an empty device list. Falling edges wait out LINGER.
-fn start_radio_gate(active: Arc<AtomicBool>, transfers: Transfers, discoverable: Discoverable) {
+///
+/// ALL OF IT IS THEN AND-ED WITH THE AIRDROP POLICY, and that is not an optimisation.
+/// AWDL serves AirDrop and nothing else: Quick Share runs over Bluetooth, Wi-Fi LAN or
+/// Wi-Fi Direct and never touches mosey0. On a BCM4383 device the two cannot coexist
+/// (BUILD-NOTES 40, 42) -- bringing AWDL up drops the Wi-Fi association -- so a device
+/// with AirDrop switched off that lost its Wi-Fi the moment the app opened was losing it
+/// for a link nothing was going to use. Worse, it took Quick Share's own Wi-Fi LAN
+/// upgrade path down with it.
+///
+/// A policy withdrawal applies IMMEDIATELY rather than lingering. The linger exists to
+/// ride out a flapping foreground flag; being told AirDrop is not permitted is not a
+/// falling edge in activity, it is a prohibition.
+fn start_radio_gate(
+    active: Arc<AtomicBool>,
+    transfers: Transfers,
+    discoverable: Discoverable,
+    policy: Arc<Mutex<TarishPolicy>>,
+) {
     // How long the radio stays up after nothing wants it any more.
     //
     // Long enough to ride out a file picker, a rotation, or a glance at another app
@@ -425,13 +461,34 @@ fn start_radio_gate(active: Arc<AtomicBool>, transfers: Transfers, discoverable:
         let mut next_try: Option<std::time::Instant> = None;
         let mut warned = false;
         let mut failures: u32 = 0;
+        let mut permitted_last: Option<bool> = None;
 
         loop {
+            // MODE_OFF on failure to read, matching airdrop_mode(): a poisoned lock must
+            // not be the reason a radio comes up.
+            let permitted = policy
+                .lock()
+                .map(|p| p.airdrop != MODE_OFF)
+                .unwrap_or(false);
+            if permitted_last != Some(permitted) {
+                // Logged on change, because a radio that never comes up is otherwise
+                // indistinguishable from a broken gate -- and this is now the most
+                // likely reason for it.
+                if permitted {
+                    log::info!("AWDL permitted — AirDrop is enabled in policy");
+                } else {
+                    log::info!(
+                        "AWDL not permitted — AirDrop is off in policy; the radio stays                          down and Wi-Fi is left alone"
+                    );
+                }
+                permitted_last = Some(permitted);
+            }
+
             let busy = active.load(Ordering::SeqCst)
-                || transfers.current() != 0
+                || transfers.current_needs_awdl()
                 || discoverable.load(Ordering::SeqCst);
 
-            let want = if busy {
+            let want_by_activity = if busy {
                 ever_busy = true;
                 idle_since = None;
                 true
@@ -441,6 +498,7 @@ fn start_radio_gate(active: Arc<AtomicBool>, transfers: Transfers, discoverable:
                 let since = *idle_since.get_or_insert_with(std::time::Instant::now);
                 since.elapsed() < LINGER
             };
+            let want = permitted && want_by_activity;
 
             // Compare against what the property ACTUALLY says, not only against our own
             // last write. Tracking just our own writes means that if the value is
@@ -1220,7 +1278,7 @@ impl ITarishService for TarishService {
             });
         }
 
-        let id = self.transfers.begin();
+        let id = self.transfers.begin(true);
         let transfers = self.transfers.clone();
         let peers_for_send = self.peers.clone();
         let peer_instance = peer_id.to_string();
@@ -1752,6 +1810,7 @@ fn main() {
         service.active.clone(),
         service.transfers.clone(),
         discoverable,
+        service.policy.clone(),
     );
     let binder = BnTarishService::new_binder(service, BinderFeatures::default());
 
@@ -1817,7 +1876,7 @@ impl TarishService {
             });
         }
 
-        let id = self.transfers.begin();
+        let id = self.transfers.begin(false);
         let device = device_name();
         // FOUR CHARACTERS. Not the mDNS instance label.
         //
@@ -1890,8 +1949,8 @@ impl TarishService {
                 };
                 match quickshare::mux::open(reader, sock, acks) {
                     Ok((r, w)) => quickshare::outbound::send(
-                        r,
-                        w,
+                        Box::new(r),
+                        Box::new(w),
                         &device,
                         &endpoint,
                         &mediums,
@@ -1902,8 +1961,8 @@ impl TarishService {
                 }
             } else {
                 quickshare::outbound::send(
-                    reader,
-                    sock,
+                    Box::new(reader),
+                    Box::new(sock),
                     &device,
                     &endpoint,
                     &mediums,

@@ -232,7 +232,7 @@ where
                 }
                 Effect::AskUser(intro) => {
                     total_bytes = intro.total_size().max(0) as u64;
-                    transfer_id = transfers.begin();
+                    transfer_id = transfers.begin(false);
                     let names: Vec<String> = intro.files.iter().map(|f| f.name.clone()).collect();
                     info!(
                         "quickshare: offer {transfer_id} from {peer_name:?}: {} file(s) {names:?}",
