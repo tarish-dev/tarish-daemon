@@ -70,7 +70,12 @@ const UPR_MEDIUMS: u32 = 1;
 const UPR_MEDIUM_METADATA: u32 = 2;
 
 // MediumMetadata, the few fields an upgrade request carries
+const MM_MEDIUM_ROLE: u32 = 12;
 const MM_SUPPORTED_WIFI_DIRECT_AUTH: u32 = 13;
+
+// MediumRole
+const MR_WIFI_DIRECT_GROUP_OWNER: u32 = 1;
+const MR_WIFI_DIRECT_GROUP_CLIENT: u32 = 2;
 /// `WIFI_DIRECT_WITH_PASSWORD`. The alternative authenticates by service name and PIN,
 /// which is a different negotiation than the one this code knows how to finish.
 const WIFI_DIRECT_WITH_PASSWORD: u64 = 1;
@@ -254,6 +259,13 @@ fn encode_wifi(c: &WifiCredentials, direct: bool) -> Vec<u8> {
 /// rather than one field each. A peer reading packed and given unpacked would see an
 /// empty list and offer nothing, which looks like a refusal.
 pub fn path_request(mediums: &[Medium]) -> Vec<u8> {
+    // Ascending, as Bada sends them. Nothing in the schema asks for an order and a
+    // conformant parser cannot care, but this list is being compared against a working
+    // implementation one difference at a time, and an unexplained one is not worth keeping.
+    let mut sorted: Vec<Medium> = mediums.to_vec();
+    sorted.sort_by_key(|m| *m as u64);
+    let mediums: &[Medium] = &sorted;
+
     let mut packed = Vec::new();
     for m in mediums {
         // Varints, concatenated, no tags. Every medium value here is under 128 so this
@@ -275,7 +287,26 @@ pub fn path_request(mediums: &[Medium]) -> Vec<u8> {
     // the same trap as the connection response's multiplex bitmask.
     let mut meta = Writer::new();
     if mediums.contains(&Medium::WifiDirect) {
-        meta.varint(MM_SUPPORTED_WIFI_DIRECT_AUTH, WIFI_DIRECT_WITH_PASSWORD);
+        // THE ROLES, AND THEY ARE NOT OPTIONAL IN PRACTICE.
+        //
+        // A peer asked to stand up a Wi-Fi Direct group has to know we can be a client of
+        // one. Without this the request is well-formed, is not refused, and is silently
+        // never answered -- which is exactly what a Windows peer did: no PathAvailable, no
+        // UPGRADE_FAILURE, nothing. Bada sends both flags and gets a group.
+        //
+        // Owner as well as client, again matching Bada. We cannot currently host a group,
+        // so this claims slightly more than we can do -- but the peer we are asking is the
+        // one that will host, and a receiver that reads this as "either of us could" still
+        // picks itself. Revisit if a peer ever asks US to host: it would ask by sending its
+        // own UPGRADE_PATH_REQUEST, which we answer with UPGRADE_FAILURE today.
+        let mut role = Writer::new();
+        role.varint(MR_WIFI_DIRECT_GROUP_OWNER, 1)
+            .varint(MR_WIFI_DIRECT_GROUP_CLIENT, 1);
+        meta.bytes(MM_MEDIUM_ROLE, &role.finish());
+        // Packed, per the schema -- it is `repeated ... [packed = true]`, not a singular
+        // field. Unpacked is accepted by a conformant parser, but this is one more place
+        // where matching the known-good costs a byte and removes a variable.
+        meta.bytes(MM_SUPPORTED_WIFI_DIRECT_AUTH, &[WIFI_DIRECT_WITH_PASSWORD as u8]);
     }
 
     let mut req = Writer::new();
@@ -749,10 +780,47 @@ mod tests {
         let info = crate::protobuf::first_bytes(&wd, BW_UPGRADE_PATH_INFO).unwrap().unwrap();
         let req = crate::protobuf::first_bytes(info, UP_UPGRADE_PATH_REQUEST).unwrap().unwrap();
         let meta = crate::protobuf::first_bytes(req, UPR_MEDIUM_METADATA).unwrap().unwrap();
+        // Packed, so one length-delimited field holding the varints -- not a bare varint.
         assert_eq!(
-            crate::protobuf::first_varint(meta, MM_SUPPORTED_WIFI_DIRECT_AUTH).unwrap(),
-            Some(WIFI_DIRECT_WITH_PASSWORD)
+            crate::protobuf::first_bytes(meta, MM_SUPPORTED_WIFI_DIRECT_AUTH).unwrap(),
+            Some(&[WIFI_DIRECT_WITH_PASSWORD as u8][..])
         );
+    }
+
+    /// THE ROLES, WITHOUT WHICH A PEER NEVER ANSWERS.
+    ///
+    /// A Windows peer given a well-formed request that omitted MediumRole returned
+    /// nothing at all -- not an offer and not an UPGRADE_FAILURE -- and the transfer ran
+    /// to completion over Bluetooth. There is no error to assert on at runtime, so this
+    /// is the only place the omission can be caught.
+    #[test]
+    fn a_wifi_direct_request_states_both_group_roles() {
+        let wd = crate::frames::upgrade_body(&path_request(&[Medium::WifiDirect])).unwrap();
+        let info = crate::protobuf::first_bytes(&wd, BW_UPGRADE_PATH_INFO).unwrap().unwrap();
+        let req = crate::protobuf::first_bytes(info, UP_UPGRADE_PATH_REQUEST).unwrap().unwrap();
+        let meta = crate::protobuf::first_bytes(req, UPR_MEDIUM_METADATA).unwrap().unwrap();
+        let role = crate::protobuf::first_bytes(meta, MM_MEDIUM_ROLE)
+            .unwrap()
+            .expect("a Wi-Fi Direct request must carry MediumRole");
+        assert_eq!(
+            crate::protobuf::first_varint(role, MR_WIFI_DIRECT_GROUP_CLIENT).unwrap(),
+            Some(1),
+            "we join the peer's group, so client is the role that matters"
+        );
+        assert_eq!(
+            crate::protobuf::first_varint(role, MR_WIFI_DIRECT_GROUP_OWNER).unwrap(),
+            Some(1)
+        );
+    }
+
+    /// And it must NOT appear when Wi-Fi Direct was not asked for.
+    #[test]
+    fn no_group_roles_without_a_wifi_direct_request() {
+        let lan = crate::frames::upgrade_body(&path_request(&[Medium::WifiLan])).unwrap();
+        let info = crate::protobuf::first_bytes(&lan, BW_UPGRADE_PATH_INFO).unwrap().unwrap();
+        let req = crate::protobuf::first_bytes(info, UP_UPGRADE_PATH_REQUEST).unwrap().unwrap();
+        let meta = crate::protobuf::first_bytes(req, UPR_MEDIUM_METADATA).unwrap().unwrap();
+        assert_eq!(crate::protobuf::first_bytes(meta, MM_MEDIUM_ROLE).unwrap(), None);
     }
 
     /// A medium we do not model is dropped, not fatal -- the negotiation stays

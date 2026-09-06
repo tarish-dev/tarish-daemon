@@ -32,6 +32,7 @@ use std::time::Duration;
 use dev_tarish::aidl::dev::tarish::{
     TarishPeer::TarishPeer,
     TarishPolicy::TarishPolicy,
+    TarishUpgrade::TarishUpgrade,
     TarishStatus::TarishStatus,
     ITarishCallback::ITarishCallback,
     ITarishService::{BnTarishService, ITarishService},
@@ -119,6 +120,14 @@ pub(crate) struct TransferState {
     /// Set to a transfer id once someone typed its PIN correctly.
     pin_ok: Mutex<Option<i64>>,
     pin_confirmed: std::sync::Condvar,
+    /// The socket a client has provided for a bandwidth upgrade, and which transfer
+    /// asked for it.
+    ///
+    /// `Some((id, None))` is an explicit decline, which is a real answer and different
+    /// from nobody having replied yet -- it lets the waiter stop immediately instead of
+    /// sitting out a thirty-second timeout for a client that has already said no.
+    upgrade_socket: Mutex<Option<(i64, Option<std::fs::File>)>>,
+    upgrade_answered: std::sync::Condvar,
     /// Whether the transfer in flight actually rides the AWDL link.
     ///
     /// AirDrop does; Quick Share never does -- it runs over Bluetooth, Wi-Fi LAN or
@@ -153,6 +162,10 @@ impl TransferState {
 
     pub(crate) fn finish(&self, id: i64) {
         let _ = self.current.compare_exchange(id, 0, Ordering::SeqCst, Ordering::SeqCst);
+        // A client that answered an upgrade request after we stopped waiting left a
+        // descriptor parked in that slot. Nothing will ever read it, and it would sit open
+        // until the next upgrade replaced it, so drop it with the transfer that asked.
+        self.clear_upgrade(id);
     }
 
     /// Cancel by id rather than "whatever is running": a stale tap from a client that
@@ -237,6 +250,50 @@ impl TransferState {
         if let Ok(mut c) = self.pin_ok.lock() {
             if *c == Some(id) {
                 *c = None;
+            }
+        }
+    }
+
+    /// A client's answer to onUpgradeNeeded. `None` declines.
+    pub(crate) fn provide_upgrade(&self, id: i64, sock: Option<std::fs::File>) {
+        if let Ok(mut u) = self.upgrade_socket.lock() {
+            *u = Some((id, sock));
+        }
+        self.upgrade_answered.notify_all();
+    }
+
+    /// Block until a client answers the upgrade request for `id`, or we give up.
+    ///
+    /// `None` covers every way of not getting a socket -- declined, cancelled, nobody
+    /// bound, or the wait ran out -- because the caller does the same thing with all of
+    /// them: carry on over the transport it already has.
+    pub(crate) fn await_upgrade(&self, id: i64, timeout: Duration) -> Option<std::fs::File> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut guard = self.upgrade_socket.lock().ok()?;
+        loop {
+            // Take only an answer addressed to THIS transfer. A late reply for a previous
+            // one is dropped here, which closes the fd it carried -- the right outcome for
+            // a socket nothing is going to read.
+            if guard.as_ref().map(|(who, _)| *who == id).unwrap_or(false) {
+                return guard.take().and_then(|(_, sock)| sock);
+            }
+            if self.is_cancelled(id) {
+                return None;
+            }
+            let left = deadline.checked_duration_since(std::time::Instant::now())?;
+            guard = self
+                .upgrade_answered
+                .wait_timeout(guard, left.min(Duration::from_millis(500)))
+                .ok()?
+                .0;
+        }
+    }
+
+    /// Drop any parked upgrade answer for `id`. Called when a transfer ends.
+    pub(crate) fn clear_upgrade(&self, id: i64) {
+        if let Ok(mut u) = self.upgrade_socket.lock() {
+            if u.as_ref().map(|(who, _)| *who == id).unwrap_or(false) {
+                *u = None;
             }
         }
     }
@@ -643,6 +700,14 @@ fn quickshare_mediums() -> Vec<u64> {
     // So it is not "the mediums we could upgrade to" in any sense we can reason about
     // from the schema; the receiver wants both entries present and refuses the request
     // in under a fifth of a second otherwise. Do not simplify this to either one alone.
+    //
+    // WIFI_DIRECT IS NOT IN THE DEFAULT, and it may need to be. The upgrade request now
+    // asks for Wi-Fi Direct, but a peer intersects that against what the CONNECTION
+    // REQUEST claimed, so it may never offer a group while 8 is absent here. The row
+    // above says [BLUETOOTH, WIFI_DIRECT] was refused in 94 ms -- but that was without
+    // WIFI_LAN, and the pattern in this table is that the receiver wants the full set
+    // rather than any one entry. Try `setprop persist.tarish.qs_mediums 2,5,8` before
+    // concluding that Wi-Fi Direct does not work; it costs a send, not a rebuild.
     let default = vec![Medium::Bluetooth as u64, Medium::WifiLan as u64];
     let Some(raw) = read_property("persist.tarish.qs_mediums") else {
         return default;
@@ -751,6 +816,50 @@ impl quickshare::outbound::Progress for TransferProgress {
         let ok = self.transfers.await_pin(self.id, Duration::from_secs(120));
         self.transfers.clear_pin(self.id);
         ok
+    }
+
+    fn join_wifi(
+        &self,
+        req: &quickshare::outbound::WifiJoin,
+    ) -> Option<std::net::TcpStream> {
+        // Ask whoever is bound. No client means no radio, so there is nothing to wait for
+        // -- return at once rather than parking the transfer for thirty seconds to
+        // discover that. A transfer running with no client bound is ordinary: the send was
+        // started from a share sheet and the person has since closed the app.
+        let upgrade = TarishUpgrade {
+            medium: req.medium as i32,
+            ssid: req.ssid.to_string(),
+            passphrase: req.passphrase.to_string(),
+            gateway: req.gateway.to_string(),
+            port: req.port as i32,
+            frequency: req.frequency,
+        };
+        {
+            let cbs = self.callbacks.lock().ok()?;
+            if cbs.is_empty() {
+                log::info!("quickshare: no client bound to join a network; staying put");
+                return None;
+            }
+            for cb in cbs.iter() {
+                let _ = cb.onUpgradeNeeded(self.id, &upgrade);
+            }
+        }
+        // Thirty seconds because forming or joining a Wi-Fi Direct group takes 4-8s on
+        // the hardware measured, and first-time driver init is slower. Long enough not to
+        // be the reason a working join is abandoned; short enough that a client which
+        // never answers costs a slow transfer rather than a stalled one.
+        let answered = self.transfers.await_upgrade(self.id, Duration::from_secs(30));
+        self.transfers.clear_upgrade(self.id);
+        let file = answered?;
+        // The client promised a connected TCP socket. Converting rather than wrapping
+        // gives us the socket options -- nodelay, read timeouts -- that the upgrade
+        // handshake sets on it.
+        //
+        // SAFETY: the fd came over binder as a ParcelFileDescriptor and this owns it now;
+        // `into_raw_fd` gives up File's ownership so it is not closed twice.
+        use std::os::fd::{FromRawFd, IntoRawFd};
+        let sock = unsafe { std::net::TcpStream::from_raw_fd(file.into_raw_fd()) };
+        Some(sock)
     }
 }
 
@@ -1093,6 +1202,35 @@ impl ITarishService for TarishService {
             log::info!("quickshare: PIN rejected for transfer {transfer_id}");
         }
         Ok(ok)
+    }
+
+    fn provideUpgradeSocket(
+        &self,
+        transfer_id: i64,
+        socket: Option<&binder::ParcelFileDescriptor>,
+    ) -> BinderResult<()> {
+        let Some(pfd) = socket else {
+            log::info!("quickshare: client declined the upgrade for transfer {transfer_id}");
+            self.transfers.provide_upgrade(transfer_id, None);
+            return Ok(());
+        };
+        // Duplicated for the same reason every other descriptor here is: the parcel's copy
+        // is closed when this transaction returns, and the transfer thread that will read
+        // it runs long after that.
+        match dup_file(pfd) {
+            Ok(f) => {
+                log::info!("quickshare: client joined the network for transfer {transfer_id}");
+                self.transfers.provide_upgrade(transfer_id, Some(f));
+            }
+            Err(e) => {
+                // Report it as a decline rather than an error. The transfer is waiting for
+                // an answer and will otherwise sit out its whole timeout for a descriptor
+                // that is never going to arrive.
+                log::warn!("quickshare: could not take the upgrade socket ({e}); declining");
+                self.transfers.provide_upgrade(transfer_id, None);
+            }
+        }
+        Ok(())
     }
 
     fn refreshPeers(&self) -> BinderResult<()> {

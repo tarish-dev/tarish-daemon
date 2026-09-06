@@ -1,6 +1,7 @@
 package dev.tarish;
 
 import dev.tarish.TarishPeer;
+import dev.tarish.TarishUpgrade;
 
 /** Events from tarishd to a bound client. All calls are oneway: the daemon must
  *  never block on a UI process, which may be slow, frozen or about to die. */
@@ -50,4 +51,24 @@ oneway interface ITarishCallback {
      * renumbers every method after it.
      */
     void onTransferPinRequired(long transferId);
+
+    /**
+     * The peer has offered a faster network. Join it and hand back a socket.
+     *
+     * Answer with ITarishService.provideUpgradeSocket -- with a connected socket on
+     * success, or null on failure, and ANSWER EITHER WAY. The transfer is parked in the
+     * daemon waiting for this, and while it waits nothing is moving; a client that
+     * simply does not reply costs the transfer its timeout and then continues on the
+     * slow transport it already had.
+     *
+     * Declining is a legitimate answer. The transfer is already running over Bluetooth
+     * and will finish there, only slower, so a client that cannot join -- no permission,
+     * Wi-Fi off, a driver that will not form a group -- should say so promptly rather
+     * than try hard.
+     *
+     * APPENDED LAST, and any future method must be too: the Rust and Java stubs map
+     * transaction codes by position, so inserting a method above this one silently
+     * renumbers every method after it.
+     */
+    void onUpgradeNeeded(long transferId, in TarishUpgrade upgrade);
 }

@@ -64,6 +64,37 @@ pub trait Progress {
     /// showing it -- a sender that displays its own copy lets someone confirm a transfer
     /// without ever looking at the receiver, which is the one thing this prevents.
     fn confirm_pin(&self, pin: &str) -> bool;
+
+    /// Join a network the peer stood up, and hand back a socket connected to it.
+    ///
+    /// THE DAEMON CANNOT DO THIS ITSELF. Joining a Wi-Fi Direct group is
+    /// `WifiP2pManager.connect()`, framework API a native service cannot reach -- the
+    /// same boundary that puts BLE scanning in the app. So the protocol half stays here
+    /// and the radio half goes out to whoever implements this.
+    ///
+    /// Blocks: forming a group takes seconds on real hardware. `None` means the join did
+    /// not happen -- no client bound, no permission, a driver that would not form a group,
+    /// or the client declined -- and is not an error. The transfer continues on the
+    /// transport it already has, only slower.
+    fn join_wifi(&self, req: &WifiJoin) -> Option<std::net::TcpStream>;
+}
+
+/// A network a peer has stood up for us, and where to reach it once we are on it.
+///
+/// Hotspot and Wi-Fi Direct share this shape because the caller does the same two things
+/// with both -- join by name and passphrase, then open a TCP socket. `medium` is what
+/// says which framework call joins it.
+pub struct WifiJoin<'a> {
+    pub medium: upgrade::Medium,
+    pub ssid: &'a str,
+    pub passphrase: &'a str,
+    /// Where to connect once joined. Empty means the peer named no address and the joiner
+    /// is to use the network's own gateway, which for a Wi-Fi Direct group is the group
+    /// owner -- something the framework reports and we would otherwise be guessing.
+    pub gateway: &'a str,
+    pub port: u16,
+    /// The channel in MHz, or 0. A hint for the radio; never a reason to refuse.
+    pub frequency: i32,
 }
 
 /// Drive a whole send. Returns `Ok(true)` if the peer accepted and every file went.
@@ -320,12 +351,20 @@ where
             // accepts, so its listener comes up while a human is still reading the
             // prompt instead of adding a round trip once they have tapped.
             //
-            // WIFI_LAN only. Wi-Fi Direct means standing up a P2P group, which is
-            // framework API the daemon cannot reach; claiming it would invite an offer
-            // we would have to decline.
-            let ask = upgrade::path_request(&[upgrade::Medium::WifiLan]);
+            // WI-FI DIRECT ONLY, which is what Bada asks for and what a peer answers.
+            //
+            // Asking for Wi-Fi Direct AND Wi-Fi LAN together produced silence from a
+            // Windows peer -- no offer, no UPGRADE_FAILURE, nothing -- so this is narrowed
+            // to the set a working implementation sends. That is not proof Wi-Fi LAN is
+            // what broke it: the request was also missing MediumRole at the time, which is
+            // on its own enough to explain the silence. Worth re-adding WIFI_LAN once a
+            // group has actually formed, since on a shared network it needs no radio work
+            // at all. Do it as its own change, and read the log rather than assuming.
+            //
+            // We do not choose the medium either way: the peer offers one and we take it.
+            let ask = upgrade::path_request(&[upgrade::Medium::WifiDirect]);
             write_frame(&mut out, &channel.encrypt(&ask).map_err(chan)?)?;
-            debug!("quickshare: asked for a Wi-Fi LAN upgrade");
+            debug!("quickshare: asked for a Wi-Fi Direct upgrade");
         }
 
         if progress.cancelled() {
@@ -389,7 +428,7 @@ where
                 // every byte arrived.
                 match upgrade::parse(&body) {
                     Ok(upgrade::Frame::PathAvailable(path)) => {
-                        match adopt(&path, endpoint_id, &mut input, &mut out, &mut channel) {
+                        match adopt(&path, endpoint_id, &mut input, &mut out, &mut channel, progress) {
                             Ok(true) => {
                                 info!(
                                     "quickshare: upgraded to {:?}; the rest goes over that",
@@ -590,21 +629,47 @@ fn finish_cleanly<W: Write>(
 /// The introduction carries our endpoint id because that is what the peer keys the new
 /// socket back to its existing session on. Get it wrong and the connection is accepted
 /// and then ignored.
-fn adopt(
-    path: &upgrade::UpgradePath,
-    endpoint_id: &str,
-    input: &mut Frames<Reader>,
-    out: &mut Writer,
-    channel: &mut SecureChannel,
-) -> io::Result<bool> {
-    // Only Wi-Fi LAN, which is the one that needs no radio work: the peer hands us an
-    // address on a network we are already on. Hotspot and Wi-Fi Direct mean joining a
-    // network, which is framework API a native daemon cannot reach.
+/// Get onto the medium the peer offered.
+///
+/// Two ways, and the difference is whether a radio has to be joined. Wi-Fi LAN hands us
+/// an address on a network we are already on, so the daemon dials it. Wi-Fi Direct and
+/// hotspot mean joining a network, which is framework API this process cannot reach, so
+/// the client does it and hands the socket back.
+///
+/// `Ok(None)` is a decline, not a failure: an offer we cannot take, or a client that
+/// would not take it. The caller answers UPGRADE_FAILURE once, in one place -- this used
+/// to be four copies of that write, one per way of giving up.
+fn acquire<P>(path: &upgrade::UpgradePath, progress: &P) -> io::Result<Option<std::net::TcpStream>>
+where
+    P: Progress,
+{
+    if let Some(w) = path.wifi.as_ref() {
+        let Ok(port) = u16::try_from(w.port) else {
+            debug!("quickshare: upgrade offered port {}, out of range", w.port);
+            return Ok(None);
+        };
+        // "0.0.0.0" is the schema's default and means "whatever the network's gateway
+        // turns out to be" -- it is not an address to connect to. Normalised to empty so
+        // the client has one thing to test rather than two.
+        let gateway = if w.gateway == "0.0.0.0" { "" } else { w.gateway.as_str() };
+        info!(
+            "quickshare: peer offered {:?} as {:?}; asking the app to join",
+            path.medium, w.ssid
+        );
+        let req = WifiJoin {
+            medium: path.medium,
+            ssid: &w.ssid,
+            passphrase: &w.password,
+            gateway,
+            port,
+            frequency: w.frequency,
+        };
+        return Ok(progress.join_wifi(&req));
+    }
+
     let Some(lan) = path.lan.as_ref() else {
-        debug!("quickshare: offered {:?}, which we cannot join", path.medium);
-        let no = frames::bandwidth_upgrade(&upgrade::failure());
-        write_frame(out, &channel.encrypt(&no).map_err(chan)?)?;
-        return Ok(false);
+        debug!("quickshare: offered {:?}, which carried no way to reach it", path.medium);
+        return Ok(None);
     };
 
     // The address arrives as raw bytes in network order: four for IPv4, sixteen for
@@ -618,22 +683,39 @@ fn adopt(
         }
         n => {
             debug!("quickshare: upgrade offered a {n}-byte address; not one we can use");
-            let no = frames::bandwidth_upgrade(&upgrade::failure());
-            write_frame(out, &channel.encrypt(&no).map_err(chan)?)?;
-            return Ok(false);
+            return Ok(None);
         }
     };
     let Ok(port) = u16::try_from(lan.port) else {
         debug!("quickshare: upgrade offered port {}, out of range", lan.port);
-        let no = frames::bandwidth_upgrade(&upgrade::failure());
-        write_frame(out, &channel.encrypt(&no).map_err(chan)?)?;
-        return Ok(false);
+        return Ok(None);
     };
     let addr = std::net::SocketAddr::new(ip, port);
     info!("quickshare: upgrading to Wi-Fi LAN at {addr}");
     // Bounded: an address we cannot reach must cost seconds, not the transfer. The peer
     // may be on a network we can see but not route to.
-    let sock = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
+    Ok(Some(std::net::TcpStream::connect_timeout(
+        &addr,
+        Duration::from_secs(5),
+    )?))
+}
+
+fn adopt<P>(
+    path: &upgrade::UpgradePath,
+    endpoint_id: &str,
+    input: &mut Frames<Reader>,
+    out: &mut Writer,
+    channel: &mut SecureChannel,
+    progress: &P,
+) -> io::Result<bool>
+where
+    P: Progress,
+{
+    let Some(sock) = acquire(path, progress)? else {
+        let no = frames::bandwidth_upgrade(&upgrade::failure());
+        write_frame(out, &channel.encrypt(&no).map_err(chan)?)?;
+        return Ok(false);
+    };
     // The frames here are small and request/response; Nagle would add a round trip to
     // each one for no benefit.
     let _ = sock.set_nodelay(true);

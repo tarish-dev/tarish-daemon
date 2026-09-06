@@ -234,4 +234,20 @@ interface ITarishService {
      */
     long sendFilesOnL2capSocket(String peerId, in ParcelFileDescriptor socket,
             in ParcelFileDescriptor[] files, in String[] names);
+
+    /**
+     * Hand back the socket asked for by ITarishCallback.onUpgradeNeeded.
+     *
+     * `socket` is a TCP connection to the peer over the network the app just joined,
+     * already connected. Pass null to decline -- because the join failed, the permission
+     * is missing, or the client would rather not. Declining is not an error and does not
+     * end the transfer: it continues on the transport it is already on.
+     *
+     * A socket for a transfer that is no longer waiting for one is closed and ignored,
+     * which is the right answer for a late reply to a transfer that has since timed out
+     * or been cancelled.
+     *
+     * APPENDED LAST -- transaction codes are positional.
+     */
+    void provideUpgradeSocket(long transferId, in @nullable ParcelFileDescriptor socket);
 }
