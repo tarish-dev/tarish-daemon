@@ -31,16 +31,36 @@ net_domain(tarishsharingd)
 binder_use(tarishsharingd)
 add_service(tarishsharingd, tarish_service)
 
-# The Tarish app is a system app, so it lands in the system_app domain. Publishing the
-# service is not enough on its own: a client also needs `call` on this domain and
-# `find` on the service name, and without them binder fails with a bare "remote
-# transaction failed" that says nothing about SELinux.
+# PLATFORM_APP, not system_app, and the difference is the app's uid.
+#
+# seapp_contexts maps a platform-signed app by the uid it runs as:
+#
+#     user=system seinfo=platform                          domain=system_app
+#     user=_app   minTargetSdkVersion=37 seinfo=platform    domain=platform_app
+#
+# The app used to declare sharedUserId="android.uid.system" and so ran as uid 1000 and
+# matched the first line. Dropping that -- which is the point, since it made the app the
+# system user and more privileged than this daemon -- moves it to the second. Rules
+# written against system_app then match nothing, and under enforcing the app cannot find
+# the service at all. Under permissive it works while logging denials, which is the worst
+# of the two outcomes because it looks fine.
+#
+# Publishing the service is not enough on its own: a client also needs `call` on this
+# domain and `find` on the service name, and without them binder fails with a bare
+# "remote transaction failed" that says nothing about SELinux.
 #
 # binder_call both ways, because the daemon calls BACK into the app through
 # ITarishCallback to say files have arrived.
-binder_call(system_app, tarishsharingd)
-binder_call(tarishsharingd, system_app)
-allow system_app tarish_service:service_manager find;
+#
+# STILL TOO BROAD. platform_app is a class, not this app -- any platform-signed app with
+# its own uid lands in it, and every one of them can then drive the whole interface:
+# enumerate peers, send files, watch transfers, and setPolicy to switch off the PIN
+# requirement. Narrowing it needs a dedicated domain via seapp_contexts keyed on package
+# and signature, which means re-granting everything a platform app gets and cannot be
+# written blind. See ARCHITECTURE-TARGET.md.
+binder_call(platform_app, tarishsharingd)
+binder_call(tarishsharingd, platform_app)
+allow platform_app tarish_service:service_manager find;
 
 # /proc/net/if_inet6, to find our own link-local address for the AAAA record we
 # advertise. The alternative is getifaddrs(), which would mean ~30 lines of
@@ -77,8 +97,8 @@ allow tarishsharingd tarish_data_file:file read;
 # needing permission on the file itself, which is what an earlier version of this
 # assumed: collection to Downloads/Tarish failed silently and the transfer looked like it
 # arrived and vanished.
-allow system_app tarish_data_file:file read;
-allow system_app tarish_data_file:dir search;
+allow platform_app tarish_data_file:file read;
+allow platform_app tarish_data_file:dir search;
 
 # And the reverse, for sending: the client passes descriptors for files it opened from
 # MediaStore, so this daemon has to be allowed to use an fd that mediaprovider owns.
@@ -134,7 +154,7 @@ set_prop(tarishsharingd, tarish_name_prop)
 # read/write only. NOT create, connect or bind: this daemon must never be able to open a
 # socket of its own from a descriptor someone else handed it, and it has no reason to --
 # the app already connected it.
-allow tarishsharingd system_app:unix_stream_socket { read write getattr };
+allow tarishsharingd platform_app:unix_stream_socket { read write getattr };
 
 # set_prop() alone is NOT enough on this release. The macro grants
 # `tarish_awdl_prop:property_service set` and `init:unix_stream_socket connectto`, but
