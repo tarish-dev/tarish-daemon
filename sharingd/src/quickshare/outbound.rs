@@ -35,9 +35,11 @@ use tarish_protocol::frames::{self, Frame as OfflineFrame, PayloadChunk, Payload
 use tarish_protocol::fsm::{Effect, Event, Outbound};
 use tarish_protocol::payload::{Assembler, Event as PayloadEvent};
 use tarish_protocol::sharing::{FileMetadata, FileType, Introduction};
+use tarish_protocol::upgrade;
 use tarish_protocol::ukey2::handshake::ClientHandshake;
 use log::{debug, info, warn};
 use std::io::{self, Read, Write};
+use std::time::Duration;
 
 /// Bytes per PayloadTransfer chunk. What stock Quick Share uses; large enough that the
 /// per-frame overhead disappears, small enough that progress moves visibly.
@@ -65,9 +67,19 @@ pub trait Progress {
 }
 
 /// Drive a whole send. Returns `Ok(true)` if the peer accepted and every file went.
-pub fn send<S, W, P>(
-    input: S,
-    mut out: W,
+/// The two halves of whatever socket we are on.
+///
+/// **Boxed so they can be REPLACED mid-transfer.** A bandwidth upgrade moves the same
+/// encrypted conversation onto a different socket: the keys and sequence numbers carry
+/// over untouched -- `SecureChannel` holds no transport, which is what makes this a swap
+/// rather than a renegotiation -- but every read and write after the handover has to go
+/// somewhere else. Generic parameters cannot express that; a boxed pair can.
+pub type Reader = Box<dyn Read + Send>;
+pub type Writer = Box<dyn Write + Send>;
+
+pub fn send<P>(
+    input: Reader,
+    mut out: Writer,
     device_name: &str,
     endpoint_id: &str,
     mediums: &[u64],
@@ -75,8 +87,6 @@ pub fn send<S, W, P>(
     progress: &P,
 ) -> io::Result<bool>
 where
-    S: Read,
-    W: Write,
     P: Progress,
 {
     let mut input = Frames::new(input);
@@ -302,6 +312,20 @@ where
                     .and_then(|w| write_frame(&mut out, &w));
                 return Ok(false);
             }
+
+            // ASK FOR A FASTER MEDIUM, here, before the files.
+            //
+            // A stock receiver never offers one unprompted -- it advertises
+            // autoUpgradeBandwidth:false and waits. Asked now rather than after the peer
+            // accepts, so its listener comes up while a human is still reading the
+            // prompt instead of adding a round trip once they have tapped.
+            //
+            // WIFI_LAN only. Wi-Fi Direct means standing up a P2P group, which is
+            // framework API the daemon cannot reach; claiming it would invite an offer
+            // we would have to decline.
+            let ask = upgrade::path_request(&[upgrade::Medium::WifiLan]);
+            write_frame(&mut out, &channel.encrypt(&ask).map_err(chan)?)?;
+            debug!("quickshare: asked for a Wi-Fi LAN upgrade");
         }
 
         if progress.cancelled() {
@@ -357,22 +381,35 @@ where
                 return Ok(false);
             }
             OfflineFrame::BandwidthUpgrade(body) => {
-                // WE CANNOT TAKE ONE, SO SAY SO.
+                // TAKE IT IF WE CAN, SAY SO IF WE CANNOT.
                 //
-                // This was ignored. Silence is not a neutral answer: the peer has opened
-                // a listener and is waiting for us to either adopt the path or fail it,
-                // and a transfer that ends while that negotiation is still open is
-                // reported as failed -- even when every byte of the file already
-                // arrived. That is exactly what a completed send followed by "failed" on
-                // the peer looks like.
-                //
-                // Answering UPGRADE_FAILURE closes the negotiation and leaves the
-                // payload on the medium we are already on, which is what we want until
-                // there is an upgrade implementation to adopt with.
-                debug!("quickshare: declining a bandwidth upgrade we cannot take");
-                let _ = tarish_protocol::upgrade::parse(&body); // logged shape only
-                let decline = frames::bandwidth_upgrade(&tarish_protocol::upgrade::failure());
-                write_frame(&mut out, &channel.encrypt(&decline).map_err(chan)?)?;
+                // Silence is not a neutral answer: the peer has a listener open and is
+                // waiting for us either to appear on it or to fail it, and a transfer
+                // that ends with the negotiation still open is reported failed even when
+                // every byte arrived.
+                match upgrade::parse(&body) {
+                    Ok(upgrade::Frame::PathAvailable(path)) => {
+                        match adopt(&path, endpoint_id, &mut input, &mut out, &mut channel) {
+                            Ok(true) => {
+                                info!(
+                                    "quickshare: upgraded to {:?}; the rest goes over that",
+                                    path.medium
+                                );
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                // NOT fatal. An upgrade is an optimisation, and the old
+                                // socket is still good -- treating this as a connection
+                                // failure would turn a slow transfer into no transfer.
+                                warn!("quickshare: upgrade failed ({e}); staying put");
+                                let no = frames::bandwidth_upgrade(&upgrade::failure());
+                                write_frame(&mut out, &channel.encrypt(&no).map_err(chan)?)?;
+                            }
+                        }
+                    }
+                    Ok(other) => debug!("quickshare: upgrade frame {other:?}, ignored"),
+                    Err(e) => debug!("quickshare: unreadable upgrade frame ({e})"),
+                }
             }
             other => debug!("quickshare: ignoring {other:?}"),
         }
@@ -523,4 +560,123 @@ fn finish_cleanly<W: Write>(
     // talking never returns, and that hang cost a transfer that had already succeeded.
     std::thread::sleep(std::time::Duration::from_millis(1500));
     Ok(())
+}
+
+/// Move the conversation onto the medium the peer just offered.
+///
+/// Returns `Ok(true)` when the swap happened and `input`/`out` now point at the new
+/// socket, `Ok(false)` when the offer was one we cannot use (and we said so), and `Err`
+/// when the attempt failed part-way. **None of these is fatal to the transfer** -- the
+/// caller stays on the old socket and keeps going, because an upgrade is an optimisation
+/// and losing it should cost speed, not the file.
+///
+/// The order is not ours to choose, and each step has a reason:
+///
+/// ```text
+///   connect the new socket
+///   -> CLIENT_INTRODUCTION            NEW socket, PLAINTEXT
+///   <- CLIENT_INTRODUCTION_ACK        NEW socket, plaintext, only if promised
+///   -> LAST_WRITE_TO_PRIOR_CHANNEL    OLD socket, encrypted
+///   <- SAFE_TO_CLOSE_PRIOR_CHANNEL    OLD socket, encrypted
+///   ...everything after: the SAME secure channel, over the new socket
+/// ```
+///
+/// **The introduction is plaintext and the frames after it are not.** The new socket has
+/// no handshake of its own -- it inherits the keys and, importantly, the SEQUENCE NUMBERS
+/// of the channel already running. That is why `SecureChannel` is passed through rather
+/// than rebuilt: a fresh one would restart at sequence 1 and the peer would refuse every
+/// frame as a replay.
+///
+/// The introduction carries our endpoint id because that is what the peer keys the new
+/// socket back to its existing session on. Get it wrong and the connection is accepted
+/// and then ignored.
+fn adopt(
+    path: &upgrade::UpgradePath,
+    endpoint_id: &str,
+    input: &mut Frames<Reader>,
+    out: &mut Writer,
+    channel: &mut SecureChannel,
+) -> io::Result<bool> {
+    // Only Wi-Fi LAN, which is the one that needs no radio work: the peer hands us an
+    // address on a network we are already on. Hotspot and Wi-Fi Direct mean joining a
+    // network, which is framework API a native daemon cannot reach.
+    let Some(lan) = path.lan.as_ref() else {
+        debug!("quickshare: offered {:?}, which we cannot join", path.medium);
+        let no = frames::bandwidth_upgrade(&upgrade::failure());
+        write_frame(out, &channel.encrypt(&no).map_err(chan)?)?;
+        return Ok(false);
+    };
+
+    // The address arrives as raw bytes in network order: four for IPv4, sixteen for
+    // IPv6. Anything else is not an address and connecting to a guess would hang.
+    let ip: std::net::IpAddr = match lan.ip.len() {
+        4 => std::net::Ipv4Addr::new(lan.ip[0], lan.ip[1], lan.ip[2], lan.ip[3]).into(),
+        16 => {
+            let mut b = [0u8; 16];
+            b.copy_from_slice(&lan.ip);
+            std::net::Ipv6Addr::from(b).into()
+        }
+        n => {
+            debug!("quickshare: upgrade offered a {n}-byte address; not one we can use");
+            let no = frames::bandwidth_upgrade(&upgrade::failure());
+            write_frame(out, &channel.encrypt(&no).map_err(chan)?)?;
+            return Ok(false);
+        }
+    };
+    let Ok(port) = u16::try_from(lan.port) else {
+        debug!("quickshare: upgrade offered port {}, out of range", lan.port);
+        let no = frames::bandwidth_upgrade(&upgrade::failure());
+        write_frame(out, &channel.encrypt(&no).map_err(chan)?)?;
+        return Ok(false);
+    };
+    let addr = std::net::SocketAddr::new(ip, port);
+    info!("quickshare: upgrading to Wi-Fi LAN at {addr}");
+    // Bounded: an address we cannot reach must cost seconds, not the transfer. The peer
+    // may be on a network we can see but not route to.
+    let sock = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
+    // The frames here are small and request/response; Nagle would add a round trip to
+    // each one for no benefit.
+    let _ = sock.set_nodelay(true);
+    sock.set_read_timeout(Some(Duration::from_secs(10)))?;
+
+    let mut new_out: Writer = Box::new(sock.try_clone()?);
+    let mut new_in = Frames::new(Box::new(sock) as Reader);
+
+    // 1. announce ourselves on the new socket, IN PLAINTEXT.
+    write_frame(&mut new_out, &upgrade::client_introduction(endpoint_id))?;
+
+    // 2. the ack, only when the peer said it would send one. Waiting for one that is
+    //    not coming stalls until the read timeout and then abandons a working upgrade.
+    if path.supports_introduction_ack {
+        let reply = new_in.next()?;
+        let body = frames::upgrade_body(&reply)
+            .ok_or_else(|| bad("the new socket answered with something else"))?;
+        match upgrade::parse(&body).map_err(bad)? {
+            upgrade::Frame::ClientIntroductionAck => {}
+            other => return Err(bad(format!("expected an introduction ack, got {other:?}"))),
+        }
+    }
+
+    // 3. tell the old socket we are done with it, and wait to be released. Encrypted,
+    //    because the old channel never stopped being the secure one.
+    let last = frames::bandwidth_upgrade(&upgrade::last_write_to_prior());
+    write_frame(out, &channel.encrypt(&last).map_err(chan)?)?;
+
+    // A stock peer starts its own teardown as soon as our introduction lands, so this
+    // usually arrives immediately. Bounded reads: anything else on the old socket is
+    // application traffic that will be re-read on the new one.
+    for _ in 0..8 {
+        let wire = input.next()?;
+        let plain = channel.decrypt(&wire).map_err(chan)?;
+        if let Ok(OfflineFrame::BandwidthUpgrade(b)) = frames::parse(&plain) {
+            if let Ok(upgrade::Frame::SafeToClosePrior { .. }) = upgrade::parse(&b) {
+                break;
+            }
+        }
+    }
+
+    // 4. the swap. Same channel, same keys, same sequence numbers -- different fd.
+    *input = new_in;
+    *out = new_out;
+    Ok(true)
 }
