@@ -715,6 +715,19 @@ const SAFE_TO_CLOSE_WAIT: Duration = Duration::from_secs(5);
 /// then, so this is a round trip on a fresh Wi-Fi link and ten seconds is generous.
 const INTRODUCTION_ACK_WAIT: Duration = Duration::from_secs(10);
 
+/// What we report as our Wi-Fi association frequency when releasing the old channel.
+///
+/// The schema's own "not set". We are handing over BECAUSE there was no usable network, so
+/// there is no frequency to report, and inventing one would be worse than saying nothing.
+const STA_FREQUENCY_UNKNOWN: i32 = -1;
+
+/// How long a single write may make no progress before the transfer is called failed.
+///
+/// This exists so a stalled transfer FAILS instead of hanging. A hung transfer is worse
+/// than a failed one: it holds the radio, never reports an outcome, and leaves the peer
+/// mid-session so nothing else can connect either.
+const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Hold the payload until the peer answers the upgrade request, or the deadline passes.
 ///
 /// Anything the peer says that is NOT about the upgrade is queued for the main loop rather
@@ -797,7 +810,7 @@ where
                     // still good -- treating this as a connection failure would turn a
                     // slow transfer into no transfer.
                     warn!("quickshare: upgrade failed ({e}); staying put");
-                    let no = frames::bandwidth_upgrade(&upgrade::failure());
+                    let no = upgrade::failure();
                     write_frame(out, &channel.encrypt(&no).map_err(chan)?)?;
                 }
             }
@@ -882,13 +895,26 @@ where
     P: Progress,
 {
     let Some(sock) = acquire(path, progress)? else {
-        let no = frames::bandwidth_upgrade(&upgrade::failure());
+        let no = upgrade::failure();
         write_frame(out, &channel.encrypt(&no).map_err(chan)?)?;
         return Ok(false);
     };
     // The frames here are small and request/response; Nagle would add a round trip to
     // each one for no benefit.
     let _ = sock.set_nodelay(true);
+    // A WRITE TIMEOUT, AND IT IS NOT OPTIONAL.
+    //
+    // Without it a peer that accepts the TCP connection and then never reads parks the
+    // transfer thread in sk_stream_wait_memory FOREVER: measured with 6.3 MB in Send-Q and
+    // the thread still there minutes later. Nothing times out, so the transfer never
+    // finishes, so onTransferFinished never fires, so the app never releases the Wi-Fi
+    // Direct group -- and every later attempt fails with "L2CAP data connection refused:
+    // 24" because the peer is still tangled in the session we never ended. One stall
+    // poisoned the device until it was rebooted.
+    //
+    // Twenty seconds of no progress at all on a freshly formed Wi-Fi link is broken, not
+    // slow: the same link moves 22 MB/s when it works.
+    let _ = sock.set_write_timeout(Some(WRITE_STALL_TIMEOUT));
     // DELIBERATELY NO SO_RCVTIMEO. This set a 10s read timeout for the introduction ack
     // below, and the timeout then STAYED ON THE SOCKET for the whole transfer -- so the
     // main loop's wait for the peer's acceptance, which is a human tapping a button, would
@@ -918,9 +944,26 @@ where
 
     // 3. tell the old socket we are done with it, and wait to be released. Encrypted,
     //    because the old channel never stopped being the secure one.
-    let last = frames::bandwidth_upgrade(&upgrade::last_write_to_prior());
+    let last = upgrade::last_write_to_prior();
     write_frame(out, &channel.encrypt(&last).map_err(chan)?)?;
 
+    // FOUR FRAMES, NOT TWO. This is the whole handover and skipping half of it looks
+    // exactly like the peer ignoring us:
+    //
+    //   1. we send LAST_WRITE_TO_PRIOR      (done above)
+    //   2. the peer sends ITS LAST_WRITE_TO_PRIOR
+    //   3. WE send SAFE_TO_CLOSE_PRIOR      <- this was missing entirely
+    //   4. the peer sends ITS SAFE_TO_CLOSE_PRIOR
+    //
+    // Without step 3 the peer never stops reading the old channel and never starts on the
+    // new one. Measured: ESTAB with Send-Q at 7,200,944 bytes to 192.168.49.1, the transfer
+    // thread parked in sk_stream_wait_memory, and "no safe-to-close from the peer" -- which
+    // reads as the peer being broken when it is waiting for a frame we owed it.
+    //
+    // Step 2 is not waited for strictly: a stock GMS host sends its own LAST_WRITE as soon
+    // as our introduction lands and does not wait for ours, so the two can cross. Both are
+    // accepted in either order, and step 3 goes out as soon as we have seen either.
+    //
     // BOUNDED IN TIME, and every other frame KEPT.
     //
     // This was bounded only in count -- eight reads -- on a socket with no read timeout,
@@ -933,8 +976,9 @@ where
     // arrive in this window -- it is the same channel -- and discarding it leaves the FSM
     // waiting for an answer that was received and dropped.
     let deadline = std::time::Instant::now() + SAFE_TO_CLOSE_WAIT;
-    let mut released = false;
-    while !released {
+    let mut we_released = false;
+    let mut peer_released = false;
+    while !peer_released {
         let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
             break;
         };
@@ -942,20 +986,44 @@ where
             break;
         };
         let plain = channel.decrypt(&wire).map_err(chan)?;
-        match frames::parse(&plain) {
-            Ok(OfflineFrame::BandwidthUpgrade(b))
-                if matches!(upgrade::parse(&b), Ok(upgrade::Frame::SafeToClosePrior { .. })) =>
-            {
-                released = true;
+        let mut handled = false;
+        if let Ok(OfflineFrame::BandwidthUpgrade(b)) = frames::parse(&plain) {
+            match upgrade::parse(&b) {
+                Ok(upgrade::Frame::LastWriteToPrior) => {
+                    handled = true;
+                    if !we_released {
+                        // OUR safe-to-close. The peer will not touch the new socket until
+                        // it has this.
+                        let ok = upgrade::safe_to_close_prior(STA_FREQUENCY_UNKNOWN);
+                        write_frame(out, &channel.encrypt(&ok).map_err(chan)?)?;
+                        we_released = true;
+                        debug!("quickshare: released the old channel");
+                    }
+                }
+                Ok(upgrade::Frame::SafeToClosePrior { .. }) => {
+                    handled = true;
+                    peer_released = true;
+                }
+                _ => {}
             }
-            // Anything else belongs to the conversation, not to the handover.
-            _ => deferred.push_back(plain),
+        }
+        // Anything else belongs to the conversation, not to the handover.
+        if !handled {
+            deferred.push_back(plain);
         }
     }
-    if !released {
-        // Swap anyway. The peer has our CLIENT_INTRODUCTION, so from its side the new
-        // channel is the live one -- staying on the old socket after introducing ourselves
-        // on the new one is the worse of the two guesses.
+    if !we_released {
+        // The peer's LAST_WRITE never arrived, but it is owed our release either way --
+        // a stock host sends its own without waiting for ours, so a crossed or lost frame
+        // must not leave us silently withholding the one thing it is waiting for.
+        let ok = upgrade::safe_to_close_prior(STA_FREQUENCY_UNKNOWN);
+        write_frame(out, &channel.encrypt(&ok).map_err(chan)?)?;
+        debug!("quickshare: released the old channel unprompted");
+    }
+    if !peer_released {
+        // Swap anyway. The peer has our CLIENT_INTRODUCTION and our release, so from its
+        // side the new channel is the live one -- staying on the old socket after
+        // introducing ourselves on the new one is the worse of the two guesses.
         warn!("quickshare: no safe-to-close from the peer; switching over regardless");
     }
 

@@ -226,6 +226,22 @@ impl From<protobuf::Error> for Error {
 // ------------------------------------------------------------------ encoding ---
 
 /// Wrap in a V1 offline frame of type BANDWIDTH_UPGRADE_NEGOTIATION.
+///
+/// EVERY BUILDER IN THIS MODULE RETURNS A COMPLETE OFFLINE FRAME. Write it to the transport
+/// as it is; do NOT pass it through `frames::bandwidth_upgrade` again.
+///
+/// Wrapping twice is not a malformed frame and nothing rejects it. The negotiation body
+/// becomes a whole OfflineFrame, whose first field is `version = 1` -- and read as a
+/// BandwidthUpgradeNegotiationFrame, field 1 is `event_type`, where 1 means
+/// UPGRADE_PATH_AVAILABLE. So a LAST_WRITE_TO_PRIOR and a SAFE_TO_CLOSE_PRIOR both arrive
+/// looking like a path offer, the peer logs
+///
+///     process BANDWIDTH_UPGRADE_NEGOTIATION frame event type:UPGRADE_PATH_AVAILABLE
+///     ProcessBandwidthUpgradePathAvailableEvent ignored by Advertiser
+///
+/// and silently drops them. Five call sites did this; the handover stalled with the peer
+/// refusing to read the new socket, and from our side that was indistinguishable from the
+/// peer being uncooperative. See `every_builder_returns_one_offline_frame`.
 fn wrap(body: &[u8]) -> Vec<u8> {
     crate::frames::bandwidth_upgrade(body)
 }
@@ -821,6 +837,55 @@ mod tests {
         let req = crate::protobuf::first_bytes(info, UP_UPGRADE_PATH_REQUEST).unwrap().unwrap();
         let meta = crate::protobuf::first_bytes(req, UPR_MEDIUM_METADATA).unwrap().unwrap();
         assert_eq!(crate::protobuf::first_bytes(meta, MM_MEDIUM_ROLE).unwrap(), None);
+    }
+
+    /// EVERY BUILDER RETURNS EXACTLY ONE OFFLINE FRAME, wrapped exactly once.
+    ///
+    /// Wrapping twice is silently accepted by a peer and mis-decoded: the inner frame's
+    /// `version = 1` lands on `event_type`, so anything double-wrapped reads as
+    /// UPGRADE_PATH_AVAILABLE and is ignored. Nothing errors, on either side. This asserts
+    /// the round trip so a second wrap at a call site cannot pass unnoticed -- and asserts
+    /// what a double wrap would look like, so the failure is documented as a fact.
+    #[test]
+    fn every_builder_returns_one_offline_frame() {
+        let cases: Vec<(&str, Vec<u8>, Frame)> = vec![
+            (
+                "last_write_to_prior",
+                last_write_to_prior(),
+                Frame::LastWriteToPrior,
+            ),
+            (
+                "safe_to_close_prior",
+                safe_to_close_prior(-1),
+                Frame::SafeToClosePrior { sta_frequency: -1 },
+            ),
+            (
+                "client_introduction",
+                client_introduction("ABCD"),
+                Frame::ClientIntroduction {
+                    endpoint_id: "ABCD".to_string(),
+                },
+            ),
+            (
+                "client_introduction_ack",
+                client_introduction_ack(),
+                Frame::ClientIntroductionAck,
+            ),
+        ];
+        for (name, built, want) in cases {
+            let body = crate::frames::upgrade_body(&built)
+                .unwrap_or_else(|| panic!("{name}: not a bandwidth-upgrade offline frame"));
+            let got = parse(&body).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(got, want, "{name} did not round-trip");
+        }
+
+        // And this is what a SECOND wrap does. Not an error -- a different frame.
+        let twice = crate::frames::bandwidth_upgrade(&last_write_to_prior());
+        let body = crate::frames::upgrade_body(&twice).unwrap();
+        match parse(&body).unwrap() {
+            Frame::PathAvailable(_) => {} // the inner version=1 read as event_type=1
+            other => panic!("expected a double wrap to look like a path offer, got {other:?}"),
+        }
     }
 
     /// A medium we do not model is dropped, not fatal -- the negotiation stays

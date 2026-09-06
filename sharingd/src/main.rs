@@ -2210,6 +2210,10 @@ impl TarishService {
         // Small request/response frames dominate the handshake; Nagle would add a round
         // trip to each for no benefit on a link this fast.
         let _ = sock.set_nodelay(true);
+        // Same reason as the upgraded socket: a peer that accepts and then stops reading
+        // would park this transfer's thread in sk_stream_wait_memory for good, and a
+        // transfer that never ends never reports an outcome and never frees anything.
+        let _ = sock.set_write_timeout(Some(Duration::from_secs(20)));
         log::info!("quickshare: connected to {peer_id} at {target} over the LAN");
 
         let mut out_files = Vec::with_capacity(files.len());
