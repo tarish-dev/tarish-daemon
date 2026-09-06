@@ -434,6 +434,7 @@ pub type Writer = Box<dyn Write + Send>;
 pub fn serve<H>(
     stream: Reader,
     mut out: Writer,
+    bootstrap: upgrade::Medium,
     host: &H,
     transfers: &Transfers,
     callbacks: &Callbacks,
@@ -441,8 +442,14 @@ pub fn serve<H>(
 where
     H: Host,
 {
+    // Only worth upgrading FROM a slow transport. On a LAN socket we are already at tens of
+    // megabytes and standing up a Wi-Fi Direct group would tear down a working link to get
+    // something slower -- the same gate the send path needs, for the same reason.
+    let bootstrap_is_slow = bootstrap == upgrade::Medium::Bluetooth;
     let mut input = Frames::new(stream);
     let mut deferred: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
+    // Whether the conversation has already moved to a faster socket.
+    let mut upgraded = false;
 
     // --- 1. the connection request, in plaintext -----------------------------
     let first = input.next()?;
@@ -592,6 +599,40 @@ where
                         expected.insert(f.payload_id, f.clone());
                     }
                     info!("quickshare: accepted, expecting {} payload(s)", expected.len());
+
+                    // OFFER A FASTER MEDIUM NOW, UNPROMPTED. A sender never asks.
+                    //
+                    // The roles are not sender and receiver, they are DISCOVERER and
+                    // ADVERTISER, and the rule is role-based: the advertiser hosts the new
+                    // network and the discoverer joins it. Receiving makes us the
+                    // advertiser, so the offer has to come from us. Two things in a stock
+                    // peer's own log say so:
+                    //
+                    //   BandwidthUpgradeManager has processed endpoint disconnection ...
+                    //   because there is no current BandwidthUpgradeMedium
+                    //       -- a sender that never set one up, i.e. never asked
+                    //
+                    //   ProcessBandwidthUpgradePathAvailableEvent ignored by Advertiser
+                    //       -- an advertiser refuses to JOIN, so it can only host
+                    //
+                    // Waiting for an UPGRADE_PATH_REQUEST here waits forever, which is why
+                    // every inbound transfer ran at Bluetooth speed while the very same
+                    // phone had happily hosted a group for us minutes earlier.
+                    //
+                    // Before the acceptance goes out, deliberately: the sender waits for our
+                    // response and will not stream until it arrives, so doing this first
+                    // means the handover never races the payload.
+                    if !upgraded && bootstrap_is_slow {
+                        match offer_group(host, &mut input, &mut out, &mut channel, &mut deferred) {
+                            Ok(true) => {
+                                upgraded = true;
+                                info!("quickshare: upgraded the inbound transfer to Wi-Fi Direct");
+                            }
+                            Ok(false) => debug!("quickshare: staying on this transport"),
+                            // Never fatal: the transfer is fine where it is, only slower.
+                            Err(e) => warn!("quickshare: could not upgrade ({e}); staying put"),
+                        }
+                    }
                 }
                 Effect::BeginSending(_) => { /* we never send on an inbound connection */ }
                 Effect::Done => {

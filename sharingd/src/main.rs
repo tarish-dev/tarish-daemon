@@ -1352,14 +1352,14 @@ impl ITarishService for TarishService {
                 auto_accept,
             };
             log::info!("quickshare: inbound Bluetooth connection (transfer {id})");
-            let outcome =
-                quickshare::connection::serve(
-                    Box::new(reader),
-                    Box::new(sock),
-                    &host,
-                    &transfers,
-                    &callbacks,
-                );
+            let outcome = quickshare::connection::serve(
+                Box::new(reader),
+                Box::new(sock),
+                tarish_protocol::upgrade::Medium::Bluetooth,
+                &host,
+                &transfers,
+                &callbacks,
+            );
             let status = match &outcome {
                 Ok(names) if !names.is_empty() => {
                     log::info!("quickshare: received {} file(s) over Bluetooth", names.len());
@@ -2129,14 +2129,14 @@ fn start_quickshare_server(
                         auto_accept,
                     };
                     log::info!("quickshare: inbound connection from {peer} (transfer {id})");
-                    let outcome =
-                        quickshare::connection::serve(
-                    Box::new(reader),
-                    Box::new(sock),
-                    &host,
-                    &transfers,
-                    &callbacks,
-                );
+                    let outcome = quickshare::connection::serve(
+                        Box::new(reader),
+                        Box::new(sock),
+                        tarish_protocol::upgrade::Medium::WifiLan,
+                        &host,
+                        &transfers,
+                        &callbacks,
+                    );
                     // TELL THE CLIENT IT ENDED. Without this the app sits at a full
                     // progress bar forever: the bytes arrived, the file is in the inbox, and
                     // nothing ever said the transfer was over. serve() has no notion of
