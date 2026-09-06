@@ -1361,12 +1361,16 @@ impl ITarishService for TarishService {
                 &callbacks,
             );
             let status = match &outcome {
+                // NOT "over Bluetooth": the transport may have been swapped underneath by
+                // then. Bluetooth is where the connection STARTED, and a line claiming a
+                // 5 GHz Wi-Fi Direct transfer arrived over Bluetooth is the kind of log that
+                // sends someone looking in the wrong place later.
                 Ok(names) if !names.is_empty() => {
-                    log::info!("quickshare: received {} file(s) over Bluetooth", names.len());
+                    log::info!("quickshare: received {} file(s) from a Bluetooth connection", names.len());
                     STATUS_OK
                 }
                 Ok(_) => {
-                    log::info!("quickshare: nothing received over Bluetooth");
+                    log::info!("quickshare: nothing received");
                     STATUS_DECLINED
                 }
                 Err(e) => {
@@ -2756,29 +2760,57 @@ impl quickshare::connection::Host for QsHost {
     }
 
     fn host_group(&self) -> Option<quickshare::connection::WifiGroup> {
-        // Ask whoever is bound. No client means no radio, so there is nothing to wait for.
-        {
-            let Ok(cbs) = self.callbacks.lock() else {
-                return None;
-            };
-            if cbs.is_empty() {
-                log::info!("quickshare: no client bound to host a group; staying put");
-                return None;
+        // ASKED REPEATEDLY, NOT ONCE.
+        //
+        // onGroupNeeded is oneway, so it reaches whoever is registered at the instant it is
+        // sent and nobody else. On an INBOUND transfer the component that answers it --
+        // TransferService -- is started by the app just after it responds to the offer, and
+        // the daemon fires this the moment ask() returns. The callback lost that race every
+        // time: the question went out before anyone was listening, and the transfer then sat
+        // out the whole timeout waiting for an answer to a question nobody heard.
+        //
+        // Re-asking is the fix rather than a longer wait, because waiting cannot help once
+        // the frame has been sent to nobody. Cheap: one oneway call every two seconds, and it
+        // stops the moment an answer lands.
+        let deadline = std::time::Instant::now() + GROUP_WAIT;
+        let mut asked_anyone = false;
+        while std::time::Instant::now() < deadline {
+            {
+                let Ok(cbs) = self.callbacks.lock() else {
+                    return None;
+                };
+                for cb in cbs.iter() {
+                    let _ = cb.onGroupNeeded(self.id);
+                    asked_anyone = true;
+                }
             }
-            for cb in cbs.iter() {
-                let _ = cb.onGroupNeeded(self.id);
+            if let Some(g) = self.transfers.await_group(self.id, GROUP_ASK_INTERVAL) {
+                return Some(quickshare::connection::WifiGroup {
+                    ssid: g.ssid,
+                    passphrase: g.passphrase,
+                    go_address: g.goAddress,
+                    frequency: g.frequency,
+                });
             }
         }
-        // Forming a group is 4-8s on real hardware, and slower on a cold driver.
-        let group = self.transfers.await_group(self.id, Duration::from_secs(30))?;
-        Some(quickshare::connection::WifiGroup {
-            ssid: group.ssid,
-            passphrase: group.passphrase,
-            go_address: group.goAddress,
-            frequency: group.frequency,
-        })
+        if asked_anyone {
+            log::info!("quickshare: no client answered the group request; staying put");
+        } else {
+            log::info!("quickshare: no client bound to host a group; staying put");
+        }
+        None
     }
 }
+
+/// How long an inbound transfer waits for a client to stand up a Wi-Fi Direct group.
+///
+/// Forming one is 4-8s on real hardware and slower on a cold driver, and the sender is
+/// waiting on our acceptance throughout -- so this is a real pause, paid once, against a
+/// transfer that would otherwise run at a hundredth of the speed.
+const GROUP_WAIT: Duration = Duration::from_secs(30);
+
+/// How often to repeat the request while waiting. See host_group.
+const GROUP_ASK_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Report how a Quick Share send ended, once, in one place.
 ///
