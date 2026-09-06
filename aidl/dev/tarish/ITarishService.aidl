@@ -250,4 +250,29 @@ interface ITarishService {
      * APPENDED LAST -- transaction codes are positional.
      */
     void provideUpgradeSocket(long transferId, in @nullable ParcelFileDescriptor socket);
+
+    /**
+     * Send to a Quick Share peer over the LAN, on a socket the DAEMON opens.
+     *
+     * TRY THIS FIRST for any Quick Share peer. Wi-Fi LAN is a bootstrap medium in this
+     * protocol, not something a transfer upgrades to: a peer on the same subnet publishes
+     * an address and port over mDNS and is reached by connecting to it, which is how a
+     * stock implementation gets full speed to a Windows machine. Bluetooth is the answer
+     * for a peer that is NOT on our network, and it runs at a fraction of the speed --
+     * around 200 KB/s measured, against a LAN's tens of megabytes.
+     *
+     * Unlike the Bluetooth variants the caller opens no socket, because there is nothing
+     * here the app is needed for: the address came from the daemon's own mDNS browser, and
+     * the daemon holds the local-network grant that lets it connect. It is the same
+     * division as everywhere else -- the app owns the radio, the daemon owns the protocol,
+     * and a TCP connection on an already-joined network needs no radio.
+     *
+     * Returns 0 when there is no LAN route to this peer, or the connection failed. That is
+     * the normal answer for a peer discovered only over BLE, and the caller should then
+     * fall back to sendFilesOnSocket or sendFilesOnL2capSocket. It is deliberately not an
+     * exception: having no LAN route is the expected case off-network, not an error.
+     *
+     * APPENDED LAST -- transaction codes are positional.
+     */
+    long sendFilesOnLan(String peerId, in ParcelFileDescriptor[] files, in String[] names);
 }

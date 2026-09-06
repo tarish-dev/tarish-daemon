@@ -61,6 +61,17 @@ type PeerTable = Arc<Mutex<Vec<mdns::Peer>>>;
 /// which owns the socket. Daemon state on purpose: closing the client must not
 /// make the device vanish.
 type Discoverable = Arc<AtomicBool>;
+/// Quick Share peers found by mDNS on wlan0, with the address and port they published.
+///
+/// **This is a ROUTE, not just a listing.** Wi-Fi LAN is a bootstrap medium in this
+/// protocol, not something a transfer upgrades to -- Bada's own registry says so: "Wi-Fi
+/// LAN is the discovery medium today, so there is nothing to upgrade to", and its route
+/// order is LAN before RFCOMM before L2CAP. A peer on our subnet is reached by connecting
+/// to what it advertised, and everything else is for peers that are not.
+///
+/// The browser maintained this table and only logged it, so the daemon learned the peer
+/// was at 192.168.0.99:56189 and then sent the file over Bluetooth at 200 KB/s.
+type QsLanPeers = Arc<Mutex<Vec<quickshare::discovery::QsPeer>>>;
 type Callbacks = Arc<Mutex<Vec<Strong<dyn ITarishCallback>>>>;
 /// Names learned from /Discover, keyed by the peer's LINK-LOCAL ADDRESS.
 ///
@@ -633,6 +644,8 @@ struct TarishService {
     /// discovery mechanisms, two tables -- merged only at getPeers, where each row
     /// carries the protocol that found it.
     ble_peers: Arc<Mutex<std::collections::HashMap<String, BlePeer>>>,
+    /// Quick Share peers reachable over the LAN, published by the mDNS browser.
+    qs_lan: QsLanPeers,
     /// What this device is permitted to do. Starts DENIED -- see setPolicy in the AIDL.
     policy: Arc<Mutex<TarishPolicy>>,
     /// Mirrors policy.requireConfirmation for the accept loop, which runs on the httpd
@@ -913,6 +926,7 @@ impl TarishService {
             sta_freq: Arc::new(std::sync::atomic::AtomicI32::new(-1)),
             peers,
             ble_peers: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            qs_lan: Arc::new(Mutex::new(Vec::new())),
             policy: Arc::new(Mutex::new(denied_policy())),
             auto_accept: Arc::new(AtomicBool::new(false)),
             // Required until the app says otherwise.
@@ -1202,6 +1216,15 @@ impl ITarishService for TarishService {
             log::info!("quickshare: PIN rejected for transfer {transfer_id}");
         }
         Ok(ok)
+    }
+
+    fn sendFilesOnLan(
+        &self,
+        peer_id: &str,
+        files: &[binder::ParcelFileDescriptor],
+        names: &[String],
+    ) -> BinderResult<i64> {
+        self.send_on_lan(peer_id, files, names)
     }
 
     fn provideUpgradeSocket(
@@ -1838,8 +1861,8 @@ fn start_airdrop_server(
 /// other with it. Retries rather than giving up -- wlan0 may have no address yet at
 /// boot, and a daemon that is running and permanently blind is worse than one that
 /// keeps trying.
-fn start_quickshare_discovery() {
-    std::thread::spawn(|| {
+fn start_quickshare_discovery(lan: QsLanPeers) {
+    std::thread::spawn(move || {
         const IFACE: &str = "wlan0";
         // Instances already reported, so a peer is announced when it appears rather than
         // every half second for as long as it stays.
@@ -1880,7 +1903,13 @@ fn start_quickshare_discovery() {
                 // Logged once per instance rather than per poll: the peer table is
                 // refreshed every 500ms and the interesting event is a peer appearing,
                 // not it continuing to exist.
-                for p in browser.peers() {
+                let found = browser.peers();
+                // Publish before logging. This is what sendFilesOnLan reads, and a table
+                // that is only ever logged is the bug this replaces.
+                if let Ok(mut t) = lan.lock() {
+                    *t = found.clone();
+                }
+                for p in found {
                     if seen.insert(p.instance.clone()) {
                         log::info!(
                             "quickshare: peer {} \"{}\" at {}:{} ({})",
@@ -1950,6 +1979,10 @@ fn main() {
         discoverable,
         service.policy.clone(),
     );
+    // Cloned BEFORE the service moves into the binder. The discovery thread is started
+    // after the service is published on purpose -- nothing should browse for peers until
+    // there is somewhere to report them -- so the handle has to be taken while it can be.
+    let qs_lan = service.qs_lan.clone();
     let binder = BnTarishService::new_binder(service, BinderFeatures::default());
 
     if let Err(e) = binder::add_service(SERVICE_NAME, binder.as_binder()) {
@@ -1960,7 +1993,7 @@ fn main() {
     // Quick Share identity, logged once. Discovery is not wired yet; this proves the
     // derivation on real hardware rather than only in reasoning.
     log::info!("quickshare: {}", quickshare::describe_identity(&device_name()));
-    start_quickshare_discovery();
+    start_quickshare_discovery(qs_lan);
 
     // One thread is plenty for a skeleton; the transfer work will want more.
     binder::ProcessState::join_thread_pool();
@@ -2108,25 +2141,157 @@ impl TarishService {
                     &progress,
                 )
             };
-            match outcome {
-                Ok(true) => {
-                    log::info!("quickshare: transfer {id} complete");
-                    progress.finished(STATUS_OK);
-                }
-                // Not an error: someone on the other device said no. Reporting it as a
-                // failure invites a retry that will be refused again.
-                Ok(false) => {
-                    log::info!("quickshare: transfer {id} was not accepted");
-                    progress.finished(STATUS_DECLINED);
-                }
-                Err(e) => {
-                    log::warn!("quickshare: transfer {id} failed: {e}");
-                    progress.finished(STATUS_FAILED);
-                }
-            }
+            report_outcome(id, outcome, &progress);
             transfers.finish(id);
         });
 
         Ok(id)
+    }
+
+    /// Send to a Quick Share peer over the LAN, dialling the address it advertised.
+    ///
+    /// THE FAST PATH, AND THE ONE THAT WAS MISSING. Wi-Fi LAN is a bootstrap medium here,
+    /// not an upgrade target: a peer on our subnet publishes an address over mDNS and is
+    /// reached by connecting to it. The daemon had that address -- it logged
+    /// "peer MTOI at 192.168.0.99:56189" -- and then sent the file over Bluetooth at
+    /// 200 KB/s, because the browser's table was never published anywhere that could use
+    /// it. Chasing a WIFI_LAN bandwidth upgrade instead was a dead end: a stock peer never
+    /// offers one, and Bada's own registry says why -- "Wi-Fi LAN is the discovery medium
+    /// today, so there is nothing to upgrade to".
+    fn send_on_lan(
+        &self,
+        peer_id: &str,
+        files: &[binder::ParcelFileDescriptor],
+        names: &[String],
+    ) -> BinderResult<i64> {
+        if !allows_send(self.quickshare_mode()) {
+            log::warn!("sendFilesOnLan refused — policy does not permit Quick Share send");
+            return Err(Status::from(StatusCode::PERMISSION_DENIED));
+        }
+        if files.len() != names.len() {
+            return Err(Status::from(StatusCode::BAD_VALUE));
+        }
+
+        // Matched on endpoint id, which is what the app holds. The same four characters
+        // key the BLE table, so a peer seen both ways resolves to one device.
+        let route = {
+            let table = self
+                .qs_lan
+                .lock()
+                .map_err(|_| Status::from(StatusCode::UNKNOWN_ERROR))?;
+            table
+                .iter()
+                .find(|p| p.endpoint_id == peer_id)
+                .and_then(|p| p.addr.map(|a| (a, p.port)))
+        };
+        // Not an error. A peer discovered only over BLE has no LAN route, and the caller
+        // is expected to fall back to Bluetooth -- so say so quietly and return 0.
+        let Some((addr, port)) = route else {
+            log::info!("quickshare: no LAN route to {peer_id}; the caller should use Bluetooth");
+            return Ok(0);
+        };
+        if port == 0 {
+            log::info!("quickshare: {peer_id} published no port yet; not a LAN route");
+            return Ok(0);
+        }
+
+        let target = std::net::SocketAddr::new(std::net::IpAddr::V4(addr), port);
+        // Bounded, and short. A peer that advertised an address it is not listening on
+        // must cost a moment before we fall back, not the whole transfer.
+        let sock = match std::net::TcpStream::connect_timeout(&target, Duration::from_secs(5)) {
+            Ok(s) => s,
+            Err(e) => {
+                log::info!("quickshare: could not reach {peer_id} at {target} ({e}); use Bluetooth");
+                return Ok(0);
+            }
+        };
+        // Small request/response frames dominate the handshake; Nagle would add a round
+        // trip to each for no benefit on a link this fast.
+        let _ = sock.set_nodelay(true);
+        log::info!("quickshare: connected to {peer_id} at {target} over the LAN");
+
+        let mut out_files = Vec::with_capacity(files.len());
+        for (f, n) in files.iter().zip(names) {
+            let file = dup_file(f).map_err(|e| {
+                log::warn!("sendFilesOnLan: could not dup {n}: {e}");
+                Status::from(StatusCode::BAD_VALUE)
+            })?;
+            let size = file.metadata().map(|m| m.len() as i64).unwrap_or(0);
+            out_files.push(quickshare::outbound::OutFile {
+                name: n.clone(),
+                mime: mime_of(n),
+                size,
+                reader: Box::new(file),
+            });
+        }
+
+        let id = self.transfers.begin(false);
+        let device = device_name();
+        let endpoint = String::from_utf8_lossy(&quickshare::random_endpoint_id()).into_owned();
+        let peer = peer_id.to_string();
+        let transfers = self.transfers.clone();
+        let callbacks = self.callbacks.clone();
+        let require_pin = self.require_pin.load(Ordering::SeqCst);
+
+        std::thread::spawn(move || {
+            let reader = match sock.try_clone() {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!("quickshare: could not clone the LAN socket: {e}");
+                    transfers.finish(id);
+                    return;
+                }
+            };
+            let progress = TransferProgress {
+                id,
+                transfers: transfers.clone(),
+                callbacks,
+                require_pin,
+            };
+            log::info!(
+                "quickshare: sending {} file(s) to {peer} over the LAN",
+                out_files.len()
+            );
+            // WIFI_LAN ALONE, and not quickshare_mediums(). That function answers a
+            // different question -- what we could upgrade a BLUETOOTH bootstrap to -- and
+            // its measured table is about what a receiver accepts over Bluetooth. Bada
+            // does the same: a LAN transport advertises setOf(WIFI_LAN) and nothing else,
+            // because there is no faster medium to move to from here.
+            let mediums = [tarish_protocol::frames::Medium::WifiLan as u64];
+            let outcome = quickshare::outbound::send(
+                Box::new(reader),
+                Box::new(sock),
+                &device,
+                &endpoint,
+                &mediums,
+                out_files,
+                &progress,
+            );
+            report_outcome(id, outcome, &progress);
+            transfers.finish(id);
+        });
+
+        Ok(id)
+    }
+}
+
+/// Report how a Quick Share send ended, once, in one place.
+///
+/// Declined is not a failure: someone on the other device said no, and reporting that as
+/// "could not send" invites a retry that will be refused again.
+fn report_outcome(id: i64, outcome: std::io::Result<bool>, progress: &TransferProgress) {
+    match outcome {
+        Ok(true) => {
+            log::info!("quickshare: transfer {id} complete");
+            progress.finished(STATUS_OK);
+        }
+        Ok(false) => {
+            log::info!("quickshare: transfer {id} was not accepted");
+            progress.finished(STATUS_DECLINED);
+        }
+        Err(e) => {
+            log::warn!("quickshare: transfer {id} failed: {e}");
+            progress.finished(STATUS_FAILED);
+        }
     }
 }
