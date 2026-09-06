@@ -447,6 +447,20 @@ fn dup_file(pfd: &binder::ParcelFileDescriptor) -> std::io::Result<std::fs::File
     Ok(unsafe { std::fs::File::from_raw_fd(raw) })
 }
 
+/// "XX:XX:XX:XX:XX:XX" to six bytes. None for anything else.
+fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let mut out = [0u8; 6];
+    let mut n = 0;
+    for part in s.split(':') {
+        if n == 6 || part.len() != 2 {
+            return None;
+        }
+        out[n] = u8::from_str_radix(part, 16).ok()?;
+        n += 1;
+    }
+    (n == 6).then_some(out)
+}
+
 fn read_property(name: &str) -> Option<String> {
     let cname = std::ffi::CString::new(name).ok()?;
     let mut buf = [0u8; 128];
@@ -646,6 +660,9 @@ struct TarishService {
     ble_peers: Arc<Mutex<std::collections::HashMap<String, BlePeer>>>,
     /// Quick Share peers reachable over the LAN, published by the mDNS browser.
     qs_lan: QsLanPeers,
+    /// Who we say we are when receiving. Shared with the mDNS responder so both wires
+    /// advertise the same endpoint id -- see QsIdentity.
+    qs_ident: Arc<quickshare::discovery::QsIdentity>,
     /// What this device is permitted to do. Starts DENIED -- see setPolicy in the AIDL.
     policy: Arc<Mutex<TarishPolicy>>,
     /// Mirrors policy.requireConfirmation for the accept loop, which runs on the httpd
@@ -927,6 +944,7 @@ impl TarishService {
             peers,
             ble_peers: Arc::new(Mutex::new(std::collections::HashMap::new())),
             qs_lan: Arc::new(Mutex::new(Vec::new())),
+            qs_ident: Arc::new(quickshare::discovery::QsIdentity::new(&device_name())),
             policy: Arc::new(Mutex::new(denied_policy())),
             auto_accept: Arc::new(AtomicBool::new(false)),
             // Required until the app says otherwise.
@@ -1225,6 +1243,104 @@ impl ITarishService for TarishService {
         names: &[String],
     ) -> BinderResult<i64> {
         self.send_on_lan(peer_id, files, names)
+    }
+
+    fn quickShareAdvertisement(&self, bluetooth_mac: &str) -> BinderResult<Vec<u8>> {
+        let Some(mac) = parse_mac(bluetooth_mac) else {
+            log::warn!("quickShareAdvertisement: {bluetooth_mac:?} is not a Bluetooth address");
+            return Ok(Vec::new());
+        };
+        // No PSM: we listen on RFCOMM, not L2CAP.
+        //
+        // THIS FIELD DECIDES WHICH SOCKET THE PEER OPENS, and it is not a preference. A peer
+        // that sees a PSM opens an L2CAP channel and REFUSES RFCOMM -- accepted and closed
+        // inside 200 ms, no frame either way, which reads as a device that is asleep. So this
+        // stays None until an L2CAP listener actually exists.
+        let advert = tarish_protocol::ble::build_advertisement(
+            &self.qs_ident.id_str(),
+            &self.qs_ident.endpoint_info,
+            Some(mac),
+            self.qs_ident.device_token,
+            None,
+        );
+        match advert {
+            Some(bytes) => {
+                log::info!(
+                    "quickshare: advertisement for {} over BLE ({} bytes, RFCOMM at {bluetooth_mac})",
+                    self.qs_ident.id_str(),
+                    bytes.len()
+                );
+                Ok(bytes)
+            }
+            None => {
+                log::warn!("quickShareAdvertisement: could not build one");
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    fn receiveOnSocket(&self, socket: &binder::ParcelFileDescriptor) -> BinderResult<i64> {
+        if !allows_receive(self.quickshare_mode()) {
+            log::warn!("receiveOnSocket refused — policy does not permit Quick Share receive");
+            return Err(Status::from(StatusCode::PERMISSION_DENIED));
+        }
+        // Duplicated for the same reason every other descriptor here is: the parcel's copy
+        // closes when this transaction returns, and the thread that reads it runs after.
+        let sock = match dup_file(socket) {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("receiveOnSocket: could not take the socket ({e})");
+                return Ok(0);
+            }
+        };
+        let reader = match sock.try_clone() {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!("receiveOnSocket: could not clone the socket ({e})");
+                return Ok(0);
+            }
+        };
+
+        let id = self.transfers.begin(false);
+        let transfers = self.transfers.clone();
+        let callbacks = self.callbacks.clone();
+        let auto_accept = self.auto_accept.clone();
+        std::thread::spawn(move || {
+            let host = QsHost {
+                id,
+                // The peer names itself in its ConnectionRequest, which serve() reads. There
+                // is no address to report here: a Bluetooth peer arrives on a socket the app
+                // accepted and the daemon never sees who dialled.
+                peer: "a nearby device".to_string(),
+                transfers: transfers.clone(),
+                callbacks: callbacks.clone(),
+                auto_accept,
+            };
+            log::info!("quickshare: inbound Bluetooth connection (transfer {id})");
+            let outcome =
+                quickshare::connection::serve(reader, sock, &host, &transfers, &callbacks);
+            let status = match &outcome {
+                Ok(names) if !names.is_empty() => {
+                    log::info!("quickshare: received {} file(s) over Bluetooth", names.len());
+                    STATUS_OK
+                }
+                Ok(_) => {
+                    log::info!("quickshare: nothing received over Bluetooth");
+                    STATUS_DECLINED
+                }
+                Err(e) => {
+                    log::warn!("quickshare: inbound transfer {id} failed: {e}");
+                    STATUS_FAILED
+                }
+            };
+            if let Ok(cbs) = callbacks.lock() {
+                for cb in cbs.iter() {
+                    let _ = cb.onTransferFinished(id, status);
+                }
+            }
+            transfers.finish(id);
+        });
+        Ok(id)
     }
 
     fn provideUpgradeSocket(
@@ -1994,7 +2110,11 @@ fn start_quickshare_server(
 /// other with it. Retries rather than giving up -- wlan0 may have no address yet at
 /// boot, and a daemon that is running and permanently blind is worse than one that
 /// keeps trying.
-fn start_quickshare_discovery(lan: QsLanPeers, port: Arc<std::sync::atomic::AtomicU16>) {
+fn start_quickshare_discovery(
+    lan: QsLanPeers,
+    port: Arc<std::sync::atomic::AtomicU16>,
+    ident: Arc<quickshare::discovery::QsIdentity>,
+) {
     std::thread::spawn(move || {
         const IFACE: &str = "wlan0";
         // Instances already reported, so a peer is announced when it appears rather than
@@ -2025,11 +2145,12 @@ fn start_quickshare_discovery(lan: QsLanPeers, port: Arc<std::sync::atomic::Atom
             loop {
                 let bound = port.load(Ordering::SeqCst);
                 if responder.is_none() && bound != 0 {
-                    match quickshare::discovery::QsResponder::new(IFACE, &device_name(), bound) {
+                    match quickshare::discovery::QsResponder::new(IFACE, &ident, bound) {
                         Ok(r) => {
                             log::info!(
-                                "quickshare: advertising as \"{}\" on port {bound}",
-                                device_name()
+                                "quickshare: advertising as \"{}\" ({}) on port {bound}",
+                                device_name(),
+                                ident.id_str()
                             );
                             responder = Some(r);
                         }
@@ -2152,6 +2273,7 @@ fn main() {
     // after the service is published on purpose -- nothing should browse for peers until
     // there is somewhere to report them -- so the handle has to be taken while it can be.
     let qs_lan = service.qs_lan.clone();
+    let qs_ident = service.qs_ident.clone();
     // The port the Quick Share listener actually bound, for the responder to advertise.
     // Zero until it is up, which is how the responder knows not to announce yet.
     let qs_port = Arc::new(std::sync::atomic::AtomicU16::new(0));
@@ -2172,7 +2294,7 @@ fn main() {
     // Quick Share identity, logged once. Discovery is not wired yet; this proves the
     // derivation on real hardware rather than only in reasoning.
     log::info!("quickshare: {}", quickshare::describe_identity(&device_name()));
-    start_quickshare_discovery(qs_lan, qs_port);
+    start_quickshare_discovery(qs_lan, qs_port, qs_ident);
 
     // One thread is plenty for a skeleton; the transfer work will want more.
     binder::ProcessState::join_thread_pool();

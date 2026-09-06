@@ -323,6 +323,49 @@ fn join_multicast_v4(sock: &UdpSocket, ifindex: u32) -> io::Result<()> {
 
 // ------------------------------------------------------------------ advertising ---
 
+/// Who this device says it is when receiving.
+///
+/// ONE IDENTITY FOR EVERY MEDIUM. The endpoint id appears in the mDNS instance name, in the
+/// BLE advertisement and in the ConnectionRequest a peer sends back, and a peer that sees
+/// two different ids sees two different devices -- it would list us twice and could pick the
+/// one it cannot reach. So this is built once and shared, rather than each advertiser
+/// generating its own.
+///
+/// The endpoint info is the same structure on both wires too: flags, a salt, an encrypted
+/// metadata key and the name. Built here so there is exactly one copy of what we claim to
+/// be.
+pub struct QsIdentity {
+    pub endpoint_id: [u8; quickshare::ENDPOINT_ID_LEN],
+    pub endpoint_info: Vec<u8>,
+    /// Two bytes a peer uses to tell one advertisement of ours from another. Random per
+    /// boot: it is not an identifier we want to be stable across sessions.
+    pub device_token: [u8; 2],
+}
+
+impl QsIdentity {
+    pub fn new(device_name: &str) -> Self {
+        let info = quickshare::endpoint::EndpointInfo {
+            version: 0,
+            hidden: false,
+            device_type: quickshare::endpoint::DeviceType::Phone,
+            metadata: random_metadata(),
+            device_name: Some(device_name.to_string()),
+        };
+        let mut token = [0u8; 2];
+        let _ = openssl::rand::rand_bytes(&mut token);
+        Self {
+            endpoint_id: quickshare::random_endpoint_id(),
+            endpoint_info: info.encode(),
+            device_token: token,
+        }
+    }
+
+    /// The four ASCII characters, as a string, for logging and for the instance name.
+    pub fn id_str(&self) -> String {
+        String::from_utf8_lossy(&self.endpoint_id).into_owned()
+    }
+}
+
 /// Announces this device as a Quick Share endpoint on the Wi-Fi LAN, and answers queries
 /// for it.
 ///
@@ -350,7 +393,7 @@ pub struct QsResponder {
 }
 
 impl QsResponder {
-    pub fn new(iface: &str, device_name: &str, port: u16) -> io::Result<Self> {
+    pub fn new(iface: &str, ident: &QsIdentity, port: u16) -> io::Result<Self> {
         let ifindex = crate::mdns::ifindex_of(iface)?;
         let sock = bind_reuse_v4(MDNS_PORT).or_else(|e| {
             // Losing :5353 to the platform's own mdnsd costs us the ability to ANSWER
@@ -377,30 +420,19 @@ impl QsResponder {
         let tx = UdpSocket::bind(SocketAddrV4::new(addr, 0))?;
         set_multicast_if_v4(&tx, ifindex)?;
 
-        let id = quickshare::random_endpoint_id();
-        let instance = format!(
-            "{}.{}",
-            quickshare::instance_name(&id),
-            quickshare::endpoint::SERVICE_TYPE
-        );
+        let label = quickshare::instance_name(&ident.endpoint_id);
+        let instance = format!("{}.{}", label, quickshare::endpoint::SERVICE_TYPE);
         // Derived from the endpoint id rather than from the device name: the name is the
         // user's and may be anything, including characters a DNS label cannot carry.
-        let host = format!("tarish-{}.local", quickshare::instance_name(&id).to_lowercase());
+        let host = format!("tarish-{}.local", label.to_lowercase());
 
-        let info = quickshare::endpoint::EndpointInfo {
-            version: 0,
-            hidden: false,
-            device_type: quickshare::endpoint::DeviceType::Phone,
-            metadata: random_metadata(),
-            device_name: Some(device_name.to_string()),
-        };
         Ok(Self {
             sock,
             tx,
             instance,
             host,
             addr,
-            endpoint_info: info.encode(),
+            endpoint_info: ident.endpoint_info.clone(),
             port,
         })
     }

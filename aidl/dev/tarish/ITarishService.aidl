@@ -275,4 +275,47 @@ interface ITarishService {
      * APPENDED LAST -- transaction codes are positional.
      */
     long sendFilesOnLan(String peerId, in ParcelFileDescriptor[] files, in String[] names);
+
+    /**
+     * The BLE service data to advertise so Quick Share senders can find this device.
+     *
+     * THE DAEMON ENCODES, THE APP RADIATES -- the mirror of reportBlePeer, and the same
+     * reason. The advertisement's layout lives in libtarish_protocol with test vectors taken
+     * from a real Pixel and a real Windows machine, so building it in Java would be a second
+     * implementation of a format we already got right once, free to drift from the decoder.
+     *
+     * `bluetoothMac` is this device's Bluetooth Classic address, which goes INSIDE the
+     * advertisement: a peer with no address can see us and not connect. The app has to
+     * supply it because the daemon cannot reach Bluetooth at all. Pass it as
+     * "XX:XX:XX:XX:XX:XX".
+     *
+     * Returns an empty array if the address is unusable or the device has no receive
+     * identity yet, in which case do not advertise -- an advertisement without an address is
+     * worse than none, since it puts a device in the sender's list that cannot be reached.
+     *
+     * The bytes go in an AdvertiseData service-data field under 16-bit UUID 0xFEF3. They
+     * change if the device name changes, so ask again rather than caching across a restart.
+     *
+     * APPENDED LAST -- transaction codes are positional.
+     */
+    byte[] quickShareAdvertisement(String bluetoothMac);
+
+    /**
+     * Receive a Quick Share transfer on a socket the CALLER already accepted.
+     *
+     * The receiving counterpart to sendFilesOnSocket, and the same division: a peer with no
+     * shared network arrives over Bluetooth, framework Bluetooth is unreachable from a
+     * native service, so the app accepts the connection and the daemon runs the protocol.
+     *
+     * As on the send side this is one end of a socket PAIR rather than the Bluetooth socket
+     * itself, because Android does not expose a BluetoothSocket's descriptor. The app pumps
+     * between the two.
+     *
+     * Returns a transfer id, or 0 if it could not be started -- policy forbids receiving, or
+     * the descriptor could not be taken. The offer prompt, the answer and the files then
+     * follow the ordinary path: onTransferOffered, respondToOffer, getReceivedFiles.
+     *
+     * APPENDED LAST -- transaction codes are positional.
+     */
+    long receiveOnSocket(in ParcelFileDescriptor socket);
 }

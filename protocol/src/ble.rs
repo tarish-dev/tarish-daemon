@@ -420,15 +420,22 @@ pub fn build_advertisement(
     }
 
     let mut body = Vec::new();
-    // versPCP: version 1 in the top three bits, PCP in the low five. 0x16 is what both
-    // captured devices send, and it is not a field worth improvising.
-    body.push(0x16);
+    // versPCP = 0x23: version 1 in the top three bits, PCP 3 in the low five. Both captured
+    // devices send exactly this. An earlier version of this function sent 0x16, which was
+    // the info_len byte misread out of the same capture -- and nothing rejects a wrong
+    // version, the advertisement is simply never recognised.
+    body.push(0x23);
     body.extend_from_slice(&SERVICE_ID_HASH);
     body.extend_from_slice(endpoint_id.as_bytes());
     body.push(endpoint_info.len() as u8);
     body.extend_from_slice(endpoint_info);
     if let Some(mac) = bluetooth_mac {
         body.extend_from_slice(&mac);
+        // TWO ZERO BYTES after the address, inside the body. Both captures carry them and
+        // the decoder ignores them, so their meaning is unknown -- which is exactly why they
+        // are reproduced rather than dropped. A body two bytes shorter than every real one
+        // is a difference we would be choosing without knowing what it costs.
+        body.extend_from_slice(&[0, 0]);
     }
 
     let mut out = Vec::new();
@@ -438,14 +445,13 @@ pub fn build_advertisement(
     out.extend_from_slice(&(body.len() as u32).to_be_bytes());
     out.extend_from_slice(&body);
     out.extend_from_slice(&device_token);
-    // The mask is written even when empty, because absence and emptiness are different to
-    // a peer -- the same trap as the connection response's multiplex bitmask.
-    match psm {
-        Some(p) if p != 0 => {
-            out.push(EXTRA_FIELD_PSM);
-            out.extend_from_slice(&p.to_be_bytes());
-        }
-        _ => out.push(0),
+    // NO MASK BYTE AT ALL when there is no PSM. The Windows capture ends at the device
+    // token; the Pixel one carries mask 0x01 and a PSM. So the field is absent rather than
+    // zero, and this followed a guess -- with a confident comment attached -- until the two
+    // captures were actually compared.
+    if let Some(p) = psm.filter(|p| *p != 0) {
+        out.push(EXTRA_FIELD_PSM);
+        out.extend_from_slice(&p.to_be_bytes());
     }
     Some(out)
 }
@@ -638,6 +644,45 @@ d42301dd5ac4eed5c084b2d50726f4172749cc7d3e40de9000064ea";
         "4a172357444b4811320f75aa376a6c91683c1583cf24accd3c2536",
         "4a172342524a361132e88e4a78a8c8399b84fcc5a2404ee85f2d94",
     ];
+
+    /// THE ENCODER MUST REPRODUCE A REAL DEVICE, BYTE FOR BYTE.
+    ///
+    /// Deliberately not a round trip through our own decoder: that passes with a wrong
+    /// version byte, a missing pad and an invented mask, because the decoder ignores all
+    /// three. These are the bytes a Pixel and a Windows machine actually put on the air, and
+    /// any difference from them is one we would be choosing blind.
+    ///
+    /// It caught exactly that. versPCP was being sent as 0x16 -- the info_len byte, misread
+    /// out of this same capture -- with no zero pad after the address and a mask byte where
+    /// Windows sends nothing. Nothing rejects any of it: the advertisement is simply never
+    /// recognised, and the device is invisible with no error on either side.
+    #[test]
+    fn the_encoder_reproduces_real_advertisements() {
+        for (name, hex) in [("Pixel", PIXEL_WITH_PSM), ("Windows", WINDOWS)] {
+            let want = unhex(hex);
+            let a = parse_advertisement(&want).expect("the capture should parse");
+            let mac = a.bluetooth_mac.as_deref().map(|m| {
+                let mut out = [0u8; MAC_LEN];
+                for (i, part) in m.split(':').enumerate() {
+                    out[i] = u8::from_str_radix(part, 16).unwrap();
+                }
+                out
+            });
+            // The device token sits between the body and the extras and the decoder does not
+            // surface it, so take it from the capture -- this test is about everything else.
+            let body_len = u32::from_be_bytes(want[4..8].try_into().unwrap()) as usize;
+            let token = [want[8 + body_len], want[9 + body_len]];
+
+            let got = build_advertisement(&a.endpoint_id, &a.endpoint_info, mac, token, a.psm)
+                .unwrap_or_else(|| panic!("{name}: refused to build"));
+            let hexed = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+            assert_eq!(
+                hexed(&got),
+                hexed(&want),
+                "{name}: what we build differs from what the device sends"
+            );
+        }
+    }
 
     fn unhex(s: &str) -> Vec<u8> {
         (0..s.len())
