@@ -52,6 +52,9 @@ const E_SAFE_TO_CLOSE_PRIOR: u64 = 3;
 const E_CLIENT_INTRODUCTION: u64 = 4;
 const E_UPGRADE_FAILURE: u64 = 5;
 const E_CLIENT_INTRODUCTION_ACK: u64 = 6;
+/// Sent by the side that wants a faster medium. A stock receiver never offers one
+/// unprompted -- it advertises `autoUpgradeBandwidth: false` and waits to be asked.
+const E_UPGRADE_PATH_REQUEST: u64 = 7;
 
 // UpgradePathInfo
 const UP_MEDIUM: u32 = 1;
@@ -60,6 +63,17 @@ const UP_WIFI_LAN: u32 = 3;
 const UP_WIFI_DIRECT: u32 = 6;
 const UP_SUPPORTS_DISABLING_ENCRYPTION: u32 = 7;
 const UP_SUPPORTS_INTRODUCTION_ACK: u32 = 9;
+const UP_UPGRADE_PATH_REQUEST: u32 = 10;
+
+// UpgradePathInfo.UpgradePathRequest
+const UPR_MEDIUMS: u32 = 1;
+const UPR_MEDIUM_METADATA: u32 = 2;
+
+// MediumMetadata, the few fields an upgrade request carries
+const MM_SUPPORTED_WIFI_DIRECT_AUTH: u32 = 13;
+/// `WIFI_DIRECT_WITH_PASSWORD`. The alternative authenticates by service name and PIN,
+/// which is a different negotiation than the one this code knows how to finish.
+const WIFI_DIRECT_WITH_PASSWORD: u64 = 1;
 
 // WifiHotspotCredentials
 const HS_SSID: u32 = 1;
@@ -167,6 +181,8 @@ impl Default for UpgradePath {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
+    /// Asking the peer to stand up a faster medium, and saying which we could take.
+    PathRequest { mediums: Vec<Medium> },
     /// The host is offering a faster medium.
     PathAvailable(UpgradePath),
     /// The joiner announcing itself on the NEW channel.
@@ -225,6 +241,54 @@ fn encode_wifi(c: &WifiCredentials, direct: bool) -> Vec<u8> {
             .varint(HS_FREQUENCY, c.frequency as i64 as u64);
     }
     w.finish()
+}
+
+/// Build UPGRADE_PATH_REQUEST: ask the peer for a faster medium.
+///
+/// **Nothing happens without this.** A stock receiver advertises
+/// `autoUpgradeBandwidth: false` and its upgrade manager stays idle until it is asked,
+/// so a sender that waits for an offer waits forever and runs the whole payload over
+/// whatever it bootstrapped on -- Bluetooth, at around a tenth of Wi-Fi.
+///
+/// `mediums` is packed, per the schema: one length-delimited field holding the varints
+/// rather than one field each. A peer reading packed and given unpacked would see an
+/// empty list and offer nothing, which looks like a refusal.
+pub fn path_request(mediums: &[Medium]) -> Vec<u8> {
+    let mut packed = Vec::new();
+    for m in mediums {
+        // Varints, concatenated, no tags. Every medium value here is under 128 so this
+        // is one byte each, but encode properly rather than rely on that.
+        let mut v = *m as u64;
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                packed.push(b);
+                break;
+            }
+            packed.push(b | 0x80);
+        }
+    }
+
+    // Present even when empty. It carries Wi-Fi Direct role and auth details when that
+    // medium is asked for, and absence is a different thing to a peer than emptiness --
+    // the same trap as the connection response's multiplex bitmask.
+    let mut meta = Writer::new();
+    if mediums.contains(&Medium::WifiDirect) {
+        meta.varint(MM_SUPPORTED_WIFI_DIRECT_AUTH, WIFI_DIRECT_WITH_PASSWORD);
+    }
+
+    let mut req = Writer::new();
+    req.bytes(UPR_MEDIUMS, &packed)
+        .bytes(UPR_MEDIUM_METADATA, &meta.finish());
+
+    let mut info = Writer::new();
+    info.bytes(UP_UPGRADE_PATH_REQUEST, &req.finish());
+
+    let mut w = Writer::new();
+    w.varint(BW_EVENT_TYPE, E_UPGRADE_PATH_REQUEST)
+        .bytes(BW_UPGRADE_PATH_INFO, &info.finish());
+    wrap(&w.finish())
 }
 
 /// Build UPGRADE_PATH_AVAILABLE.
@@ -304,6 +368,37 @@ pub fn failure() -> Vec<u8> {
 ///
 /// Takes the inner bytes, not a whole offline frame: `frames::parse` has already
 /// dispatched on type and handed them over.
+/// Read a packed repeated enum: concatenated varints in one length-delimited field.
+///
+/// Unknown values are dropped rather than refused -- a peer is free to advertise a
+/// medium this build does not model, and refusing the whole frame over one would turn a
+/// forward-compatible negotiation into a brittle one.
+fn parse_packed_mediums(packed: &[u8]) -> Vec<Medium> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < packed.len() {
+        let mut v: u64 = 0;
+        let mut shift = 0u32;
+        loop {
+            let Some(&b) = packed.get(i) else { return out };
+            i += 1;
+            v |= ((b & 0x7f) as u64) << shift;
+            if b & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+            if shift > 63 {
+                return out;
+            }
+        }
+        match Medium::from(v) {
+            Medium::Unknown => {}
+            m => out.push(m),
+        }
+    }
+    out
+}
+
 pub fn parse(body: &[u8]) -> Result<Frame, Error> {
     let event = protobuf::first_varint(body, BW_EVENT_TYPE)?
         .ok_or(Error::Malformed("no event type"))?;
@@ -329,6 +424,15 @@ pub fn parse(body: &[u8]) -> Result<Frame, Error> {
             Frame::SafeToClosePrior {
                 sta_frequency: protobuf::first_varint(sc, SC_STA_FREQUENCY)?.unwrap_or(0) as i64
                     as i32,
+            }
+        }
+        E_UPGRADE_PATH_REQUEST => {
+            let info = protobuf::first_bytes(body, BW_UPGRADE_PATH_INFO)?.unwrap_or(&[]);
+            let req = protobuf::first_bytes(info, UP_UPGRADE_PATH_REQUEST)?.unwrap_or(&[]);
+            Frame::PathRequest {
+                mediums: parse_packed_mediums(
+                    protobuf::first_bytes(req, UPR_MEDIUMS)?.unwrap_or(&[]),
+                ),
             }
         }
         E_UPGRADE_FAILURE => Frame::Failure,
@@ -604,6 +708,66 @@ impl Joiner {
 
 #[cfg(test)]
 mod tests {
+    /// Nothing happens without this frame: a stock receiver waits to be asked and never
+    /// offers a faster medium on its own.
+    #[test]
+    fn a_path_request_round_trips() {
+        let want = vec![Medium::WifiLan, Medium::WifiDirect];
+        match parse(&crate::frames::upgrade_body(&path_request(&want)).unwrap()).unwrap() {
+            Frame::PathRequest { mediums } => assert_eq!(mediums, want),
+            other => panic!("wrong frame: {other:?}"),
+        }
+    }
+
+    /// PACKED. One length-delimited field holding the varints, not one field each. A
+    /// peer reading packed and handed unpacked sees an empty list and offers nothing,
+    /// which is indistinguishable from a refusal.
+    #[test]
+    fn the_mediums_are_packed_into_one_field() {
+        let body = crate::frames::upgrade_body(&path_request(&[Medium::WifiLan, Medium::WifiDirect])).unwrap();
+        let info = crate::protobuf::first_bytes(&body, BW_UPGRADE_PATH_INFO)
+            .unwrap()
+            .unwrap();
+        let req = crate::protobuf::first_bytes(info, UP_UPGRADE_PATH_REQUEST)
+            .unwrap()
+            .unwrap();
+        let packed = crate::protobuf::first_bytes(req, UPR_MEDIUMS).unwrap().unwrap();
+        // Two mediums, one byte each, in one field -- not two fields.
+        assert_eq!(packed, &[5u8, 8u8], "expected packed WIFI_LAN(5), WIFI_DIRECT(8)");
+    }
+
+    /// Asking for Wi-Fi LAN alone must not claim Wi-Fi Direct capability.
+    #[test]
+    fn wifi_direct_metadata_appears_only_when_asked_for() {
+        let lan = crate::frames::upgrade_body(&path_request(&[Medium::WifiLan])).unwrap();
+        let info = crate::protobuf::first_bytes(&lan, BW_UPGRADE_PATH_INFO).unwrap().unwrap();
+        let req = crate::protobuf::first_bytes(info, UP_UPGRADE_PATH_REQUEST).unwrap().unwrap();
+        let meta = crate::protobuf::first_bytes(req, UPR_MEDIUM_METADATA).unwrap().unwrap();
+        assert!(meta.is_empty(), "no Wi-Fi Direct asked for, so no auth types");
+
+        let wd = crate::frames::upgrade_body(&path_request(&[Medium::WifiDirect])).unwrap();
+        let info = crate::protobuf::first_bytes(&wd, BW_UPGRADE_PATH_INFO).unwrap().unwrap();
+        let req = crate::protobuf::first_bytes(info, UP_UPGRADE_PATH_REQUEST).unwrap().unwrap();
+        let meta = crate::protobuf::first_bytes(req, UPR_MEDIUM_METADATA).unwrap().unwrap();
+        assert_eq!(
+            crate::protobuf::first_varint(meta, MM_SUPPORTED_WIFI_DIRECT_AUTH).unwrap(),
+            Some(WIFI_DIRECT_WITH_PASSWORD)
+        );
+    }
+
+    /// A medium we do not model is dropped, not fatal -- the negotiation stays
+    /// forward-compatible.
+    #[test]
+    fn an_unknown_medium_is_ignored_rather_than_refused() {
+        assert_eq!(parse_packed_mediums(&[5, 99, 8]), vec![Medium::WifiLan, Medium::WifiDirect]);
+    }
+
+    #[test]
+    fn a_truncated_packed_list_does_not_panic() {
+        assert_eq!(parse_packed_mediums(&[0x80]), Vec::<Medium>::new());
+        assert_eq!(parse_packed_mediums(&[]), Vec::<Medium>::new());
+    }
+
     use super::*;
 
     fn hotspot() -> UpgradePath {
