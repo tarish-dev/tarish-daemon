@@ -38,6 +38,7 @@ use tarish_protocol::fsm::{Effect, Event, Inbound};
 use tarish_protocol::payload::{Assembler, Event as PayloadEvent};
 use tarish_protocol::sharing::{self, FileMetadata};
 use tarish_protocol::ukey2::handshake::ServerHandshake;
+use tarish_protocol::upgrade;
 use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -58,6 +59,28 @@ pub trait Host {
     fn progress(&self, done: u64, total: u64);
     /// Has the user cancelled locally?
     fn cancelled(&self) -> bool;
+
+    /// Stand up a Wi-Fi Direct group for the sender to join, and say how to reach it.
+    ///
+    /// THE RECEIVER HOSTS: whoever gets UPGRADE_PATH_REQUEST creates the network. Only the
+    /// client can, so this goes out to it and blocks -- forming a group takes seconds.
+    ///
+    /// `None` declines, which is ordinary rather than an error. The transfer then continues
+    /// on the transport it already has, only slower. The default is exactly that, so a Host
+    /// with no radio behind it simply never upgrades.
+    fn host_group(&self) -> Option<WifiGroup> {
+        None
+    }
+}
+
+/// A network we have stood up for a sender to join.
+pub struct WifiGroup {
+    pub ssid: String,
+    pub passphrase: String,
+    /// This device's address on the group, which the sender connects to.
+    pub go_address: String,
+    /// The channel in MHz, or 0 when unknown. A hint, never a requirement.
+    pub frequency: i32,
 }
 
 /// Tell every registered client something happened.
@@ -218,19 +241,208 @@ impl<S: ReadReady> Frames<S> {
     }
 }
 
+/// How long the sender has to join the group we stood up and introduce itself.
+///
+/// It has to form an association and open a socket, on a network that did not exist a moment
+/// ago. Generous, because the alternative to waiting is a transfer that crawls.
+const JOIN_WAIT: Duration = Duration::from_secs(25);
+
+/// The host side of a bandwidth upgrade: stand up a group, offer it, take the sender onto it.
+///
+/// The mirror of `adopt()` on the send side, and the same four-frame handover seen from the
+/// other end:
+///
+///   1. we offer  UPGRADE_PATH_AVAILABLE  on the old channel
+///   2. the sender connects and sends CLIENT_INTRODUCTION on the NEW one, in plaintext
+///   3. we send LAST_WRITE_TO_PRIOR unprompted -- the sender waits for it before releasing
+///   4. the sender sends SAFE_TO_CLOSE, we answer with ours, and the swap happens
+///
+/// `Ok(false)` means we stayed put, which is never fatal: an upgrade is an optimisation and
+/// treating its failure as a connection failure turns a slow transfer into no transfer.
+fn offer_group<H: Host>(
+    host: &H,
+    input: &mut Frames<Reader>,
+    out: &mut Writer,
+    channel: &mut SecureChannel,
+    deferred: &mut std::collections::VecDeque<Vec<u8>>,
+) -> io::Result<bool> {
+    // A LISTENER FIRST, so the offer can never name a port nothing is on. Bound to
+    // 0.0.0.0 rather than to the group address: the p2p interface does not exist yet when
+    // this runs, and binding to an address that has not appeared fails.
+    let listener = match std::net::TcpListener::bind(("0.0.0.0", 0)) {
+        Ok(l) => l,
+        Err(e) => {
+            debug!("quickshare: no listener for an upgrade ({e})");
+            let no = upgrade::failure();
+            write_frame(out, &channel.encrypt(&no).map_err(chan)?)?;
+            return Ok(false);
+        }
+    };
+    let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+
+    let Some(group) = host.host_group() else {
+        debug!("quickshare: the client would not host a group");
+        let no = upgrade::failure();
+        write_frame(out, &channel.encrypt(&no).map_err(chan)?)?;
+        return Ok(false);
+    };
+    info!(
+        "quickshare: hosting {:?} on {}:{port} for the sender",
+        group.ssid, group.go_address
+    );
+
+    let path = upgrade::UpgradePath {
+        medium: upgrade::Medium::WifiDirect,
+        wifi: Some(upgrade::WifiCredentials {
+            ssid: group.ssid,
+            password: group.passphrase,
+            port: port as i32,
+            gateway: group.go_address,
+            frequency: group.frequency,
+        }),
+        lan: None,
+        // We do send one, and saying so is what lets the sender wait for it rather than
+        // guessing. A sender told "no ack" proceeds without waiting, which is also correct
+        // -- but then an ack it did not expect turns up on a channel it is about to reuse.
+        supports_introduction_ack: true,
+        supports_disabling_encryption: false,
+    };
+    write_frame(out, &channel.encrypt(&upgrade::path_available(&path)).map_err(chan)?)?;
+
+    // The sender now has to associate with a network that did not exist a second ago.
+    listener
+        .set_nonblocking(false)
+        .and_then(|_| listener.set_ttl(64))
+        .ok();
+    let (sock, from) = match accept_within(&listener, JOIN_WAIT) {
+        Some(x) => x,
+        None => {
+            debug!("quickshare: the sender never joined; staying put");
+            let no = upgrade::failure();
+            write_frame(out, &channel.encrypt(&no).map_err(chan)?)?;
+            return Ok(false);
+        }
+    };
+    let _ = sock.set_nodelay(true);
+    // Same reason as every other socket here: a peer that stops reading must cost this
+    // transfer, not a thread that never returns.
+    let _ = sock.set_write_timeout(Some(Duration::from_secs(20)));
+    info!("quickshare: the sender joined from {from}");
+
+    let mut new_in = Frames::new(Box::new(sock.try_clone()?) as Reader);
+    let mut new_out: Writer = Box::new(sock);
+
+    // The introduction arrives in PLAINTEXT: the new channel carries no keys of its own.
+    let Some(intro) = new_in.next_within(Duration::from_secs(10))? else {
+        debug!("quickshare: the sender connected but never introduced itself");
+        let no = upgrade::failure();
+        write_frame(out, &channel.encrypt(&no).map_err(chan)?)?;
+        return Ok(false);
+    };
+    match frames::upgrade_body(&intro).map(|b| upgrade::parse(&b)) {
+        Some(Ok(upgrade::Frame::ClientIntroduction { .. })) => {}
+        other => {
+            debug!("quickshare: the new socket opened with {other:?}, not an introduction");
+            let no = upgrade::failure();
+            write_frame(out, &channel.encrypt(&no).map_err(chan)?)?;
+            return Ok(false);
+        }
+    }
+    write_frame(&mut new_out, &upgrade::client_introduction_ack())?;
+
+    // OUR LAST_WRITE, UNPROMPTED. The sender will not send SAFE_TO_CLOSE until it has this,
+    // so a host that stays quiet here leaves it waiting for a frame that is never coming --
+    // the exact stall that cost most of a day from the other side.
+    write_frame(out, &channel.encrypt(&upgrade::last_write_to_prior()).map_err(chan)?)?;
+
+    // Then the release exchange on the OLD channel, bounded. Anything else is the
+    // conversation and goes to the main loop rather than being dropped.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut released = false;
+    while !released {
+        let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            break;
+        };
+        let Some(wire) = input.next_within(left)? else {
+            break;
+        };
+        let plain = channel.decrypt(&wire).map_err(chan)?;
+        let mut handled = false;
+        if let Some(body) = frames::upgrade_body(&plain) {
+            match upgrade::parse(&body) {
+                Ok(upgrade::Frame::SafeToClosePrior { .. }) => {
+                    handled = true;
+                    released = true;
+                }
+                // Its LAST_WRITE crossing ours. Nothing to answer.
+                Ok(upgrade::Frame::LastWriteToPrior) => handled = true,
+                _ => {}
+            }
+        }
+        if !handled {
+            deferred.push_back(plain);
+        }
+    }
+    // Ours goes out either way: the sender is owed it, and a lost or crossed frame must not
+    // leave us withholding the one thing it is waiting for.
+    let bye = upgrade::safe_to_close_prior(upgrade::STA_FREQUENCY_NOT_SET);
+    write_frame(out, &channel.encrypt(&bye).map_err(chan)?)?;
+    if !released {
+        warn!("quickshare: no safe-to-close from the sender; switching over regardless");
+    }
+
+    *input = new_in;
+    *out = new_out;
+    Ok(true)
+}
+
+/// Accept one connection, or give up. `set_read_timeout` does not apply to accept, so this
+/// polls the listener rather than blocking on it forever.
+fn accept_within(
+    listener: &std::net::TcpListener,
+    within: Duration,
+) -> Option<(std::net::TcpStream, std::net::SocketAddr)> {
+    let deadline = std::time::Instant::now() + within;
+    listener.set_nonblocking(true).ok()?;
+    while std::time::Instant::now() < deadline {
+        match listener.accept() {
+            Ok((s, a)) => {
+                let _ = s.set_nonblocking(false);
+                let _ = listener.set_nonblocking(false);
+                return Some((s, a));
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = listener.set_nonblocking(false);
+    None
+}
+
 /// Serve one connection. Returns the names written, or an error.
-pub fn serve<S, H>(
-    stream: S,
-    mut out: impl Write,
+/// BOXED SO THEY CAN BE REPLACED MID-TRANSFER, exactly as on the send side.
+///
+/// A bandwidth upgrade moves the same encrypted conversation onto a different socket: the
+/// keys and sequence numbers carry over untouched, because SecureChannel holds no transport.
+/// Every read and write after the handover has to go somewhere else, and a generic parameter
+/// cannot express that.
+pub type Reader = Box<dyn ReadReady + Send>;
+pub type Writer = Box<dyn Write + Send>;
+
+pub fn serve<H>(
+    stream: Reader,
+    mut out: Writer,
     host: &H,
     transfers: &Transfers,
     callbacks: &Callbacks,
 ) -> io::Result<Vec<String>>
 where
-    S: Read,
     H: Host,
 {
     let mut input = Frames::new(stream);
+    let mut deferred: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
 
     // --- 1. the connection request, in plaintext -----------------------------
     let first = input.next()?;
@@ -421,8 +633,15 @@ where
         if !pending.is_empty() {
             continue;
         }
-        let wire = input.next()?;
-        let plain = channel.decrypt(&wire).map_err(chan)?;
+        // Frames read during a handover that were not part of it. PLAINTEXT: decrypting
+        // one twice would advance the sequence numbers twice for a single frame.
+        let plain = match deferred.pop_front() {
+            Some(p) => p,
+            None => {
+                let wire = input.next()?;
+                channel.decrypt(&wire).map_err(chan)?
+            }
+        };
         match frames::parse(&plain).map_err(bad)? {
             OfflineFrame::PayloadTransfer(pt) => {
                 match assembler.accept(&pt).map_err(|e| bad(e.to_string()))? {
@@ -489,6 +708,30 @@ where
                         return Err(bad(format!("peer reported an error on payload {id}")));
                     }
                     PayloadEvent::Pending => {}
+                }
+            }
+            OfflineFrame::BandwidthUpgrade(body) => {
+                // A SENDER ASKING US TO GO FASTER. We are the receiver, so we host: stand up
+                // a Wi-Fi Direct group, offer it, and move the conversation onto it.
+                //
+                // Anything we cannot do here answers UPGRADE_FAILURE rather than going
+                // quiet. The sender has asked and is waiting; silence costs it a timeout,
+                // and it is the state that made this hard to debug from the other side.
+                match upgrade::parse(&body) {
+                    Ok(upgrade::Frame::PathRequest { mediums }) => {
+                        if !mediums.contains(&upgrade::Medium::WifiDirect) {
+                            debug!("quickshare: sender asked for {mediums:?}, none of which we host");
+                            let no = upgrade::failure();
+                            write_frame(&mut out, &channel.encrypt(&no).map_err(chan)?)?;
+                        } else {
+                            match offer_group(host, &mut input, &mut out, &mut channel, &mut deferred)? {
+                                true => info!("quickshare: upgraded the inbound transfer to Wi-Fi Direct"),
+                                false => debug!("quickshare: staying on this transport"),
+                            }
+                        }
+                    }
+                    Ok(other) => debug!("quickshare: upgrade frame {other:?}, ignored"),
+                    Err(e) => debug!("quickshare: unreadable upgrade frame ({e})"),
                 }
             }
             OfflineFrame::KeepAlive { ack: false, seq_num } => {

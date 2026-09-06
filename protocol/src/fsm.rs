@@ -238,8 +238,21 @@ impl Inbound {
 
             (_, Frame::Unknown(_)) => Vec::new(),
 
-            // A receiver has no use for a response; only senders receive those.
-            (_, Frame::Response(_)) => self.fail("the peer answered an offer we never made"),
+            // A SENDER CONFIRMS THE ACCEPTANCE, and that is not an error.
+            //
+            // A receiver never acts on a Response -- it is the side that sends one -- so
+            // this rejected it outright. But a stock Android sender answers our accept with
+            // its own Response before it starts the payload, and killing the transfer for it
+            // meant every inbound transfer from an Android device died seven milliseconds
+            // after the person tapped Accept:
+            //
+            //     sharing refused: the peer answered an offer we never made
+            //
+            // Windows does not send one, which is why receiving from Windows worked and hid
+            // this. Ignored rather than acted on: a receiver has nothing to do with it, and
+            // the same reasoning as the late paired-key frames above applies -- unexpected
+            // is not the same as hostile.
+            (_, Frame::Response(_)) => Vec::new(),
 
             (state, frame) => {
                 let _ = (state, frame);
@@ -389,6 +402,31 @@ mod tests {
             signed_data: vec![0; 72],
             secret_id_hash: vec![0; 6],
         }
+    }
+
+    /// A SENDER CONFIRMS THE ACCEPTANCE, and a receiver must not die on it.
+    ///
+    /// A stock Android sender answers our accept with its own Response before it starts the
+    /// payload. This used to be fatal -- "the peer answered an offer we never made" -- so
+    /// every inbound transfer from an Android device failed seven milliseconds after the
+    /// person tapped Accept. Windows sends none, which is why receiving from Windows worked
+    /// and hid it entirely.
+    #[test]
+    fn a_receiver_ignores_the_senders_own_response() {
+        let mut r = Inbound::new();
+        r.start();
+        r.on(Event::Frame(pke()));
+        r.on(Event::Frame(Frame::PairedKeyResult(PairedKeyResult::Unable)));
+        r.on(Event::Frame(Frame::Introduction(intro())));
+        r.on(Event::UserAccepted);
+        assert_eq!(r.state(), State::Transferring);
+
+        assert_eq!(
+            r.on(Event::Frame(Frame::Response(Status::Accept))),
+            vec![],
+            "a sender's confirmation is not ours to act on, and not a reason to stop"
+        );
+        assert_eq!(r.state(), State::Transferring, "and it must not move us out of the transfer");
     }
 
     /// The happy path, receiving.
@@ -595,15 +633,18 @@ mod tests {
         ));
     }
 
-    /// And a receiver must not be handed a response to an offer it never made.
+    /// A receiver IGNORES a response rather than refusing it, even an unprompted one.
+    ///
+    /// This asserted the opposite, and the opposite is what killed every inbound transfer
+    /// from an Android device: a stock sender confirms our acceptance with its own Response,
+    /// and treating that as fatal ended the transfer seven milliseconds after Accept. A
+    /// receiver has nothing to do with a Response; that is a reason to skip it, not to die.
     #[test]
-    fn a_receiver_refuses_a_response() {
+    fn a_receiver_ignores_a_response_it_did_not_expect() {
         let mut r = Inbound::new();
         r.start();
-        assert!(matches!(
-            r.on(Event::Frame(Frame::Response(Status::Accept)))[..],
-            [Effect::Failed(_)]
-        ));
+        assert_eq!(r.on(Event::Frame(Frame::Response(Status::Accept))), vec![]);
+        assert_ne!(r.state(), State::Failed, "an unexpected response is not fatal");
     }
 
     #[test]

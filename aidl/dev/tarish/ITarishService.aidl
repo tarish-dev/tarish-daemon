@@ -2,6 +2,7 @@ package dev.tarish;
 
 import dev.tarish.ITarishCallback;
 import dev.tarish.TarishPeer;
+import dev.tarish.TarishGroup;
 import dev.tarish.TarishPolicy;
 import dev.tarish.TarishStatus;
 
@@ -318,4 +319,26 @@ interface ITarishService {
      * APPENDED LAST -- transaction codes are positional.
      */
     long receiveOnSocket(in ParcelFileDescriptor socket);
+
+    /**
+     * Hand back the Wi-Fi Direct group asked for by ITarishCallback.onGroupNeeded.
+     *
+     * THE RECEIVER HOSTS, which is why this exists at all: the side that receives
+     * UPGRADE_PATH_REQUEST stands up the network and answers with UPGRADE_PATH_AVAILABLE.
+     * Sending is the mirror -- there the peer hosts and we join, through provideUpgradeSocket.
+     *
+     * An empty `ssid` declines, which is an ordinary answer rather than an error: no Wi-Fi
+     * Direct on the device, a driver that would not form a group, or a client that would
+     * rather not. The transfer then continues over Bluetooth, slower.
+     *
+     * ANSWER EITHER WAY. The inbound transfer is parked waiting for this, and a client that
+     * simply does not reply costs it the timeout before it carries on.
+     *
+     * The client tears the group down itself when the transfer ends -- it already learns
+     * that from onTransferFinished, and a group left up holds the radio and keeps the
+     * device on a network that exists for nobody.
+     *
+     * APPENDED LAST -- transaction codes are positional.
+     */
+    void provideWifiDirectGroup(long transferId, in TarishGroup group);
 }

@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use dev_tarish::aidl::dev::tarish::{
     TarishPeer::TarishPeer,
+    TarishGroup::TarishGroup,
     TarishPolicy::TarishPolicy,
     TarishUpgrade::TarishUpgrade,
     TarishStatus::TarishStatus,
@@ -139,6 +140,12 @@ pub(crate) struct TransferState {
     /// sitting out a thirty-second timeout for a client that has already said no.
     upgrade_socket: Mutex<Option<(i64, Option<std::fs::File>)>>,
     upgrade_answered: std::sync::Condvar,
+    /// The Wi-Fi Direct group a client has stood up for an inbound transfer.
+    ///
+    /// `Some((id, None))` is an explicit decline, distinct from nobody having answered yet:
+    /// it lets the waiter stop at once rather than sitting out the whole timeout.
+    group: Mutex<Option<(i64, Option<TarishGroup>)>>,
+    group_answered: std::sync::Condvar,
     /// Whether the transfer in flight actually rides the AWDL link.
     ///
     /// AirDrop does; Quick Share never does -- it runs over Bluetooth, Wi-Fi LAN or
@@ -262,6 +269,34 @@ impl TransferState {
             if *c == Some(id) {
                 *c = None;
             }
+        }
+    }
+
+    /// A client's answer to onGroupNeeded. `None` declines.
+    pub(crate) fn provide_group(&self, id: i64, group: Option<TarishGroup>) {
+        if let Ok(mut g) = self.group.lock() {
+            *g = Some((id, group));
+        }
+        self.group_answered.notify_all();
+    }
+
+    /// Block until a client answers the group request for `id`, or we give up.
+    pub(crate) fn await_group(&self, id: i64, timeout: Duration) -> Option<TarishGroup> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut guard = self.group.lock().ok()?;
+        loop {
+            if guard.as_ref().map(|(who, _)| *who == id).unwrap_or(false) {
+                return guard.take().and_then(|(_, g)| g);
+            }
+            if self.is_cancelled(id) {
+                return None;
+            }
+            let left = deadline.checked_duration_since(std::time::Instant::now())?;
+            guard = self
+                .group_answered
+                .wait_timeout(guard, left.min(Duration::from_millis(500)))
+                .ok()?
+                .0;
         }
     }
 
@@ -1318,7 +1353,13 @@ impl ITarishService for TarishService {
             };
             log::info!("quickshare: inbound Bluetooth connection (transfer {id})");
             let outcome =
-                quickshare::connection::serve(reader, sock, &host, &transfers, &callbacks);
+                quickshare::connection::serve(
+                    Box::new(reader),
+                    Box::new(sock),
+                    &host,
+                    &transfers,
+                    &callbacks,
+                );
             let status = match &outcome {
                 Ok(names) if !names.is_empty() => {
                     log::info!("quickshare: received {} file(s) over Bluetooth", names.len());
@@ -1341,6 +1382,33 @@ impl ITarishService for TarishService {
             transfers.finish(id);
         });
         Ok(id)
+    }
+
+    fn provideWifiDirectGroup(&self, transfer_id: i64, group: &TarishGroup) -> BinderResult<()> {
+        // An empty ssid is a decline, not a malformed answer: no Wi-Fi Direct, a driver
+        // that would not form a group, or a client that would rather not.
+        if group.ssid.is_empty() {
+            log::info!("quickshare: client declined to host a group for transfer {transfer_id}");
+            self.transfers.provide_group(transfer_id, None);
+        } else {
+            log::info!(
+                "quickshare: client is hosting {:?} at {} for transfer {transfer_id}",
+                group.ssid,
+                group.goAddress
+            );
+            // Field by field: the generated parcelable does not derive Clone, and
+            // `group.clone()` on a &T silently clones the REFERENCE instead of the value.
+            self.transfers.provide_group(
+                transfer_id,
+                Some(TarishGroup {
+                    ssid: group.ssid.clone(),
+                    passphrase: group.passphrase.clone(),
+                    goAddress: group.goAddress.clone(),
+                    frequency: group.frequency,
+                }),
+            );
+        }
+        Ok(())
     }
 
     fn provideUpgradeSocket(
@@ -2062,7 +2130,13 @@ fn start_quickshare_server(
                     };
                     log::info!("quickshare: inbound connection from {peer} (transfer {id})");
                     let outcome =
-                        quickshare::connection::serve(reader, sock, &host, &transfers, &callbacks);
+                        quickshare::connection::serve(
+                    Box::new(reader),
+                    Box::new(sock),
+                    &host,
+                    &transfers,
+                    &callbacks,
+                );
                     // TELL THE CLIENT IT ENDED. Without this the app sits at a full
                     // progress bar forever: the bytes arrived, the file is in the inbox, and
                     // nothing ever said the transfer was over. serve() has no notion of
@@ -2679,6 +2753,30 @@ impl quickshare::connection::Host for QsHost {
 
     fn cancelled(&self) -> bool {
         self.transfers.is_cancelled(self.id)
+    }
+
+    fn host_group(&self) -> Option<quickshare::connection::WifiGroup> {
+        // Ask whoever is bound. No client means no radio, so there is nothing to wait for.
+        {
+            let Ok(cbs) = self.callbacks.lock() else {
+                return None;
+            };
+            if cbs.is_empty() {
+                log::info!("quickshare: no client bound to host a group; staying put");
+                return None;
+            }
+            for cb in cbs.iter() {
+                let _ = cb.onGroupNeeded(self.id);
+            }
+        }
+        // Forming a group is 4-8s on real hardware, and slower on a cold driver.
+        let group = self.transfers.await_group(self.id, Duration::from_secs(30))?;
+        Some(quickshare::connection::WifiGroup {
+            ssid: group.ssid,
+            passphrase: group.passphrase,
+            go_address: group.goAddress,
+            frequency: group.frequency,
+        })
     }
 }
 

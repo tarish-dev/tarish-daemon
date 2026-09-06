@@ -71,4 +71,20 @@ oneway interface ITarishCallback {
      * renumbers every method after it.
      */
     void onUpgradeNeeded(long transferId, in TarishUpgrade upgrade);
+
+    /**
+     * A sender has asked us to stand up a faster network. Create one and hand it back.
+     *
+     * The receiving mirror of onUpgradeNeeded: there a peer described a network for us to
+     * join, here we are asked to make one for the peer. Either way the radio work belongs
+     * to the client, because WifiP2pManager is framework API a native service cannot reach.
+     *
+     * Answer with ITarishService.provideWifiDirectGroup -- with credentials, or with an
+     * empty ssid to decline, and ANSWER EITHER WAY. The transfer is parked until you do.
+     *
+     * Forming a group takes 4-8 seconds, so do it off the binder thread.
+     *
+     * APPENDED LAST -- transaction codes are positional.
+     */
+    void onGroupNeeded(long transferId);
 }
