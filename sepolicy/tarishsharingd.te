@@ -154,7 +154,24 @@ set_prop(tarishsharingd, tarish_name_prop)
 # read/write only. NOT create, connect or bind: this daemon must never be able to open a
 # socket of its own from a descriptor someone else handed it, and it has no reason to --
 # the app already connected it.
+#
+# ONE RULE PER SOCKET CLASS, and that is the part that caught us out twice. The note above
+# was already written when a Wi-Fi Direct upgrade started passing a TCP socket instead of a
+# socketpair, and it failed in EXACTLY the same way -- DeadObjectException in the app, a
+# daemon that never hears the call -- because the class is different and the rule below did
+# not cover it:
+#
+#   avc: denied { read write } for path="socket:[82541]" dev="sockfs"
+#     scontext=u:r:tarishsharingd:s0 tcontext=u:r:platform_app:s0 tclass=tcp_socket
+#
+# The denial went to LOGCAT and not to dmesg -- `dmesg | grep -c avc` was 0 while logcat
+# had it -- so a dmesg-only look says the transaction failed for no reason at all.
 allow tarishsharingd platform_app:unix_stream_socket { read write getattr };
+# The Wi-Fi Direct / hotspot upgrade: the app joins the group, connects to the group owner
+# and passes this across. setopt because the protocol sets TCP_NODELAY and a read timeout
+# on it; shutdown so the transfer can end the connection rather than only closing its own
+# descriptor.
+allow tarishsharingd platform_app:tcp_socket { read write getattr getopt setopt shutdown };
 
 # set_prop() alone is NOT enough on this release. The macro grants
 # `tarish_awdl_prop:property_service set` and `init:unix_stream_socket connectto`, but
