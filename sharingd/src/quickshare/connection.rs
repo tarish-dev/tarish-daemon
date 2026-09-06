@@ -41,6 +41,7 @@ use tarish_protocol::ukey2::handshake::ServerHandshake;
 use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
+use std::time::Duration;
 
 /// What the daemon must provide. Kept to four things so this module can be exercised
 /// with an in-memory implementation.
@@ -78,6 +79,68 @@ where
     }
 }
 
+/// A transport that can say whether input is waiting, without consuming it.
+///
+/// Needed for exactly one thing: waiting a bounded time for a bandwidth-upgrade offer
+/// before committing a payload to the slow transport we bootstrapped on. A plain `Read`
+/// cannot express that -- its only option is to block indefinitely -- and blocking on an
+/// offer that is not coming would hang every transfer to a peer that declines to upgrade.
+///
+/// `Ok(false)` means nothing arrived in time. A transport that cannot answer should return
+/// `Ok(false)` rather than blocking: the caller uses this to decide whether waiting is
+/// possible at all, and a transport that cannot be waited on should simply not be.
+pub trait ReadReady: std::io::Read {
+    fn ready_within(&self, d: Duration) -> io::Result<bool>;
+}
+
+/// POLLIN with a timeout. Shared by every descriptor-backed transport.
+fn fd_ready(fd: std::os::fd::RawFd, d: Duration) -> io::Result<bool> {
+    let mut p = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = i32::try_from(d.as_millis()).unwrap_or(i32::MAX);
+    // SAFETY: one initialised pollfd, and the count matches.
+    let r = unsafe { libc::poll(&mut p, 1, ms) };
+    if r < 0 {
+        let e = io::Error::last_os_error();
+        // A signal is not an answer. Report "nothing waiting" and let the caller's own
+        // deadline decide whether to ask again, rather than failing a working transfer.
+        if e.kind() == io::ErrorKind::Interrupted {
+            return Ok(false);
+        }
+        return Err(e);
+    }
+    Ok(r > 0)
+}
+
+/// So a `Box<dyn ReadReady + Send>` is itself a `ReadReady`.
+///
+/// The transport is boxed because a bandwidth upgrade REPLACES it mid-transfer, and without
+/// this the trait stops at the box: `Frames<Box<dyn ReadReady>>` would have no
+/// `next_within`. `Read` already gets the same treatment from std, which is why its absence
+/// here is easy to miss.
+impl<T: ReadReady + ?Sized> ReadReady for Box<T> {
+    fn ready_within(&self, d: Duration) -> io::Result<bool> {
+        (**self).ready_within(d)
+    }
+}
+
+impl ReadReady for std::fs::File {
+    fn ready_within(&self, d: Duration) -> io::Result<bool> {
+        use std::os::fd::AsRawFd;
+        fd_ready(self.as_raw_fd(), d)
+    }
+}
+
+impl ReadReady for std::net::TcpStream {
+    fn ready_within(&self, d: Duration) -> io::Result<bool> {
+        use std::os::fd::AsRawFd;
+        fd_ready(self.as_raw_fd(), d)
+    }
+}
+
 /// Reads length-prefixed frames off a stream.
 pub(crate) struct Frames<S> {
     stream: S,
@@ -103,6 +166,45 @@ impl<S: Read> Frames<S> {
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
             {
                 return Ok(f);
+            }
+            let n = self.stream.read(&mut self.buf)?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "peer closed the connection",
+                ));
+            }
+            self.decoder.push(&self.buf[..n]);
+        }
+    }
+}
+
+impl<S: ReadReady> Frames<S> {
+    /// The next whole frame, if one is decodable already or arrives within `d`.
+    ///
+    /// `None` on timeout, and that is not an error -- the caller asked whether something
+    /// was coming and the answer was no.
+    ///
+    /// THE DECODER IS CHECKED FIRST, and that is not an optimisation. It holds bytes read
+    /// off the transport by a previous call, so a whole frame can be sitting in it while
+    /// the descriptor has nothing left to offer. Polling the transport alone would report
+    /// "nothing waiting" and skip a frame already in hand.
+    pub(crate) fn next_within(&mut self, d: Duration) -> io::Result<Option<Vec<u8>>> {
+        let deadline = std::time::Instant::now() + d;
+        loop {
+            if let Some(f) = self
+                .decoder
+                .next_frame()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+            {
+                return Ok(Some(f));
+            }
+            let left = match deadline.checked_duration_since(std::time::Instant::now()) {
+                Some(l) => l,
+                None => return Ok(None),
+            };
+            if !self.stream.ready_within(left)? {
+                return Ok(None);
             }
             let n = self.stream.read(&mut self.buf)?;
             if n == 0 {

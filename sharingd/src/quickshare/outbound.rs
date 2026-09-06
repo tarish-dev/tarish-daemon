@@ -105,7 +105,7 @@ pub struct WifiJoin<'a> {
 /// over untouched -- `SecureChannel` holds no transport, which is what makes this a swap
 /// rather than a renegotiation -- but every read and write after the handover has to go
 /// somewhere else. Generic parameters cannot express that; a boxed pair can.
-pub type Reader = Box<dyn Read + Send>;
+pub type Reader = Box<dyn super::connection::ReadReady + Send>;
 pub type Writer = Box<dyn Write + Send>;
 
 pub fn send<P>(
@@ -287,6 +287,20 @@ where
     // been sent by then -- the files wait behind the peer's acceptance either way.
     let mut pin_checked = false;
     let mut solicited = false;
+    // How long the payload may be held back waiting for an offer, once asked for. Set when
+    // the request goes out, cleared the moment anything answers it. None means nothing is
+    // outstanding and the payload starts at once -- the LAN case, and every case after the
+    // negotiation has resolved either way.
+    let mut upgrade_deadline: Option<std::time::Instant> = None;
+    // DECRYPTED frames read while waiting for an offer that were not about the upgrade.
+    //
+    // The peer keeps talking during that window -- keep-alives, its own sharing frames,
+    // possibly a disconnection -- and those belong to the main loop, not to the wait.
+    //
+    // PLAINTEXT, and that is not a detail. Queuing the encrypted frame would have the main
+    // loop decrypt it a second time, and SecureChannel counts sequence numbers: the second
+    // decrypt fails, and it fails on a frame the peer sent correctly.
+    let mut deferred: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
 
     loop {
         // DRAIN EVERY EFFECT BEFORE READING AGAIN.
@@ -311,6 +325,27 @@ where
                     }
                 }
                 Effect::BeginSending(_) => {
+                    // WAIT FOR THE OFFER BEFORE COMMITTING TO THE SLOW TRANSPORT.
+                    //
+                    // Measured: the request went out 1.86s before the peer accepted, and a
+                    // Wi-Fi Direct group takes 4-8s to form. Without this the payload was
+                    // already streaming over Bluetooth at 148 KB/s by the time the offer
+                    // could arrive, and nothing read it again until the transfer had
+                    // finished -- so an offer and no offer looked identical.
+                    //
+                    // Seconds spent here are cheap against what they buy: the same file
+                    // took 142.7s over Bluetooth and 0.9s over Wi-Fi.
+                    if let Some(deadline) = upgrade_deadline.take() {
+                        wait_for_upgrade(
+                            deadline,
+                            endpoint_id,
+                            &mut input,
+                            &mut out,
+                            &mut channel,
+                            progress,
+                            &mut deferred,
+                        )?;
+                    }
                     info!("quickshare: peer accepted, sending");
                     let mut done: u64 = 0;
                     for (f, id) in files.iter_mut().zip(payload_ids.iter()) {
@@ -352,6 +387,7 @@ where
             if bootstrap == upgrade::Medium::Bluetooth {
                 let ask = upgrade::path_request(&[upgrade::Medium::WifiDirect]);
                 write_frame(&mut out, &channel.encrypt(&ask).map_err(chan)?)?;
+                upgrade_deadline = Some(std::time::Instant::now() + UPGRADE_OFFER_WAIT);
                 debug!("quickshare: asked for a Wi-Fi Direct upgrade");
             } else {
                 debug!("quickshare: on {bootstrap:?} already; not asking to upgrade");
@@ -380,8 +416,15 @@ where
         if !pending.is_empty() {
             continue;
         }
-        let wire = input.next()?;
-        let plain = channel.decrypt(&wire).map_err(chan)?;
+        // Deferred first: these were read during the upgrade wait and are older than
+        // anything still on the transport. Already decrypted -- see `deferred`.
+        let plain = match deferred.pop_front() {
+            Some(p) => p,
+            None => {
+                let wire = input.next()?;
+                channel.decrypt(&wire).map_err(chan)?
+            }
+        };
         match frames::parse(&plain).map_err(bad)? {
             OfflineFrame::PayloadTransfer(pt) => {
                 // The only payloads a sender receives are the peer's own sharing frames:
@@ -424,35 +467,16 @@ where
                 return Ok(false);
             }
             OfflineFrame::BandwidthUpgrade(body) => {
-                // TAKE IT IF WE CAN, SAY SO IF WE CANNOT.
-                //
-                // Silence is not a neutral answer: the peer has a listener open and is
-                // waiting for us either to appear on it or to fail it, and a transfer
-                // that ends with the negotiation still open is reported failed even when
-                // every byte arrived.
-                match upgrade::parse(&body) {
-                    Ok(upgrade::Frame::PathAvailable(path)) => {
-                        match adopt(&path, endpoint_id, &mut input, &mut out, &mut channel, progress) {
-                            Ok(true) => {
-                                info!(
-                                    "quickshare: upgraded to {:?}; the rest goes over that",
-                                    path.medium
-                                );
-                            }
-                            Ok(false) => {}
-                            Err(e) => {
-                                // NOT fatal. An upgrade is an optimisation, and the old
-                                // socket is still good -- treating this as a connection
-                                // failure would turn a slow transfer into no transfer.
-                                warn!("quickshare: upgrade failed ({e}); staying put");
-                                let no = frames::bandwidth_upgrade(&upgrade::failure());
-                                write_frame(&mut out, &channel.encrypt(&no).map_err(chan)?)?;
-                            }
-                        }
-                    }
-                    Ok(other) => debug!("quickshare: upgrade frame {other:?}, ignored"),
-                    Err(e) => debug!("quickshare: unreadable upgrade frame ({e})"),
-                }
+                on_upgrade_frame(
+                    &body,
+                    endpoint_id,
+                    &mut input,
+                    &mut out,
+                    &mut channel,
+                    progress,
+                )?;
+                // Whatever came of it, stop holding the payload for one.
+                upgrade_deadline = None;
             }
             other => debug!("quickshare: ignoring {other:?}"),
         }
@@ -643,6 +667,106 @@ fn finish_cleanly<W: Write>(
 /// `Ok(None)` is a decline, not a failure: an offer we cannot take, or a client that
 /// would not take it. The caller answers UPGRADE_FAILURE once, in one place -- this used
 /// to be four copies of that write, one per way of giving up.
+/// How long the payload waits for an offer after asking for a faster medium.
+///
+/// Twelve seconds. Group formation was measured at 4-8s on a Pixel and a slow first-time
+/// driver init pushes past that, so a shorter wait would abandon upgrades that were about
+/// to work. It is only ever paid when we asked -- which is only from Bluetooth -- and only
+/// until the peer answers, so a peer that declines promptly costs nothing.
+const UPGRADE_OFFER_WAIT: Duration = Duration::from_secs(12);
+
+/// Hold the payload until the peer answers the upgrade request, or the deadline passes.
+///
+/// Anything the peer says that is NOT about the upgrade is queued for the main loop rather
+/// than handled here: keep-alives, its own sharing frames, a disconnection. Handling them
+/// in two places is how a transfer starts behaving differently depending on when a frame
+/// happened to arrive.
+///
+/// Never fails for want of an offer. A peer that will not upgrade is the ordinary case and
+/// the transfer continues on the transport it has.
+fn wait_for_upgrade<P>(
+    deadline: std::time::Instant,
+    endpoint_id: &str,
+    input: &mut Frames<Reader>,
+    out: &mut Writer,
+    channel: &mut SecureChannel,
+    progress: &P,
+    deferred: &mut std::collections::VecDeque<Vec<u8>>,
+) -> io::Result<()>
+where
+    P: Progress,
+{
+    loop {
+        let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            debug!("quickshare: no upgrade offer arrived; sending on this transport");
+            return Ok(());
+        };
+        if progress.cancelled() {
+            return Ok(());
+        }
+        // Woken at least every half second so a cancel during the wait is noticed rather
+        // than sitting out the whole deadline.
+        let Some(wire) = input.next_within(left.min(Duration::from_millis(500)))? else {
+            continue;
+        };
+        let plain = channel.decrypt(&wire).map_err(chan)?;
+        match frames::parse(&plain).map_err(bad)? {
+            OfflineFrame::BandwidthUpgrade(body) => {
+                on_upgrade_frame(&body, endpoint_id, input, out, channel, progress)?;
+                return Ok(());
+            }
+            // Not ours. Hand the PLAINTEXT to the main loop -- decrypting it again there
+            // would advance the sequence numbers twice for one frame.
+            _ => deferred.push_back(plain),
+        }
+    }
+}
+
+/// Act on a BANDWIDTH_UPGRADE_NEGOTIATION frame from the peer.
+///
+/// TAKE IT IF WE CAN, SAY SO IF WE CANNOT. Silence is not a neutral answer: the peer has a
+/// listener open and is waiting for us either to appear on it or to fail it, and a transfer
+/// that ends with the negotiation still open is reported failed even when every byte
+/// arrived.
+///
+/// Its own function because it is needed in two places -- the main read loop, and the wait
+/// before the payload starts. Duplicating it would mean an offer that arrives in one window
+/// being handled differently from one that arrives in the other.
+fn on_upgrade_frame<P>(
+    body: &[u8],
+    endpoint_id: &str,
+    input: &mut Frames<Reader>,
+    out: &mut Writer,
+    channel: &mut SecureChannel,
+    progress: &P,
+) -> io::Result<()>
+where
+    P: Progress,
+{
+    match upgrade::parse(body) {
+        Ok(upgrade::Frame::PathAvailable(path)) => {
+            match adopt(&path, endpoint_id, input, out, channel, progress) {
+                Ok(true) => info!(
+                    "quickshare: upgraded to {:?}; the rest goes over that",
+                    path.medium
+                ),
+                Ok(false) => {}
+                Err(e) => {
+                    // NOT fatal. An upgrade is an optimisation, and the old socket is
+                    // still good -- treating this as a connection failure would turn a
+                    // slow transfer into no transfer.
+                    warn!("quickshare: upgrade failed ({e}); staying put");
+                    let no = frames::bandwidth_upgrade(&upgrade::failure());
+                    write_frame(out, &channel.encrypt(&no).map_err(chan)?)?;
+                }
+            }
+        }
+        Ok(other) => debug!("quickshare: upgrade frame {other:?}, ignored"),
+        Err(e) => debug!("quickshare: unreadable upgrade frame ({e})"),
+    }
+    Ok(())
+}
+
 fn acquire<P>(path: &upgrade::UpgradePath, progress: &P) -> io::Result<Option<std::net::TcpStream>>
 where
     P: Progress,

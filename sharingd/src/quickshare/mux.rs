@@ -366,6 +366,38 @@ impl Read for MuxReader {
     }
 }
 
+impl crate::quickshare::connection::ReadReady for MuxReader {
+    /// Waits on the pump's own condvar rather than on a descriptor.
+    ///
+    /// There is no fd to poll here: the bytes have already been read off the L2CAP socket
+    /// by the pump thread and unwrapped out of their packets, so what matters is whether
+    /// the inbox has anything, not whether the socket does. A closed channel counts as
+    /// ready -- the read that follows returns 0 and the caller sees the EOF it needs to.
+    fn ready_within(&self, d: Duration) -> io::Result<bool> {
+        let mut st = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| bad("L2CAP state poisoned"))?;
+        let deadline = std::time::Instant::now() + d;
+        loop {
+            if !st.inbox.is_empty() || st.closed {
+                return Ok(true);
+            }
+            let left = match deadline.checked_duration_since(std::time::Instant::now()) {
+                Some(l) => l,
+                None => return Ok(false),
+            };
+            st = self
+                .shared
+                .changed
+                .wait_timeout(st, left)
+                .map_err(|_| bad("L2CAP state poisoned"))?
+                .0;
+        }
+    }
+}
+
 impl<W: Write> Write for MuxWriter<W> {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         // Split to fit the channel, and pace against the peer between pieces.
