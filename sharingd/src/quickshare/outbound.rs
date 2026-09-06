@@ -113,6 +113,7 @@ pub fn send<P>(
     mut out: Writer,
     device_name: &str,
     endpoint_id: &str,
+    bootstrap: upgrade::Medium,
     mediums: &[u64],
     mut files: Vec<OutFile>,
     progress: &P,
@@ -285,6 +286,7 @@ where
     // receiver only puts its copy on screen once it has one. Nothing that matters has
     // been sent by then -- the files wait behind the peer's acceptance either way.
     let mut pin_checked = false;
+    let mut solicited = false;
 
     loop {
         // DRAIN EVERY EFFECT BEFORE READING AGAIN.
@@ -332,6 +334,30 @@ where
             }
         }
 
+        if !solicited {
+            solicited = true;
+            // ASK FOR A FASTER MEDIUM AS EARLY AS POSSIBLE, AND ONLY WHEN THIS ONE IS SLOW.
+            //
+            // Gated on what we bootstrapped over. On a LAN transport there is nothing
+            // faster to move to -- we are already at 22 MB/s -- and asking anyway invites
+            // the peer to stand up a Wi-Fi Direct group and tear down a working link in
+            // the middle of a transfer. Bada gates the same request the same way, on the
+            // CURRENT medium rather than the original one, for exactly that reason.
+            //
+            // Before the PIN wait, not after. Forming a group takes 4-8s on real hardware
+            // and the peer cannot start until asked, so every second spent waiting for a
+            // human to read four digits is a second the group could have been forming.
+            // Asked afterwards, the request went out and the payload followed almost
+            // immediately, leaving the offer no window to arrive in.
+            if bootstrap == upgrade::Medium::Bluetooth {
+                let ask = upgrade::path_request(&[upgrade::Medium::WifiDirect]);
+                write_frame(&mut out, &channel.encrypt(&ask).map_err(chan)?)?;
+                debug!("quickshare: asked for a Wi-Fi Direct upgrade");
+            } else {
+                debug!("quickshare: on {bootstrap:?} already; not asking to upgrade");
+            }
+        }
+
         if !pin_checked {
             pin_checked = true;
             if !progress.confirm_pin(&session_pin) {
@@ -343,28 +369,6 @@ where
                     .and_then(|w| write_frame(&mut out, &w));
                 return Ok(false);
             }
-
-            // ASK FOR A FASTER MEDIUM, here, before the files.
-            //
-            // A stock receiver never offers one unprompted -- it advertises
-            // autoUpgradeBandwidth:false and waits. Asked now rather than after the peer
-            // accepts, so its listener comes up while a human is still reading the
-            // prompt instead of adding a round trip once they have tapped.
-            //
-            // WI-FI DIRECT ONLY, which is what Bada asks for and what a peer answers.
-            //
-            // Asking for Wi-Fi Direct AND Wi-Fi LAN together produced silence from a
-            // Windows peer -- no offer, no UPGRADE_FAILURE, nothing -- so this is narrowed
-            // to the set a working implementation sends. That is not proof Wi-Fi LAN is
-            // what broke it: the request was also missing MediumRole at the time, which is
-            // on its own enough to explain the silence. Worth re-adding WIFI_LAN once a
-            // group has actually formed, since on a shared network it needs no radio work
-            // at all. Do it as its own change, and read the log rather than assuming.
-            //
-            // We do not choose the medium either way: the peer offers one and we take it.
-            let ask = upgrade::path_request(&[upgrade::Medium::WifiDirect]);
-            write_frame(&mut out, &channel.encrypt(&ask).map_err(chan)?)?;
-            debug!("quickshare: asked for a Wi-Fi Direct upgrade");
         }
 
         if progress.cancelled() {
