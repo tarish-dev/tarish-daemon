@@ -341,6 +341,15 @@ pub struct Advertisement {
 }
 
 /// Pull the device name out of endpoint info, if it is there in the clear.
+/// The device name out of an EndpointInfo structure, when the peer published one.
+///
+/// Public because the same structure arrives two ways: in a BLE advertisement, and in a
+/// ConnectionRequest's `endpoint_info`. One decoder for both -- parsing it a second time
+/// elsewhere is how the two drift.
+pub fn name_from_endpoint_info(info: &[u8]) -> Option<String> {
+    name_from_info(info)
+}
+
 fn name_from_info(info: &[u8]) -> Option<String> {
     let len = *info.get(NAME_LEN_AT)? as usize;
     let start = NAME_LEN_AT + 1;
@@ -375,6 +384,72 @@ fn format_mac(b: &[u8]) -> Option<String> {
 /// Finds the body wherever it sits rather than assuming a frame header, and validates
 /// what it finds. Returning a wrong endpoint id would be worse than returning nothing --
 /// it produces a connection attempt to something that will never answer.
+/// Build the REGULAR form of a Quick Share endpoint advertisement.
+///
+/// The mirror of `framed`/`body_at`, and deliberately the regular form only:
+///
+/// ```text
+///   0x48 | hash:3 | len:4 | body | token:2 | mask:1 [psm:2]
+///   body = versPCP:1 | hash:3 | endpoint_id:4 | info_len:1 | info | mac:6
+/// ```
+///
+/// The fast form omits the service-id hash, which is exactly what makes a peer found that
+/// way unverifiable -- `parse_advertisement` marks it `verified: false`. A receiver has no
+/// reason to be less identifiable than it can be, so we always publish the hash.
+///
+/// `psm` is the L2CAP PSM to publish, or `None`. It is not cosmetic: a peer that sees a PSM
+/// opens an L2CAP channel and REFUSES RFCOMM, and a peer that sees none does the opposite.
+/// Publish what is actually listening.
+///
+/// The round-trip against real captures is the test that matters -- `parse_advertisement`
+/// was built from a Pixel's and a Windows machine's own bytes, so anything it reads back
+/// identically is a shape those devices produce.
+pub fn build_advertisement(
+    endpoint_id: &str,
+    endpoint_info: &[u8],
+    bluetooth_mac: Option<[u8; MAC_LEN]>,
+    device_token: [u8; DEVICE_TOKEN_LEN],
+    psm: Option<u16>,
+) -> Option<Vec<u8>> {
+    if endpoint_id.len() != ENDPOINT_ID_LEN
+        || !endpoint_id.bytes().all(|c| c.is_ascii_graphic())
+        || endpoint_info.is_empty()
+        || endpoint_info.len() > u8::MAX as usize
+    {
+        return None;
+    }
+
+    let mut body = Vec::new();
+    // versPCP: version 1 in the top three bits, PCP in the low five. 0x16 is what both
+    // captured devices send, and it is not a field worth improvising.
+    body.push(0x16);
+    body.extend_from_slice(&SERVICE_ID_HASH);
+    body.extend_from_slice(endpoint_id.as_bytes());
+    body.push(endpoint_info.len() as u8);
+    body.extend_from_slice(endpoint_info);
+    if let Some(mac) = bluetooth_mac {
+        body.extend_from_slice(&mac);
+    }
+
+    let mut out = Vec::new();
+    // Header: version 2, socket version 2, regular form. Matches both captures.
+    out.push(0x48);
+    out.extend_from_slice(&SERVICE_ID_HASH);
+    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&device_token);
+    // The mask is written even when empty, because absence and emptiness are different to
+    // a peer -- the same trap as the connection response's multiplex bitmask.
+    match psm {
+        Some(p) if p != 0 => {
+            out.push(EXTRA_FIELD_PSM);
+            out.extend_from_slice(&p.to_be_bytes());
+        }
+        _ => out.push(0),
+    }
+    Some(out)
+}
+
 pub fn parse_advertisement(data: &[u8]) -> Option<Advertisement> {
     // The framed read FIRST, because it is the only one that can find the trailing
     // fields. The body is length-delimited, so the extras start at a known offset; the

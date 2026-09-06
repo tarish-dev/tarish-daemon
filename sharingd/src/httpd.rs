@@ -47,7 +47,13 @@ const MAX_BODY: usize = 8 * 1024 * 1024;
 
 /// Where received archives land. Private to this daemon, which cannot reach shared
 /// storage: the app moves them to Downloads/Tarish, where Quick Share puts its own.
-const INBOX: &str = "/data/misc/tarish/inbox";
+/// Where received files land, whichever protocol brought them.
+///
+/// Public because Quick Share receiving writes here too. ONE constant on purpose: a second
+/// copy of this path is a second thing to keep in step with the SELinux file_contexts entry
+/// and with getReceivedFiles, and nothing would notice them diverging until a file went
+/// somewhere the app cannot read.
+pub const INBOX: &str = "/data/misc/tarish/inbox";
 
 /// Report progress at most once per this many bytes.
 const PROGRESS_STEP: u64 = 256 * 1024;

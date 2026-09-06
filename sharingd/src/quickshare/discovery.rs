@@ -320,3 +320,184 @@ fn join_multicast_v4(sock: &UdpSocket, ifindex: u32) -> io::Result<()> {
     }
     Ok(())
 }
+
+// ------------------------------------------------------------------ advertising ---
+
+/// Announces this device as a Quick Share endpoint on the Wi-Fi LAN, and answers queries
+/// for it.
+///
+/// WHAT A SENDER NEEDS, AND WHY IT IS FOUR RECORDS. A peer looking for someone to send to
+/// browses `PTR _FC9F5ED42C8A._tcp.local`, and every record after that answers a question
+/// the previous one raised: PTR names the instance, SRV gives the instance a host and port,
+/// A gives the host an address, and TXT carries the endpoint info that holds the device
+/// NAME. Miss any one and the peer has a device it cannot name, cannot reach, or cannot see
+/// at all -- and each failure looks like the device simply not being there.
+///
+/// The shape is not guessed: `QsBrowser::absorb` above parses exactly these four records
+/// out of real Windows and Android advertisements, so what we emit is what we already know
+/// how to read. That is also the cheapest test available -- two of our own devices should
+/// discover each other.
+pub struct QsResponder {
+    sock: UdpSocket,
+    tx: UdpSocket,
+    /// The instance label, which encodes our endpoint id.
+    instance: String,
+    /// `<something>.local` -- the name SRV points at and A resolves.
+    host: String,
+    addr: Ipv4Addr,
+    endpoint_info: Vec<u8>,
+    port: u16,
+}
+
+impl QsResponder {
+    pub fn new(iface: &str, device_name: &str, port: u16) -> io::Result<Self> {
+        let ifindex = crate::mdns::ifindex_of(iface)?;
+        let sock = bind_reuse_v4(MDNS_PORT).or_else(|e| {
+            // Losing :5353 to the platform's own mdnsd costs us the ability to ANSWER
+            // queries, which for a receiver is most of the point -- so unlike the browser,
+            // say so loudly rather than treating it as a footnote.
+            log::warn!(
+                "quickshare: could not bind :{MDNS_PORT} ({e}); we can announce but not answer"
+            );
+            UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
+        })?;
+        join_multicast_v4(&sock, ifindex)?;
+        set_multicast_if_v4(&sock, ifindex)?;
+        sock.set_read_timeout(Some(Duration::from_millis(500)))?;
+
+        let addr = ipv4_of(iface).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                format!("{iface} has no IPv4 address"),
+            )
+        })?;
+        // Bound to the interface address, and the egress interface named explicitly. Same
+        // reason as the browser: a socket on INADDR_ANY carries mark 0, matches nothing
+        // above Android's "from all unreachable" rule, and sendto() fails with EPERM.
+        let tx = UdpSocket::bind(SocketAddrV4::new(addr, 0))?;
+        set_multicast_if_v4(&tx, ifindex)?;
+
+        let id = quickshare::random_endpoint_id();
+        let instance = format!(
+            "{}.{}",
+            quickshare::instance_name(&id),
+            quickshare::endpoint::SERVICE_TYPE
+        );
+        // Derived from the endpoint id rather than from the device name: the name is the
+        // user's and may be anything, including characters a DNS label cannot carry.
+        let host = format!("tarish-{}.local", quickshare::instance_name(&id).to_lowercase());
+
+        let info = quickshare::endpoint::EndpointInfo {
+            version: 0,
+            hidden: false,
+            device_type: quickshare::endpoint::DeviceType::Phone,
+            metadata: random_metadata(),
+            device_name: Some(device_name.to_string()),
+        };
+        Ok(Self {
+            sock,
+            tx,
+            instance,
+            host,
+            addr,
+            endpoint_info: info.encode(),
+            port,
+        })
+    }
+
+    /// The four records, as answers. Shared by the unsolicited announcement and by replies.
+    fn answers(&self) -> Vec<Vec<u8>> {
+        let mut txt = Vec::new();
+        let entry = format!(
+            "{}={}",
+            crate::quickshare::TXT_ENDPOINT_INFO,
+            base64_url_nopad(&self.endpoint_info)
+        );
+        txt.push(entry.len() as u8);
+        txt.extend_from_slice(entry.as_bytes());
+
+        let mut srv = Vec::new();
+        srv.extend_from_slice(&0u16.to_be_bytes()); // priority
+        srv.extend_from_slice(&0u16.to_be_bytes()); // weight
+        srv.extend_from_slice(&self.port.to_be_bytes());
+        srv.extend_from_slice(&dns::encode_name(&self.host));
+
+        vec![
+            dns::record(
+                quickshare::endpoint::SERVICE_TYPE,
+                dns::TYPE_PTR,
+                TTL_SECS,
+                &dns::encode_name(&self.instance),
+                false,
+            ),
+            dns::record(&self.instance, dns::TYPE_SRV, TTL_SECS, &srv, true),
+            dns::record(&self.instance, dns::TYPE_TXT, TTL_SECS, &txt, true),
+            dns::record(&self.host, dns::TYPE_A, TTL_SECS, &self.addr.octets(), true),
+        ]
+    }
+
+    /// Say we are here, unprompted. Sent on start-up and periodically.
+    ///
+    /// Unsolicited announcement matters as much as answering: a sender that is already
+    /// browsing will not re-query just because we appeared, so a receiver that only ever
+    /// replies stays invisible until the peer's next scheduled query.
+    pub fn announce(&self) -> io::Result<()> {
+        let pkt = dns::response(&self.answers());
+        self.tx
+            .send_to(&pkt, SocketAddrV4::new(MDNS_V4, MDNS_PORT))
+            .map(|_| ())
+    }
+
+    /// Answer anything asking for our service. Returns how many queries were answered.
+    pub fn poll(&mut self) -> usize {
+        let mut buf = [0u8; 4096];
+        let mut answered = 0;
+        for _ in 0..32 {
+            let Ok((n, _)) = self.sock.recv_from(&mut buf) else {
+                return answered;
+            };
+            let Some(msg) = dns::parse(&buf[..n]) else { continue };
+            // Questions only. Our own announcement comes back to us on the group, and
+            // answering an answer is how two responders talk each other into a loop.
+            let wanted = msg.questions.iter().any(|q| {
+                q.name == quickshare::endpoint::SERVICE_TYPE
+                    || q.name == self.instance
+                    || q.name == self.host
+            });
+            if wanted {
+                let _ = self.announce();
+                answered += 1;
+            }
+        }
+        answered
+    }
+}
+
+/// Base64url with no padding, which is how the endpoint info travels in TXT.
+fn base64_url_nopad(raw: &[u8]) -> String {
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::new();
+    for c in raw.chunks(3) {
+        let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(A[(n >> 18) as usize & 63] as char);
+        out.push(A[(n >> 12) as usize & 63] as char);
+        if c.len() > 1 {
+            out.push(A[(n >> 6) as usize & 63] as char);
+        }
+        if c.len() > 2 {
+            out.push(A[n as usize & 63] as char);
+        }
+    }
+    out
+}
+
+fn random_metadata() -> [u8; quickshare::endpoint::METADATA_LEN] {
+    let mut m = [0u8; quickshare::endpoint::METADATA_LEN];
+    let _ = openssl::rand::rand_bytes(&mut m);
+    m
+}
+
+/// How long a peer may cache our records. Short: an endpoint that goes away should stop
+/// being offered promptly, and announcements are cheap.
+const TTL_SECS: u32 = 120;

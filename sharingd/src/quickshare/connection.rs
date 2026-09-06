@@ -240,11 +240,24 @@ where
                 "quickshare: request from {:?} ({:?}), mediums {:?}",
                 req.endpoint_name, req.endpoint_id, req.mediums
             );
-            if req.endpoint_name.is_empty() {
-                "A nearby device".to_string()
-            } else {
-                req.endpoint_name
-            }
+            // THE NAME IS IN endpoint_info, NOT IN endpoint_name.
+            //
+            // A stock peer puts its EndpointInfo -- flags, a 2-byte salt, a 14-byte
+            // encrypted metadata key, then a length-prefixed name -- in this field, and
+            // `endpoint_name` is that same structure run through a lossy String conversion.
+            // Using it directly put the binary prefix on screen:
+            //
+            //     offer from \ufffd\ufffd\ufffdC8EW?\ufffd\ufffd13\ufffdv\ufffdK-Desktop5090
+            //
+            // and the mangling is not recoverable afterwards, which is why this parses the
+            // BYTES. Falls back to the raw string only when the structure does not parse,
+            // so a peer that fills the field differently still gets a name of some kind.
+            tarish_protocol::ble::name_from_endpoint_info(&req.endpoint_info)
+                .or_else(|| {
+                    let n = req.endpoint_name.trim();
+                    (!n.is_empty()).then(|| n.to_string())
+                })
+                .unwrap_or_else(|| "A nearby device".to_string())
         }
         other => {
             return Err(bad(format!("expected a connection request, got {other:?}")));

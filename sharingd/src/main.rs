@@ -1854,6 +1854,139 @@ fn start_airdrop_server(
     });
 }
 
+/// Accept Quick Share transfers over the LAN.
+///
+/// The receiving counterpart to send_on_lan, and the same reasoning: a peer on our subnet
+/// reaches us by connecting to an address we advertised, so the daemon listens and runs the
+/// protocol. No radio is involved, so the app is not needed here -- unlike off-network
+/// receiving, which will need it to accept a Bluetooth connection.
+///
+/// `serve()` has existed since the protocol work and had never been called. Everything it
+/// needs already existed too: the callback list for the prompt, the transfer slot for the
+/// answer, and httpd's inbox for the files.
+fn start_quickshare_server(
+    transfers: Transfers,
+    callbacks: Callbacks,
+    auto_accept: Arc<AtomicBool>,
+    policy: Arc<Mutex<TarishPolicy>>,
+    port: Arc<std::sync::atomic::AtomicU16>,
+) {
+    std::thread::spawn(move || {
+        loop {
+            // PORT 0: let the kernel choose, then publish what it chose. A fixed port would
+            // collide with whatever else is on the device and fail at bind for a reason no
+            // one would look for -- and the peer learns the port from mDNS anyway, so there
+            // is nothing to gain by picking one.
+            let listener = match std::net::TcpListener::bind(("0.0.0.0", 0)) {
+                Ok(l) => l,
+                Err(e) => {
+                    log::warn!("quickshare: could not listen ({e}); retrying in 10s");
+                    std::thread::sleep(Duration::from_secs(10));
+                    continue;
+                }
+            };
+            let bound = match listener.local_addr() {
+                Ok(a) => a.port(),
+                Err(e) => {
+                    log::warn!("quickshare: listener has no address ({e})");
+                    std::thread::sleep(Duration::from_secs(10));
+                    continue;
+                }
+            };
+            // Published BEFORE the accept loop, so the responder never advertises a port
+            // nothing is listening on.
+            port.store(bound, Ordering::SeqCst);
+            log::info!("quickshare: accepting transfers on port {bound}");
+
+            for conn in listener.incoming() {
+                let sock = match conn {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!("quickshare: accept failed ({e}); rebinding");
+                        break;
+                    }
+                };
+                // POLICY IS CHECKED PER CONNECTION, not once at start-up. An administrator
+                // who turns receiving off should close the door on the next peer to knock,
+                // not at the next reboot -- and the daemon starts denied, so a listener
+                // running before any policy arrives must refuse everything.
+                let mode = policy.lock().map(|p| p.quickshare).unwrap_or(MODE_OFF);
+                if !allows_receive(mode) {
+                    log::info!("quickshare: refusing a connection — policy does not permit receive");
+                    continue;
+                }
+
+                let peer = sock
+                    .peer_addr()
+                    .map(|a| a.ip().to_string())
+                    .unwrap_or_else(|_| "a nearby device".to_string());
+                let transfers = transfers.clone();
+                let callbacks = callbacks.clone();
+                let auto_accept = auto_accept.clone();
+                // One thread per connection. A peer that stalls mid-transfer must not stop
+                // the next one being answered.
+                std::thread::spawn(move || {
+                    let reader = match sock.try_clone() {
+                        Ok(r) => r,
+                        Err(e) => {
+                            log::warn!("quickshare: could not clone an inbound socket: {e}");
+                            return;
+                        }
+                    };
+                    // Same reason as every other socket here: a peer that stops reading
+                    // must cost this transfer, not the thread forever.
+                    let _ = sock.set_write_timeout(Some(Duration::from_secs(20)));
+                    let id = transfers.begin(false);
+                    let host = QsHost {
+                        id,
+                        peer: peer.clone(),
+                        transfers: transfers.clone(),
+                        callbacks: callbacks.clone(),
+                        auto_accept,
+                    };
+                    log::info!("quickshare: inbound connection from {peer} (transfer {id})");
+                    let outcome =
+                        quickshare::connection::serve(reader, sock, &host, &transfers, &callbacks);
+                    // TELL THE CLIENT IT ENDED. Without this the app sits at a full
+                    // progress bar forever: the bytes arrived, the file is in the inbox, and
+                    // nothing ever said the transfer was over. serve() has no notion of
+                    // this -- the send path had the same hole and it presents identically,
+                    // as a transfer "stuck at completion".
+                    let status = match &outcome {
+                        Ok(names) if !names.is_empty() => {
+                            log::info!("quickshare: received {} file(s) from {peer}", names.len());
+                            STATUS_OK
+                        }
+                        // Nothing arrived. A person declining is the ordinary reason, and it
+                        // is an answer rather than a fault.
+                        Ok(_) => {
+                            log::info!("quickshare: nothing received from {peer}");
+                            STATUS_DECLINED
+                        }
+                        Err(e) => {
+                            // A peer that opens a connection and closes it without a word is
+                            // probing, not failing -- Windows does it either side of a real
+                            // transfer. Not worth a warning.
+                            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                                log::debug!("quickshare: {peer} connected and said nothing");
+                            } else {
+                                log::warn!("quickshare: inbound transfer {id} failed: {e}");
+                            }
+                            STATUS_FAILED
+                        }
+                    };
+                    if let Ok(cbs) = callbacks.lock() {
+                        for cb in cbs.iter() {
+                            let _ = cb.onTransferFinished(id, status);
+                        }
+                    }
+                    transfers.finish(id);
+                });
+            }
+        }
+    });
+}
+
 /// Browse for Quick Share peers on the Wi-Fi LAN.
 ///
 /// Its own thread and its own socket, separate from the AWDL discovery loop: a
@@ -1861,7 +1994,7 @@ fn start_airdrop_server(
 /// other with it. Retries rather than giving up -- wlan0 may have no address yet at
 /// boot, and a daemon that is running and permanently blind is worse than one that
 /// keeps trying.
-fn start_quickshare_discovery(lan: QsLanPeers) {
+fn start_quickshare_discovery(lan: QsLanPeers, port: Arc<std::sync::atomic::AtomicU16>) {
     std::thread::spawn(move || {
         const IFACE: &str = "wlan0";
         // Instances already reported, so a peer is announced when it appears rather than
@@ -1879,8 +2012,43 @@ fn start_quickshare_discovery(lan: QsLanPeers) {
                     continue;
                 }
             };
+            // ADVERTISE FROM THE SAME LOOP AS BROWSING. Both want wlan0 with an address,
+            // both have to be torn down and rebuilt when it goes away, and doing that in two
+            // places means two chances to get the interface state wrong.
+            //
+            // None when there is no port yet -- the listener publishes it once it is bound,
+            // and advertising a port nothing is listening on is worse than not advertising:
+            // a sender finds us, connects, and fails.
+            let mut responder: Option<quickshare::discovery::QsResponder> = None;
+            let mut since_announce = Duration::from_secs(99);
             let mut since_query = Duration::from_secs(99);
             loop {
+                let bound = port.load(Ordering::SeqCst);
+                if responder.is_none() && bound != 0 {
+                    match quickshare::discovery::QsResponder::new(IFACE, &device_name(), bound) {
+                        Ok(r) => {
+                            log::info!(
+                                "quickshare: advertising as \"{}\" on port {bound}",
+                                device_name()
+                            );
+                            responder = Some(r);
+                        }
+                        Err(e) => log::debug!("quickshare: cannot advertise yet ({e})"),
+                    }
+                }
+                if let Some(r) = responder.as_mut() {
+                    r.poll();
+                    // Re-announced periodically, not only on start-up: a sender already
+                    // browsing will not re-query because we appeared, so a receiver that
+                    // waits to be asked stays invisible until the peer's next scan.
+                    if since_announce >= Duration::from_secs(30) {
+                        if let Err(e) = r.announce() {
+                            log::debug!("quickshare: announce failed ({e})");
+                        }
+                        since_announce = Duration::ZERO;
+                    }
+                }
+
                 if since_query >= Duration::from_secs(10) {
                     if let Err(e) = browser.query() {
                         // Back off before rebinding. Breaking straight out span the
@@ -1924,6 +2092,7 @@ fn start_quickshare_discovery(lan: QsLanPeers) {
 
                 std::thread::sleep(Duration::from_millis(500));
                 since_query += Duration::from_millis(500);
+                since_announce += Duration::from_millis(500);
             }
         }
     });
@@ -1983,6 +2152,16 @@ fn main() {
     // after the service is published on purpose -- nothing should browse for peers until
     // there is somewhere to report them -- so the handle has to be taken while it can be.
     let qs_lan = service.qs_lan.clone();
+    // The port the Quick Share listener actually bound, for the responder to advertise.
+    // Zero until it is up, which is how the responder knows not to announce yet.
+    let qs_port = Arc::new(std::sync::atomic::AtomicU16::new(0));
+    start_quickshare_server(
+        service.transfers.clone(),
+        service.callbacks.clone(),
+        service.auto_accept.clone(),
+        service.policy.clone(),
+        qs_port.clone(),
+    );
     let binder = BnTarishService::new_binder(service, BinderFeatures::default());
 
     if let Err(e) = binder::add_service(SERVICE_NAME, binder.as_binder()) {
@@ -1993,7 +2172,7 @@ fn main() {
     // Quick Share identity, logged once. Discovery is not wired yet; this proves the
     // derivation on real hardware rather than only in reasoning.
     log::info!("quickshare: {}", quickshare::describe_identity(&device_name()));
-    start_quickshare_discovery(qs_lan);
+    start_quickshare_discovery(qs_lan, qs_port);
 
     // One thread is plenty for a skeleton; the transfer work will want more.
     binder::ProcessState::join_thread_pool();
@@ -2279,6 +2458,105 @@ impl TarishService {
         });
 
         Ok(id)
+    }
+}
+
+/// Receives a Quick Share transfer: prompts a person, writes the files, reports progress.
+///
+/// The counterpart to TransferProgress on the send side, and deliberately built on the
+/// SAME pieces AirDrop receiving already uses -- the callback list for the prompt, the
+/// transfer slot for the answer, and `httpd`'s inbox for the files. So `getReceivedFiles`,
+/// `openReceivedFile` and `deleteReceivedFile` work for Quick Share with no new AIDL and no
+/// change in the app: a received file is a received file, whichever protocol brought it.
+struct QsHost {
+    id: i64,
+    peer: String,
+    transfers: Transfers,
+    callbacks: Callbacks,
+    auto_accept: Arc<AtomicBool>,
+}
+
+impl quickshare::connection::Host for QsHost {
+    fn ask(&self, from: &str, files: &[tarish_protocol::sharing::FileMetadata]) -> bool {
+        let names: Vec<String> = files.iter().map(|f| f.name.clone()).collect();
+        let total: i64 = files.iter().map(|f| f.size.max(0)).sum();
+
+        // Turned off deliberately, by the person or by their organisation. Nothing to ask.
+        if self.auto_accept.load(Ordering::SeqCst) {
+            log::info!(
+                "quickshare: accepting {} file(s) from {from} without asking",
+                names.len()
+            );
+            return true;
+        }
+
+        {
+            let Ok(cbs) = self.callbacks.lock() else {
+                return false;
+            };
+            // NO CLIENT, NO TRANSFER. An offer nobody can see must not be accepted on the
+            // person's behalf -- this writes files to their device. Refusing is the safe
+            // answer and it is the same one the AirDrop path gives.
+            if cbs.is_empty() {
+                log::info!("quickshare: offer from {from} refused — no client to ask");
+                return false;
+            }
+            for cb in cbs.iter() {
+                let _ = cb.onTransferOffered(
+                    self.id,
+                    &self.peer,
+                    &names,
+                    total,
+                    PROTOCOL_QUICKSHARE,
+                );
+            }
+        }
+        // A person has to pick the phone up and read it. Shorter than the sender's own
+        // patience would make us the reason it failed.
+        match self.transfers.await_answer(self.id, Duration::from_secs(60)) {
+            Some(accepted) => {
+                log::info!("quickshare: offer from {from} {}", if accepted { "accepted" } else { "declined" });
+                accepted
+            }
+            // Nobody answered. A silent timeout is a refusal: accepting because a prompt
+            // went unanswered is the one outcome a person cannot undo.
+            None => {
+                log::info!("quickshare: offer from {from} timed out unanswered — refused");
+                false
+            }
+        }
+    }
+
+    fn create(&self, name: &str) -> std::io::Result<Box<dyn std::io::Write + Send>> {
+        // The name came off the wire and is hostile until proven otherwise. safe_leaf
+        // strips any path structure; non_clobbering then refuses to overwrite, so a peer
+        // cannot replace a file it sent earlier -- or one AirDrop put there.
+        let leaf = httpd::safe_leaf(name).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("refusing the peer's file name {name:?}"),
+            )
+        })?;
+        let dest = httpd::non_clobbering(httpd::INBOX, &leaf);
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&dest)?;
+        log::info!("quickshare: writing {leaf} to the inbox");
+        Ok(Box::new(f))
+    }
+
+    fn progress(&self, done: u64, total: u64) {
+        let Ok(cbs) = self.callbacks.lock() else {
+            return;
+        };
+        for cb in cbs.iter() {
+            let _ = cb.onTransferProgress(self.id, done as i64, total as i64);
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.transfers.is_cancelled(self.id)
     }
 }
 
