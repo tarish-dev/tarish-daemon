@@ -80,6 +80,9 @@ const MR_WIFI_DIRECT_GROUP_CLIENT: u32 = 2;
 /// which is a different negotiation than the one this code knows how to finish.
 const WIFI_DIRECT_WITH_PASSWORD: u64 = 1;
 
+/// The schema's "no hint" for `SafeToClosePriorChannel.sta_frequency`.
+pub const STA_FREQUENCY_NOT_SET: i32 = -1;
+
 // WifiHotspotCredentials
 const HS_SSID: u32 = 1;
 const HS_PASSWORD: u32 = 2;
@@ -630,17 +633,34 @@ impl Host {
         }
         match event {
             Event::Frame(Channel::New, Frame::ClientIntroduction { .. }) => {
-                // The joiner arrived. Answer only if we said we would -- a peer that was
-                // told no ack is coming is not waiting for one, and sending it anyway is
-                // an unexpected frame on a channel it is about to reuse.
+                // The joiner arrived. Two frames go out, and the second one is the whole
+                // reason the handover completes.
+                //
+                // OUR LAST_WRITE, UNPROMPTED. A joiner sends its own and then WAITS for
+                // ours before it will send SAFE_TO_CLOSE -- Bada's client does exactly that,
+                // and a stock Android host was observed doing the same thing from the other
+                // side: it sent its LAST_WRITE as soon as our introduction landed, without
+                // waiting for ours. A host that stays quiet here leaves the joiner waiting
+                // for a frame that is never coming.
+                //
+                // The ack only if we said we would: a peer told no ack is coming is not
+                // waiting for one, and sending it anyway puts an unexpected frame on a
+                // channel it is about to start using for something else.
                 self.state = State::Draining;
+                let mut out = Vec::new();
                 if self.path.supports_introduction_ack {
-                    vec![Effect::Send(Channel::New, client_introduction_ack())]
-                } else {
-                    Vec::new()
+                    out.push(Effect::Send(Channel::New, client_introduction_ack()));
                 }
+                out.push(Effect::Send(Channel::Old, last_write_to_prior()));
+                out
             }
-            Event::Frame(Channel::Old, Frame::LastWriteToPrior) => {
+            // The joiner's LAST_WRITE. Nothing to do: ours has already gone out, and the
+            // sequence turns on SAFE_TO_CLOSE below. Answering here would send our
+            // release before the joiner has asked for it.
+            Event::Frame(Channel::Old, Frame::LastWriteToPrior) => Vec::new(),
+            Event::Frame(Channel::Old, Frame::SafeToClosePrior { .. }) => {
+                // The joiner has let the old channel go. Release it ourselves and the
+                // handover is done.
                 self.state = State::Upgraded;
                 vec![
                     Effect::Send(Channel::Old, safe_to_close_prior(self.sta_frequency)),
@@ -728,6 +748,16 @@ impl Joiner {
                 }
                 self.state = State::Draining;
                 vec![Effect::Send(Channel::Old, last_write_to_prior())]
+            }
+            // The host's LAST_WRITE. Answer with our release -- it will not send its own
+            // SAFE_TO_CLOSE until it has ours, so a joiner that stays quiet here waits
+            // forever on a host that is waiting for it. Observed against a stock Android
+            // host, which sends this as soon as our introduction lands.
+            Event::Frame(Channel::Old, Frame::LastWriteToPrior) => {
+                // STA_FREQUENCY_NOT_SET: a joiner is joining BECAUSE it has no network,
+                // so there is no association frequency to report and inventing one would
+                // be worse than the schema's own "unknown".
+                vec![Effect::Send(Channel::Old, safe_to_close_prior(STA_FREQUENCY_NOT_SET))]
             }
             Event::Frame(Channel::Old, Frame::SafeToClosePrior { .. }) => {
                 self.state = State::Upgraded;
@@ -946,22 +976,41 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         };
 
-        // Host receives it on the new channel and acks.
+        // Host receives it on the new channel: acks, AND releases the old channel
+        // unprompted. The second frame is what a joiner is waiting for -- see Host::on.
         let body = crate::frames::upgrade_body(&intro).unwrap();
-        let ack = match &host.on(Event::Frame(Channel::New, parse(&body).unwrap()))[..] {
-            [Effect::Send(Channel::New, bytes)] => bytes.clone(),
-            other => panic!("unexpected: {other:?}"),
-        };
+        let (ack, host_last) =
+            match &host.on(Event::Frame(Channel::New, parse(&body).unwrap()))[..] {
+                [Effect::Send(Channel::New, a), Effect::Send(Channel::Old, l)] => {
+                    (a.clone(), l.clone())
+                }
+                other => panic!("unexpected: {other:?}"),
+            };
 
         // Joiner gets the ack, says it is done with the old channel.
         let body = crate::frames::upgrade_body(&ack).unwrap();
-        let last = match &joiner.on(Event::Frame(Channel::New, parse(&body).unwrap()))[..] {
+        let joiner_last = match &joiner.on(Event::Frame(Channel::New, parse(&body).unwrap()))[..] {
             [Effect::Send(Channel::Old, bytes)] => bytes.clone(),
             other => panic!("unexpected: {other:?}"),
         };
 
-        // Host agrees and closes.
-        let body = crate::frames::upgrade_body(&last).unwrap();
+        // The two LAST_WRITEs cross, which is normal: a stock host sends its own as soon
+        // as the introduction lands and does not wait for the joiner's.
+        let body = crate::frames::upgrade_body(&joiner_last).unwrap();
+        assert!(
+            host.on(Event::Frame(Channel::Old, parse(&body).unwrap())).is_empty(),
+            "the joiner's LAST_WRITE needs no answer; ours has already gone"
+        );
+
+        // Joiner sees the host's LAST_WRITE and releases the old channel.
+        let body = crate::frames::upgrade_body(&host_last).unwrap();
+        let joiner_safe = match &joiner.on(Event::Frame(Channel::Old, parse(&body).unwrap()))[..] {
+            [Effect::Send(Channel::Old, bytes)] => bytes.clone(),
+            other => panic!("the joiner should answer a LAST_WRITE with SAFE_TO_CLOSE: {other:?}"),
+        };
+
+        // Host releases too, and only now is the handover done.
+        let body = crate::frames::upgrade_body(&joiner_safe).unwrap();
         let safe = match &host.on(Event::Frame(Channel::Old, parse(&body).unwrap()))[..] {
             [Effect::Send(Channel::Old, bytes), Effect::CloseOld, Effect::Upgraded] => bytes.clone(),
             other => panic!("unexpected: {other:?}"),
@@ -992,22 +1041,31 @@ mod tests {
         assert_eq!(joiner.state(), State::Draining);
     }
 
-    /// And a host that said it would not ack must not send one.
+    /// A host that said it would not ack must not send one -- but must STILL release the
+    /// old channel, because that is what the joiner is actually waiting for.
+    ///
+    /// This asserted an empty result when the host sent nothing at all on an introduction.
+    /// That modelled a two-frame handover, and the real one is four: a joiner will not send
+    /// SAFE_TO_CLOSE until it has seen the host's LAST_WRITE, so a silent host hangs it.
     #[test]
-    fn a_host_that_promised_no_ack_sends_none() {
+    fn a_host_that_promised_no_ack_still_releases_the_old_channel() {
         let mut path = hotspot();
         path.supports_introduction_ack = false;
         let mut host = Host::new(path, 2437);
         host.start();
-        assert_eq!(
-            host.on(Event::Frame(
-                Channel::New,
-                Frame::ClientIntroduction {
-                    endpoint_id: "ABCD".into()
-                }
-            )),
-            vec![]
-        );
+        match &host.on(Event::Frame(
+            Channel::New,
+            Frame::ClientIntroduction {
+                endpoint_id: "ABCD".into(),
+            },
+        ))[..]
+        {
+            [Effect::Send(Channel::Old, bytes)] => {
+                let body = crate::frames::upgrade_body(bytes).unwrap();
+                assert_eq!(parse(&body).unwrap(), Frame::LastWriteToPrior);
+            }
+            other => panic!("expected only a LAST_WRITE on the old channel: {other:?}"),
+        }
         assert_eq!(host.state(), State::Draining);
     }
 
