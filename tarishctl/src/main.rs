@@ -9,7 +9,7 @@
 //! with awk and a person can read it. Errors go to stderr and set a non-zero exit.
 
 use binder::Strong;
-use dev::tarish::ITarishService::ITarishService;
+use dev_tarish::aidl::dev::tarish::ITarishService::ITarishService;
 
 const SERVICE: &str = "dev.tarish.ITarishService/default";
 
@@ -41,7 +41,7 @@ Ids are opaque; take them from `peers` and from the daemon log."
     std::process::exit(2)
 }
 
-fn open_files(paths: &[String]) -> Result<(Vec<Option<binder::ParcelFileDescriptor>>, Vec<String>), String> {
+fn open_files(paths: &[String]) -> Result<(Vec<binder::ParcelFileDescriptor>, Vec<String>), String> {
     let mut fds = Vec::new();
     let mut names = Vec::new();
     for p in paths {
@@ -52,7 +52,7 @@ fn open_files(paths: &[String]) -> Result<(Vec<Option<binder::ParcelFileDescript
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| p.clone()),
         );
-        fds.push(Some(binder::ParcelFileDescriptor::new(f)));
+        fds.push(binder::ParcelFileDescriptor::new(f));
     }
     Ok((fds, names))
 }
