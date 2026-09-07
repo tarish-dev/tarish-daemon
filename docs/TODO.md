@@ -9,296 +9,14 @@ did not exist, and the live work was two hundred lines down.
 
 ## Open
 
-### The payload runs over Bluetooth, and it should not
-
-Quick Share sends work, and they are slow: ~126 KB/s for a 2.7 MB file on frankel. That is
-not the send window and not the framing. **It is the medium.**
-
-Bluetooth is only supposed to carry the BOOTSTRAP -- handshake, PIN, consent. Stock then
-performs a bandwidth upgrade and moves the payload to Wi-Fi Direct, a hotspot, or the LAN.
-It never sends a multi-megabyte file over Bluetooth. We do, because `outbound.rs` answers
-every `UPGRADE_PATH_AVAILABLE` with `UPGRADE_FAILURE`:
-
-    OfflineFrame::BandwidthUpgrade(body) => {
-        // WE CANNOT TAKE ONE, SO SAY SO.
-
-Declining was right when it was written -- an ignored offer leaves the negotiation open
-and the transfer is reported failed with every byte delivered, which is what the Windows
-"cannot complete transfer" was. It is not right as a destination.
-
-**What it needs.**
-
-- **Solicit, do not wait.** Stock GMS receivers never offer an upgrade unprompted: they
-  advertise `autoUpgradeBandwidth: false` and stay idle until the sender sends
-  `BANDWIDTH_UPGRADE_NEGOTIATION{UPGRADE_PATH_REQUEST}`. Bada sends it right after the
-  sharing FSM's first PKE frame, so the receiver's group bring-up overlaps the consent
-  wait rather than following it.
-- **Adopt the offer**, connect on the new medium, then tear the old one down in order:
-  `LAST_WRITE_TO_PRIOR_CHANNEL`, `SAFE_TO_CLOSE_PRIOR_CHANNEL`.
-- **Failure policy**, which is not symmetric: a Bluetooth bootstrap falls back to staying
-  on Bluetooth for anything that goes wrong BEFORE the teardown starts (no offer,
-  malformed offer, adopt timeout). After `LAST_WRITE` it is terminal -- the old channel is
-  no longer safe to stream on.
-
-**The protocol half is already written and tested**: `tarish_protocol::upgrade`, including
-`a_whole_upgrade_completes_on_both_sides`. What is missing is the radio.
-
-**Do WIFI_LAN first.** When both devices are on the same network the upgrade is a TCP
-connection to an address the peer hands us -- no Wi-Fi Direct, no P2P group, no new
-framework surface, and it is the path Windows already offered us unprompted
-(`172.20.9.166:58151`, which we declined). Wi-Fi Direct is the one that matters offline and
-is the bigger piece: `WifiP2pManager` lives in the framework, so like BLE it belongs in the
-app with the daemon driving it over AIDL.
-
-Until then the send window is worth what it is worth and no more: 256 KiB of packets in
-flight keeps the radio busy, but the radio is the ceiling.
-
-### Cancelling needs a pass, and a refusal currently reports as success
-
-Reported from real use 2026-09-05, after PIN entry, wrong-PIN and both-sides cancel were
-otherwise tested and working.
-
-**The bug, and it is one line.** Enter the right PIN, then decline on the RECEIVER, and the
-sender says the file was sent.
-
-`fsm.rs`, the sender's handling of the peer's answer:
-
-    (State::Introduction, Frame::Response(_)) => {
-        // A refusal is a normal answer, not a failure.
-        self.state = State::Done;
-        vec![Effect::Done]
-    }
-
-and `outbound.rs`, deciding what happened:
-
-    return Ok(fsm.state() == State::Done && total > 0);
-
-A refusal lands in `State::Done`, which is also where a completed transfer lands, so the
-two are indistinguishable at the only place that decides. `total` does not help -- it is
-the size of what we OFFERED, not of what went. So `Ok(true)`, `STATUS_OK`, "Sent".
-
-Treating a refusal as a normal ending is right. Reusing the state that means "the files
-went" is what is wrong.
-
-Two ways to fix it, and the second is better:
-
-1. Track in `outbound::send` whether `Effect::BeginSending` was ever handled, and return
-   that instead of a state comparison. Small, local, and leaves the ambiguity in the FSM
-   for the next caller to trip over.
-2. Give the FSM a distinct terminal state -- `State::Refused` -- so "finished, nothing
-   sent" is not spelled the same as "finished, everything sent". The inbound side can use
-   it too, and the existing test
-   `a_refused_send_finishes_rather_than_failing` becomes the test that pins the
-   difference rather than the one that hides it.
-
-**While in there, the rest of cancelling wants checking.** These were not all exercised:
-
-- receiver cancels MID-TRANSFER, after accepting -- does the sender stop promptly, and
-  report cancelled rather than failed or sent?
-- sender cancels mid-transfer -- does the receiver discard the partial file rather than
-  keep a truncated one?
-- either side cancels during the PIN wait, which now has a 120 s window
-- a cancel that arrives while the L2CAP writer is blocked in `wait_for_room` -- the pacing
-  wait checks `closed` but not the transfer's cancel flag, so it may sit there until the
-  ack timeout
-
-Cancel at the PIN prompt is done and reports "Cancelled" correctly; that one is the model
-for how the others should read.
-
-### Quick Share to a stock Android peer: WORKING, and how
-
-Windows works end to end over RFCOMM. A stock Pixel does not, and the reason is that it
-does not accept RFCOMM at all -- **its advertisement says so, and that took far too long
-to notice.**
-
-    PHONE    endpoint='WLTQ' name='K-N6'      EXTRA FIELDS mask=0x01 -> L2CAP PSM 177
-    WINDOWS  endpoint='D7B0' name='K-ProArt'  no extra fields
-
-A peer publishing a PSM refuses RFCOMM -- accepted, closed inside 200 ms, no frame either
-way. A peer publishing none accepts it. Verified with both devices off Wi-Fi entirely, so
-none of this is about the network.
-
-**The L2CAP stack, as far as it is understood.** Every packet is
-`[len:4][service_id_hash:3][payload]`, where `000000` is the control channel and `fc9f5e`
-is ours. In order:
-
-| step | packet | peer's answer |
-|---|---|---|
-| data connection | `[3][fc9f5e]` | `[23]` ready |
-| socket introduction | control `SocketControlFrame{INTRODUCTION, {fc9f5e, V2}}` | accepted |
-| multiplex request | data `[len][MultiplexFrame{CONTROL, CONNECTION_REQUEST}]` | **ack, then DISCONNECTION** |
-
-Each of those was found by being wrong first, and each wrong version failed silently:
-
-- a bare `[3]` with no service hash is answered `[24]`, a refusal
-- asking `[1]` first gets the channel closed without a word
-- skipping the introduction gets every data packet ignored and the channel dropped ~20 s
-  later
-- writing multiplex frames without the `fc9f5e` packet prefix does the same
-
-**NO MULTIPLEX LAYER.** Nearby has one, and this peer does not use it:
-
-    onIncomingConnection(BLE) mode: LEGACY ... failed to initialize the connection
-    java.io.IOException: In readConnectionRequestFrame, expected a CONNECTION_REQUEST
-    v1 OfflineFrame but got a UNKNOWN_FRAME_TYPE frame instead
-
-LEGACY means one service per channel, so the first thing after the introduction is the
-ordinary Nearby CONNECTION_REQUEST. A MultiplexFrame there is acknowledged by byte count
-and the socket then closed, which from the sending side is indistinguishable from being
-refused. `tarish_protocol::multiplex` is kept and tested for peers that do multiplex.
-
-**And the endpoint id must be FOUR CHARACTERS.** Ours was the mDNS instance label --
-`instance_name()` base64url-encodes a ten-byte structure and yields fourteen. Windows
-accepted it for weeks. A Pixel does not, and does not merely refuse:
-
-    FATAL EXCEPTION: highpool[467]
-    Process: com.google.android.gms.persistent
-    java.lang.IllegalArgumentException: ConnectionsDevice's endpoint id must be
-    assigned with length 4.
-
-It takes down `com.google.android.gms.persistent`, so the peer stops answering because the
-service handling us has died. That is why this looked like a protocol refusal for hours.
-
-**Verified 2026-09-05:** L2CAP connect, data connection, introduction, `peer is Android,
-safe-disconnect v4`, PIN, acceptance, 453693 bytes, `transfer 1 complete`.
-
-**HOW IT WAS FOUND, because it is the lesson.** Six rounds of inference from a reference
-implementation got the framing right and then stopped paying. Connecting the receiving
-phone over adb and reading ITS log gave the answer in one line, twice -- the LEGACY mode
-error and the endpoint-id crash. Neither was visible from the sending side, and neither
-was in Bada. **When a peer will not talk to you and you can hold it, read its log first.**
-
-Remaining: the peer rotates its BLE address and PSM every advertisement set, so a row more
-than a few seconds old fails at connect. The app should re-resolve immediately before
-dialing and retry once.
-
-Credit for the whole layer: Bada's `BleL2capInitialControlClient`, `NearbyBleSocketFrames`
-and `ble_frames.proto`.
-
-### Quick Share offline: RFCOMM is the right door — the request was the wrong shape
-
-Established by testing against two real peers 2026-09-04, then by reading Bada 2026-09-05.
-
-| peer | RFCOMM connect | then |
-|---|---|---|
-| Windows Quick Share | accepted | full UKEY2 handshake, encrypted channel, then "cannot complete transfer" |
-| Android Quick Share (two devices) | accepted | **ignores everything** — never answers the ConnectionRequest |
-
-**The first version of this entry concluded the door was wrong, and that was wrong.** It
-said the initial control connection had to be BLE L2CAP or GATT wrapped in a MultiplexFrame
-stream, and laid out four steps starting with extracting a PSM. Reading Bada instead of
-inferring from the symptom says otherwise, on three separate pieces of evidence:
-
-- Its send-route priority is **LAN → RFCOMM → BLE L2CAP → BLE GATT** (`SendBootstrapPlan`),
-  so RFCOMM outranks both BLE routes for exactly the peer we were testing against.
-- `UserFacingMediumFeatures.BLUETOOTH_CLASSIC_BOOTSTRAP_ROUTE_ENABLED` is `true`, and its
-  comment records *why*: "Stock GMS receivers bootstrap off-LAN over RFCOMM (verified by
-  HCI snoop of stock-to-stock transfers); their BLE GATT/L2CAP server paths are unreliable
-  because stock senders never exercise them."
-- `useNearbyMultiplexInitialTransport` defaults to `false` and no caller sets it. Multiplex
-  is a **LAN** option, and the transport-based constructor hardcodes it off. Nothing
-  multiplexes an RFCOMM bootstrap.
-
-And the peers agree: our captured Android advertisements are the fast form, which carries
-no PSM at all. Bada's own runbook expects exactly that —
-`rejected=[wifi-lan=missing, ble-l2cap=peer-psm-missing]`.
-
-So the socket was right. **What was wrong was the ConnectionRequest, in five places** — all
-fields a stock Android receiver requires and none of which produce an error when absent:
-
-| field | what it is | absent means |
-|---|---|---|
-| `endpoint_info` | **we sent an empty vector** | the receiver builds its "X wants to share" prompt from this. Empty leaves it with a request it cannot show anyone |
-| `medium_metadata` (7) | this device's radios | request is not dispatched |
-| `connections_device` (12) | endpoint id + info again, inside the `Device` oneof | read in preference to the flat fields |
-| `multiplex_socket_bitmask` (5, response) | present and **zero** | Samsung One UI 8.0.5 FINs ~104 ms after our ACCEPT |
-| `safe_to_disconnect_version` (7, response) | 1 | One UI 7+ drops us before the consent dialog |
-
-`keep_alive_timeout_millis` was also 30 s where stock is 600 s, in both the request and
-(newly) the response — the field was added to `ConnectionResponseFrame` in Dec 2024 and a
-Galaxy S24 Ultra FINs ~150 ms without it.
-
-Every one of these is silent. That is why the symptom was a socket that connects and then
-does nothing, and why it read as the wrong transport. Fixed in `frames.rs`; the two
-derived fields are built inside `connection_request` rather than taken from the caller, so
-no caller can omit them again. Five tests assert presence against the encoded bytes,
-because a round-trip test cannot catch this — our own parser is happy either way, which is
-how they came to be missing.
-
-Credit for all of it: Bada's `OutboundFrames`, whose comments record each field against the
-device that needed it.
-
-**Then four more of the same kind, from the same source** — Bada's `AGENTS.md` is a list of
-requirements discovered one device at a time, and each of these fails without an error:
-
-- **The ConnectionResponse exchange is send-first, then receive.** We read the peer's
-  before sending ours. Against a peer that does the same, that is a plain deadlock: both
-  sides block on a read until one times out. Windows happens to send first, which is
-  exactly why it was the only peer that ever got past this point.
-- **A FILE payload's LAST_CHUNK terminator is its own frame** — empty body, offset =
-  total size — and so is a BYTES payload's. We fused body and flag into one frame in both
-  paths. Our own receiver reads that correctly, so it round-trips in tests and looks right
-  on the wire; a stock receiver reassembles nothing from it. Every sharing frame goes
-  through the BYTES path, so an introduction sent that way reaches the peer and produces
-  no accept prompt.
-- **`IntroductionFrame.use_case` must be NEARBY_SHARE**, and each `FileMetadata.id` must
-  equal its `payload_id`. Ours numbered attachments 1..n. Samsung keys its receive-side
-  bookkeeping on `id` and discards an attachment it cannot match.
-- **The DisconnectionFrame must set `request_safe_to_disconnect`**, and the sender must
-  wait for the ack before closing. Having advertised `safe_to_disconnect_version = 1`, a
-  bare close is a broken promise: the FIN arrives before the peer drains its read pipeline
-  and every payload still in there is marked failed — so the transfer succeeds on our side
-  and fails on theirs.
-
-That last one only became a requirement *because* we started advertising the version, so
-it and the response fields have to land together.
-
-**Untested on hardware.** Windows got further than Android on the old shape, so it may
-still fail at the same place; if it does, the next suspect is unchanged — see below.
-
-**What is NOT wrong, and should not be re-litigated:** the crypto. Against Windows the
-plaintext handshake completes, the channel comes up, the peer is identified and a session
-PIN derives. HKDF is on RFC vectors, D2D derivation and AES-CBC on Bada's. The remaining
-Windows-side failure is most likely the SecureMessage envelope, the one layer in that path
-with no foreign-implementation vector.
-
-
-### Quick Share: what is left is the socket, not the protocol
-
-`libtarish_protocol` is complete and covered by 127 tests, including one that runs a whole
-share between two peers in-process — UKEY2 handshake, key derivation, encrypted channel,
-paired-key exchange, introduction, acceptance, a 300 KB file in 64 KiB chunks,
-reassembled and compared byte for byte. `quickshare::connection::serve` is the I/O loop
-around it and compiles into the daemon.
-
-Three things stand between that and receiving a file on hardware:
-
-1. **A `Host` implementation.** `serve` needs four methods. `ask` should reuse the
-   existing `Transfers::await_answer`, which is what already makes the AirDrop prompt
-   work — the app needs no change, and `onTransferOffered` already carries
-   `PROTOCOL_QUICKSHARE` so the prompt badges itself correctly. `create` must sanitise
-   the peer's filename: `httpd::safe_leaf` and `httpd::non_clobbering` already do exactly
-   this for AirDrop and should be made `pub(crate)` and reused rather than reimplemented.
-
-2. **A TCP listener on wlan0**, on the port the mDNS record advertises, spawning a thread
-   per connection into `serve`. Gate it on the Quick Share policy — the daemon already
-   holds `policy.quickshare`, and `allows_receive` is the check.
-
-3. **mDNS advertising.** Discovery today only BROWSES. Nothing can find this device as a
-   Quick Share endpoint until it publishes an SRV, TXT and A record for
-   `_FC9F5ED42C8A._tcp` on wlan0. The identity layer for it is done (`quickshare::mod`
-   has the instance encoding, endpoint id and TXT keys, verified against Windows Quick
-   Share); what is missing is the responder.
-
-Only (3) is real protocol work; (1) and (2) are plumbing. Sending — the outbound
-direction — needs the same three plus `fsm::Outbound`, which is written and tested.
-
-**Not blocking, but worth knowing:** `libtarish_protocol` is a dylib rather than an rlib.
-It was declared `rust_library_rlib` first and Soong emitted a correct-looking
-`--extern tarish_protocol=<valid rlib>` that rustc still could not resolve. Worth another
-look if someone wants the static link; it is not worth blocking on, and `gos-push.sh`
-carries the .so and verifies it.
-
+**Everything about the Quick Share transport is now closed** — see Done. What is left here
+is AirDrop-side discovery, two hardware/policy constraints, and questions to answer before
+writing anything.
+
+This file has now made its own documented mistake twice. The preamble above was written
+because the file used to lead with a blocker that had been fixed for weeks; it then spent
+another stretch leading with "the payload runs over Bluetooth, and it should not", which had
+also been fixed. **Move a section to Done in the same change that closes it**, not later.
 
 ### refreshPeers: the button does nothing, and the first diagnosis was wrong
 
@@ -632,15 +350,17 @@ specific transfer, just now", the transfer does not happen.
   two clients would fight over it. There is one client today and the AIDL is ours.
 
 
-### Understand before implementing: how a peer lists a dual-protocol device ONCE
+### How a peer lists a dual-protocol device ONCE — now LIVE, not hypothetical
 
 **Observed**, on two Android phones that both support AirDrop and Quick Share: the
 receiver lists the sender **once**, not twice. Something correlates the two
 advertisements, and we do not know what.
 
-This has to be understood **before** the Quick Share migration starts, because Tarish
-will be exactly such a device -- speaking AirDrop to Apple peers and Quick Share to
-Android ones -- and getting it wrong means every Android peer sees us twice.
+This was filed as a question to answer before the Quick Share migration started. The
+migration is finished, so **Tarish is now exactly such a device** — speaking AirDrop to
+Apple peers and Quick Share to Android ones, from one process, advertising both. If the
+correlation is something we are getting wrong, an Android peer sees us twice, and nobody has
+looked yet. Check what a peer's list actually shows before assuming it is fine.
 
 What is established: the two identities share **nothing** at protocol level.
 
@@ -712,8 +432,12 @@ listing a device that will refuse.
 
 ### App
 
-- [ ] Share-sheet target, transfer UI, Quick Settings tile
-- [ ] Retire Bada: `gos-app.sh` and `gos-bada.sh` are marked stopgaps
+- [x] Share-sheet target, transfer UI, Quick Settings tile
+- [x] Retire Bada — done; its Quick Share protocol was ported into `tarishsharingd`, and
+      `bada/` is a read-only reference now
+- [ ] BLE advertise on a device whose adapter was cycled — see the beacon entry above
+- [ ] The brand kit's 47 icons and its type system (Archivo / Public Sans, JetBrains Mono
+      for codes, sizes and throughput) are not applied yet; colour, themes and the mark are
 
 ### Rig
 
@@ -721,6 +445,329 @@ listing a device that will refuse.
       See [REVERSE-ENGINEERING.md](REVERSE-ENGINEERING.md).
 
 ## Done
+
+Quick Share is finished as a transport: bidirectional, to Windows and to stock Android,
+with and without a shared network.
+
+|  | shared network | off-network |
+|---|---|---|
+| **send** | 22 MB/s | Wi-Fi Direct 10.5 MB/s (21.6 MB in 2.0s); Bluetooth bootstrap ~150 KB/s |
+| **receive** | 21.6 MB in 0.46s | Wi-Fi Direct, group up in 3.4s on 5 GHz; Bluetooth ~115 KB/s |
+
+`libtarish_protocol` carries 202 tests. The two rules that cost the most to learn:
+**the advertiser hosts the upgrade network and the discoverer joins it** — not sender and
+receiver — and **Wi-Fi LAN is a bootstrap medium, never an upgrade target.**
+
+### The payload ran over Bluetooth — SOLVED, it runs over Wi-Fi Direct now
+
+**Closed.** Kept because the wrong turns in it are the useful part; the outcome is
+in the summary at the top of the Done section, and the mechanism in grapheneos
+docs/BUILD-NOTES.md 47-52.
+
+Quick Share sends work, and they are slow: ~126 KB/s for a 2.7 MB file on frankel. That is
+not the send window and not the framing. **It is the medium.**
+
+Bluetooth is only supposed to carry the BOOTSTRAP -- handshake, PIN, consent. Stock then
+performs a bandwidth upgrade and moves the payload to Wi-Fi Direct, a hotspot, or the LAN.
+It never sends a multi-megabyte file over Bluetooth. We do, because `outbound.rs` answers
+every `UPGRADE_PATH_AVAILABLE` with `UPGRADE_FAILURE`:
+
+    OfflineFrame::BandwidthUpgrade(body) => {
+        // WE CANNOT TAKE ONE, SO SAY SO.
+
+Declining was right when it was written -- an ignored offer leaves the negotiation open
+and the transfer is reported failed with every byte delivered, which is what the Windows
+"cannot complete transfer" was. It is not right as a destination.
+
+**What it needs.**
+
+- **Solicit, do not wait.** Stock GMS receivers never offer an upgrade unprompted: they
+  advertise `autoUpgradeBandwidth: false` and stay idle until the sender sends
+  `BANDWIDTH_UPGRADE_NEGOTIATION{UPGRADE_PATH_REQUEST}`. Bada sends it right after the
+  sharing FSM's first PKE frame, so the receiver's group bring-up overlaps the consent
+  wait rather than following it.
+- **Adopt the offer**, connect on the new medium, then tear the old one down in order:
+  `LAST_WRITE_TO_PRIOR_CHANNEL`, `SAFE_TO_CLOSE_PRIOR_CHANNEL`.
+- **Failure policy**, which is not symmetric: a Bluetooth bootstrap falls back to staying
+  on Bluetooth for anything that goes wrong BEFORE the teardown starts (no offer,
+  malformed offer, adopt timeout). After `LAST_WRITE` it is terminal -- the old channel is
+  no longer safe to stream on.
+
+**The protocol half is already written and tested**: `tarish_protocol::upgrade`, including
+`a_whole_upgrade_completes_on_both_sides`. What is missing is the radio.
+
+**Do WIFI_LAN first.** When both devices are on the same network the upgrade is a TCP
+connection to an address the peer hands us -- no Wi-Fi Direct, no P2P group, no new
+framework surface, and it is the path Windows already offered us unprompted
+(`172.20.9.166:58151`, which we declined). Wi-Fi Direct is the one that matters offline and
+is the bigger piece: `WifiP2pManager` lives in the framework, so like BLE it belongs in the
+app with the daemon driving it over AIDL.
+
+Until then the send window is worth what it is worth and no more: 256 KiB of packets in
+flight keeps the radio busy, but the radio is the ceiling.
+
+### Cancelling — SOLVED, and it was a reporting bug, not a recovery bug
+
+**Closed.** Kept because the wrong turns in it are the useful part; the outcome is
+in the summary at the top of the Done section, and the mechanism in grapheneos
+docs/BUILD-NOTES.md 47-52.
+
+Reported from real use 2026-09-05, after PIN entry, wrong-PIN and both-sides cancel were
+otherwise tested and working.
+
+**The bug, and it is one line.** Enter the right PIN, then decline on the RECEIVER, and the
+sender says the file was sent.
+
+`fsm.rs`, the sender's handling of the peer's answer:
+
+    (State::Introduction, Frame::Response(_)) => {
+        // A refusal is a normal answer, not a failure.
+        self.state = State::Done;
+        vec![Effect::Done]
+    }
+
+and `outbound.rs`, deciding what happened:
+
+    return Ok(fsm.state() == State::Done && total > 0);
+
+A refusal lands in `State::Done`, which is also where a completed transfer lands, so the
+two are indistinguishable at the only place that decides. `total` does not help -- it is
+the size of what we OFFERED, not of what went. So `Ok(true)`, `STATUS_OK`, "Sent".
+
+Treating a refusal as a normal ending is right. Reusing the state that means "the files
+went" is what is wrong.
+
+Two ways to fix it, and the second is better:
+
+1. Track in `outbound::send` whether `Effect::BeginSending` was ever handled, and return
+   that instead of a state comparison. Small, local, and leaves the ambiguity in the FSM
+   for the next caller to trip over.
+2. Give the FSM a distinct terminal state -- `State::Refused` -- so "finished, nothing
+   sent" is not spelled the same as "finished, everything sent". The inbound side can use
+   it too, and the existing test
+   `a_refused_send_finishes_rather_than_failing` becomes the test that pins the
+   difference rather than the one that hides it.
+
+**While in there, the rest of cancelling wants checking.** These were not all exercised:
+
+- receiver cancels MID-TRANSFER, after accepting -- does the sender stop promptly, and
+  report cancelled rather than failed or sent?
+- sender cancels mid-transfer -- does the receiver discard the partial file rather than
+  keep a truncated one?
+- either side cancels during the PIN wait, which now has a 120 s window
+- a cancel that arrives while the L2CAP writer is blocked in `wait_for_room` -- the pacing
+  wait checks `closed` but not the transfer's cancel flag, so it may sit there until the
+  ack timeout
+
+Cancel at the PIN prompt is done and reports "Cancelled" correctly; that one is the model
+for how the others should read.
+
+### Quick Share to a stock Android peer — SOLVED, both directions
+
+**Closed.** Kept because the wrong turns in it are the useful part; the outcome is
+in the summary at the top of the Done section, and the mechanism in grapheneos
+docs/BUILD-NOTES.md 47-52.
+
+Windows works end to end over RFCOMM. A stock Pixel does not, and the reason is that it
+does not accept RFCOMM at all -- **its advertisement says so, and that took far too long
+to notice.**
+
+    PHONE    endpoint='WLTQ' name='K-N6'      EXTRA FIELDS mask=0x01 -> L2CAP PSM 177
+    WINDOWS  endpoint='D7B0' name='K-ProArt'  no extra fields
+
+A peer publishing a PSM refuses RFCOMM -- accepted, closed inside 200 ms, no frame either
+way. A peer publishing none accepts it. Verified with both devices off Wi-Fi entirely, so
+none of this is about the network.
+
+**The L2CAP stack, as far as it is understood.** Every packet is
+`[len:4][service_id_hash:3][payload]`, where `000000` is the control channel and `fc9f5e`
+is ours. In order:
+
+| step | packet | peer's answer |
+|---|---|---|
+| data connection | `[3][fc9f5e]` | `[23]` ready |
+| socket introduction | control `SocketControlFrame{INTRODUCTION, {fc9f5e, V2}}` | accepted |
+| multiplex request | data `[len][MultiplexFrame{CONTROL, CONNECTION_REQUEST}]` | **ack, then DISCONNECTION** |
+
+Each of those was found by being wrong first, and each wrong version failed silently:
+
+- a bare `[3]` with no service hash is answered `[24]`, a refusal
+- asking `[1]` first gets the channel closed without a word
+- skipping the introduction gets every data packet ignored and the channel dropped ~20 s
+  later
+- writing multiplex frames without the `fc9f5e` packet prefix does the same
+
+**NO MULTIPLEX LAYER.** Nearby has one, and this peer does not use it:
+
+    onIncomingConnection(BLE) mode: LEGACY ... failed to initialize the connection
+    java.io.IOException: In readConnectionRequestFrame, expected a CONNECTION_REQUEST
+    v1 OfflineFrame but got a UNKNOWN_FRAME_TYPE frame instead
+
+LEGACY means one service per channel, so the first thing after the introduction is the
+ordinary Nearby CONNECTION_REQUEST. A MultiplexFrame there is acknowledged by byte count
+and the socket then closed, which from the sending side is indistinguishable from being
+refused. `tarish_protocol::multiplex` is kept and tested for peers that do multiplex.
+
+**And the endpoint id must be FOUR CHARACTERS.** Ours was the mDNS instance label --
+`instance_name()` base64url-encodes a ten-byte structure and yields fourteen. Windows
+accepted it for weeks. A Pixel does not, and does not merely refuse:
+
+    FATAL EXCEPTION: highpool[467]
+    Process: com.google.android.gms.persistent
+    java.lang.IllegalArgumentException: ConnectionsDevice's endpoint id must be
+    assigned with length 4.
+
+It takes down `com.google.android.gms.persistent`, so the peer stops answering because the
+service handling us has died. That is why this looked like a protocol refusal for hours.
+
+**Verified 2026-09-05:** L2CAP connect, data connection, introduction, `peer is Android,
+safe-disconnect v4`, PIN, acceptance, 453693 bytes, `transfer 1 complete`.
+
+**HOW IT WAS FOUND, because it is the lesson.** Six rounds of inference from a reference
+implementation got the framing right and then stopped paying. Connecting the receiving
+phone over adb and reading ITS log gave the answer in one line, twice -- the LEGACY mode
+error and the endpoint-id crash. Neither was visible from the sending side, and neither
+was in Bada. **When a peer will not talk to you and you can hold it, read its log first.**
+
+Remaining: the peer rotates its BLE address and PSM every advertisement set, so a row more
+than a few seconds old fails at connect. The app should re-resolve immediately before
+dialing and retry once.
+
+Credit for the whole layer: Bada's `BleL2capInitialControlClient`, `NearbyBleSocketFrames`
+and `ble_frames.proto`.
+
+### Quick Share offline: RFCOMM — SOLVED, and it is only the bootstrap
+
+**Closed.** Kept because the wrong turns in it are the useful part; the outcome is
+in the summary at the top of the Done section, and the mechanism in grapheneos
+docs/BUILD-NOTES.md 47-52.
+
+Established by testing against two real peers 2026-09-04, then by reading Bada 2026-09-05.
+
+| peer | RFCOMM connect | then |
+|---|---|---|
+| Windows Quick Share | accepted | full UKEY2 handshake, encrypted channel, then "cannot complete transfer" |
+| Android Quick Share (two devices) | accepted | **ignores everything** — never answers the ConnectionRequest |
+
+**The first version of this entry concluded the door was wrong, and that was wrong.** It
+said the initial control connection had to be BLE L2CAP or GATT wrapped in a MultiplexFrame
+stream, and laid out four steps starting with extracting a PSM. Reading Bada instead of
+inferring from the symptom says otherwise, on three separate pieces of evidence:
+
+- Its send-route priority is **LAN → RFCOMM → BLE L2CAP → BLE GATT** (`SendBootstrapPlan`),
+  so RFCOMM outranks both BLE routes for exactly the peer we were testing against.
+- `UserFacingMediumFeatures.BLUETOOTH_CLASSIC_BOOTSTRAP_ROUTE_ENABLED` is `true`, and its
+  comment records *why*: "Stock GMS receivers bootstrap off-LAN over RFCOMM (verified by
+  HCI snoop of stock-to-stock transfers); their BLE GATT/L2CAP server paths are unreliable
+  because stock senders never exercise them."
+- `useNearbyMultiplexInitialTransport` defaults to `false` and no caller sets it. Multiplex
+  is a **LAN** option, and the transport-based constructor hardcodes it off. Nothing
+  multiplexes an RFCOMM bootstrap.
+
+And the peers agree: our captured Android advertisements are the fast form, which carries
+no PSM at all. Bada's own runbook expects exactly that —
+`rejected=[wifi-lan=missing, ble-l2cap=peer-psm-missing]`.
+
+So the socket was right. **What was wrong was the ConnectionRequest, in five places** — all
+fields a stock Android receiver requires and none of which produce an error when absent:
+
+| field | what it is | absent means |
+|---|---|---|
+| `endpoint_info` | **we sent an empty vector** | the receiver builds its "X wants to share" prompt from this. Empty leaves it with a request it cannot show anyone |
+| `medium_metadata` (7) | this device's radios | request is not dispatched |
+| `connections_device` (12) | endpoint id + info again, inside the `Device` oneof | read in preference to the flat fields |
+| `multiplex_socket_bitmask` (5, response) | present and **zero** | Samsung One UI 8.0.5 FINs ~104 ms after our ACCEPT |
+| `safe_to_disconnect_version` (7, response) | 1 | One UI 7+ drops us before the consent dialog |
+
+`keep_alive_timeout_millis` was also 30 s where stock is 600 s, in both the request and
+(newly) the response — the field was added to `ConnectionResponseFrame` in Dec 2024 and a
+Galaxy S24 Ultra FINs ~150 ms without it.
+
+Every one of these is silent. That is why the symptom was a socket that connects and then
+does nothing, and why it read as the wrong transport. Fixed in `frames.rs`; the two
+derived fields are built inside `connection_request` rather than taken from the caller, so
+no caller can omit them again. Five tests assert presence against the encoded bytes,
+because a round-trip test cannot catch this — our own parser is happy either way, which is
+how they came to be missing.
+
+Credit for all of it: Bada's `OutboundFrames`, whose comments record each field against the
+device that needed it.
+
+**Then four more of the same kind, from the same source** — Bada's `AGENTS.md` is a list of
+requirements discovered one device at a time, and each of these fails without an error:
+
+- **The ConnectionResponse exchange is send-first, then receive.** We read the peer's
+  before sending ours. Against a peer that does the same, that is a plain deadlock: both
+  sides block on a read until one times out. Windows happens to send first, which is
+  exactly why it was the only peer that ever got past this point.
+- **A FILE payload's LAST_CHUNK terminator is its own frame** — empty body, offset =
+  total size — and so is a BYTES payload's. We fused body and flag into one frame in both
+  paths. Our own receiver reads that correctly, so it round-trips in tests and looks right
+  on the wire; a stock receiver reassembles nothing from it. Every sharing frame goes
+  through the BYTES path, so an introduction sent that way reaches the peer and produces
+  no accept prompt.
+- **`IntroductionFrame.use_case` must be NEARBY_SHARE**, and each `FileMetadata.id` must
+  equal its `payload_id`. Ours numbered attachments 1..n. Samsung keys its receive-side
+  bookkeeping on `id` and discards an attachment it cannot match.
+- **The DisconnectionFrame must set `request_safe_to_disconnect`**, and the sender must
+  wait for the ack before closing. Having advertised `safe_to_disconnect_version = 1`, a
+  bare close is a broken promise: the FIN arrives before the peer drains its read pipeline
+  and every payload still in there is marked failed — so the transfer succeeds on our side
+  and fails on theirs.
+
+That last one only became a requirement *because* we started advertising the version, so
+it and the response fields have to land together.
+
+**Untested on hardware.** Windows got further than Android on the old shape, so it may
+still fail at the same place; if it does, the next suspect is unchanged — see below.
+
+**What is NOT wrong, and should not be re-litigated:** the crypto. Against Windows the
+plaintext handshake completes, the channel comes up, the peer is identified and a session
+PIN derives. HKDF is on RFC vectors, D2D derivation and AES-CBC on Bada's. The remaining
+Windows-side failure is most likely the SecureMessage envelope, the one layer in that path
+with no foreign-implementation vector.
+
+
+### Quick Share: the socket — DONE, all four quadrants run on hardware
+
+**Closed.** Kept because the wrong turns in it are the useful part; the outcome is
+in the summary at the top of the Done section, and the mechanism in grapheneos
+docs/BUILD-NOTES.md 47-52.
+
+`libtarish_protocol` is complete and covered by 127 tests, including one that runs a whole
+share between two peers in-process — UKEY2 handshake, key derivation, encrypted channel,
+paired-key exchange, introduction, acceptance, a 300 KB file in 64 KiB chunks,
+reassembled and compared byte for byte. `quickshare::connection::serve` is the I/O loop
+around it and compiles into the daemon.
+
+Three things stand between that and receiving a file on hardware:
+
+1. **A `Host` implementation.** `serve` needs four methods. `ask` should reuse the
+   existing `Transfers::await_answer`, which is what already makes the AirDrop prompt
+   work — the app needs no change, and `onTransferOffered` already carries
+   `PROTOCOL_QUICKSHARE` so the prompt badges itself correctly. `create` must sanitise
+   the peer's filename: `httpd::safe_leaf` and `httpd::non_clobbering` already do exactly
+   this for AirDrop and should be made `pub(crate)` and reused rather than reimplemented.
+
+2. **A TCP listener on wlan0**, on the port the mDNS record advertises, spawning a thread
+   per connection into `serve`. Gate it on the Quick Share policy — the daemon already
+   holds `policy.quickshare`, and `allows_receive` is the check.
+
+3. **mDNS advertising.** Discovery today only BROWSES. Nothing can find this device as a
+   Quick Share endpoint until it publishes an SRV, TXT and A record for
+   `_FC9F5ED42C8A._tcp` on wlan0. The identity layer for it is done (`quickshare::mod`
+   has the instance encoding, endpoint id and TXT keys, verified against Windows Quick
+   Share); what is missing is the responder.
+
+Only (3) is real protocol work; (1) and (2) are plumbing. Sending — the outbound
+direction — needs the same three plus `fsm::Outbound`, which is written and tested.
+
+**Not blocking, but worth knowing:** `libtarish_protocol` is a dylib rather than an rlib.
+It was declared `rust_library_rlib` first and Soong emitted a correct-looking
+`--extern tarish_protocol=<valid rlib>` that rustc still could not resolve. Worth another
+look if someone wants the static link; it is not worth blocking on, and `gos-push.sh`
+carries the .so and verifies it.
+
 
 ### 6 GHz shares 5 GHz's radio chain — ANSWERED, the grouping was right
 
