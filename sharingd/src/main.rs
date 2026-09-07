@@ -2677,7 +2677,12 @@ struct QsHost {
 }
 
 impl quickshare::connection::Host for QsHost {
-    fn ask(&self, from: &str, files: &[tarish_protocol::sharing::FileMetadata]) -> bool {
+    fn id(&self) -> i64 {
+        self.id
+    }
+
+
+    fn ask(&self, transfer_id: i64, from: &str, files: &[tarish_protocol::sharing::FileMetadata]) -> bool {
         let names: Vec<String> = files.iter().map(|f| f.name.clone()).collect();
         let total: i64 = files.iter().map(|f| f.size.max(0)).sum();
 
@@ -2713,7 +2718,13 @@ impl quickshare::connection::Host for QsHost {
         }
         // A person has to pick the phone up and read it. Shorter than the sender's own
         // patience would make us the reason it failed.
-        match self.transfers.await_answer(self.id, Duration::from_secs(60)) {
+        // WAIT ON THE ID THE CLIENT WAS TOLD, not this connection's own id. They are two
+        // different slots -- main.rs mints one for QsHost and connection.rs mints another
+        // for the offer it announces -- and await_answer drops any answer whose id does
+        // not match, on purpose. So respondToOffer() could never satisfy this wait and
+        // every incoming Quick Share transfer ended "timed out unanswered — refused",
+        // with the sender reporting a clean send and the receiver keeping nothing.
+        match self.transfers.await_answer(transfer_id, Duration::from_secs(60)) {
             Some(accepted) => {
                 log::info!("quickshare: offer from {from} {}", if accepted { "accepted" } else { "declined" });
                 accepted

@@ -47,8 +47,22 @@ use std::time::Duration;
 /// What the daemon must provide. Kept to four things so this module can be exercised
 /// with an in-memory implementation.
 pub trait Host {
+    /// The transfer id this connection is already registered under.
+    ///
+    /// ONE id per transfer. This file used to mint a second with `transfers.begin()` for
+    /// the offer it announced, so the client tracked one number and the daemon tracked
+    /// another: accepts were dropped, and progress, completion and cancellation were all
+    /// reported against an id the client had never heard of.
+    fn id(&self) -> i64;
+
     /// Ask the person. Blocks until they answer or it times out. `false` means refuse.
-    fn ask(&self, from: &str, files: &[FileMetadata]) -> bool;
+    ///
+    /// `transfer_id` IS THE ID THE CLIENT WAS TOLD, and the host must wait on exactly it.
+    /// It used to be absent, so QsHost waited on its own connection id while
+    /// onTransferOffered announced a different one -- and Transfers::await_answer drops
+    /// answers whose id does not match, deliberately, so every accept was discarded and
+    /// every incoming Quick Share transfer timed out "unanswered".
+    fn ask(&self, transfer_id: i64, from: &str, files: &[FileMetadata]) -> bool;
     /// Open somewhere to put a file, given the name the PEER chose.
     ///
     /// The implementation must treat that name as hostile -- this is the only place that
@@ -566,7 +580,8 @@ where
                 }
                 Effect::AskUser(intro) => {
                     total_bytes = intro.total_size().max(0) as u64;
-                    transfer_id = transfers.begin(false);
+                    // NOT transfers.begin() -- see Host::id.
+                    transfer_id = host.id();
                     let names: Vec<String> = intro.files.iter().map(|f| f.name.clone()).collect();
                     info!(
                         "quickshare: offer {transfer_id} from {peer_name:?}: {} file(s) {names:?}",
@@ -584,7 +599,7 @@ where
                         )
                     });
 
-                    let accepted = host.ask(&peer_name, &intro.files);
+                    let accepted = host.ask(transfer_id, &peer_name, &intro.files);
                     // Fed back as an EVENT. The machine will not accept on its own under
                     // any sequence of peer frames, which is the property the prompt
                     // exists for.
