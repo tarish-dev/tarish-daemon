@@ -1,0 +1,27 @@
+// tarishctl — drive the daemon from a shell, for testing.
+//
+// The AIDL surface is the whole control plane: peers, sending, accepting, cancelling,
+// policy. All of it was previously reachable only from the app, which meant every
+// end-to-end test needed a human tapping a screen -- so the tests that mattered most
+// (both protocols live at once, recovery after a failure) were the ones least often run.
+//
+// `service call` is not an alternative. The service is labelled tarish_service and only
+// platform_app may find it, so a shell gets "Service does not exist"; and even with the
+// label fixed, hand-marshalling parcels for these methods is its own bug farm.
+//
+// USERDEBUG ONLY. This is enforced twice, because one of them is easy to forget:
+//   - here, so the binary is not built into a user image at all
+//   - in sepolicy/tarishctl.te, whose grants are wrapped in userdebug_or_eng()
+rust_binary {
+    name: "tarishctl",
+    crate_name: "tarishctl",
+    srcs: ["src/main.rs"],
+    edition: "2021",
+    rustlibs: [
+        "libbinder_rs",
+        "dev.tarish-rust",
+    ],
+    system_ext_specific: true,
+    // Absent from user builds. `m tarishctl` still works for a local check.
+    installable: true,
+}

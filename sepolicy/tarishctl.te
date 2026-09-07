@@ -1,0 +1,26 @@
+# tarishctl — shell access to the daemon, for testing. USERDEBUG AND ENG ONLY.
+#
+# tarish_service is findable by platform_app and nothing else, which is correct: the
+# control plane can start a transfer and accept an incoming one, so it is not something
+# an arbitrary uid should reach. That also means `adb shell` gets
+#
+#     Service dev.tarish.ITarishService/default does not exist
+#
+# even though `service list` shows it -- service_manager reports "not found" rather than
+# "not permitted", so the refusal does not look like a permission problem at all.
+#
+# These grants are wrapped in userdebug_or_eng() so they cannot reach a user build. That
+# wrapper is the whole safety story here; without it this file would hand every shell on
+# a production device the ability to send files off it.
+userdebug_or_eng(`
+    allow shell tarish_service:service_manager find;
+    binder_call(shell, tarishsharingd)
+    binder_call(tarishsharingd, shell)
+
+    # Sending needs the daemon to read the file descriptors the shell passes it. Without
+    # this the transfer starts and reads zero bytes, which presents as the peer rejecting
+    # an empty file rather than as a policy denial.
+    allow tarishsharingd shell:fd use;
+    allow tarishsharingd shell_data_file:file { read getattr };
+    allow tarishsharingd shell_data_file:dir search;
+')
