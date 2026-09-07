@@ -10,6 +10,7 @@
 
 use binder::Strong;
 use dev_tarish::aidl::dev::tarish::ITarishService::ITarishService;
+use dev_tarish::aidl::dev::tarish::TarishPolicy::TarishPolicy;
 
 const SERVICE: &str = "dev.tarish.ITarishService/default";
 
@@ -35,6 +36,9 @@ fn usage() -> ! {
   cancel <transfer-id>        cancel a transfer in flight
   received                    list files this device has received
   refresh                     re-run discovery
+  policy                      print the current policy
+  policy pin <on|off>         require a PIN before sending, or do not
+  policy mode <0|1|2|3>       set both protocols: off / contacts / everyone / ...
 
 Ids are opaque; take them from `peers` and from the daemon log."
     );
@@ -115,6 +119,35 @@ fn run() -> Result<(), String> {
             }
         }
         "refresh" => svc.refreshPeers().map_err(|e| e.to_string())?,
+        // Testing a transfer end to end means answering the PIN, and a harness that
+        // scrapes it out of logcat races the log. Turning the requirement off makes the
+        // transport testable on its own; leaving it on is what a person gets.
+        "policy" => {
+            let mut p: TarishPolicy = Default::default();
+            p.airdrop = 3;
+            p.quickshare = 3;
+            p.requireConfirmation = true;
+            match (args.get(1).map(String::as_str), args.get(2).map(String::as_str)) {
+                // NO READBACK. There is no getter on the interface, and printing the
+                // defaults this command was about to send would be inventing an answer:
+                // it read "confirm=true" immediately after successfully setting it false.
+                // The daemon logs the real thing when it changes -- grep its log for
+                // "policy: airdrop=... confirm=..." -- so say that instead of guessing.
+                (None, _) => {
+                    return Err("no getter on the interface; read the daemon's log line \
+                                \"policy: airdrop=.. quickshare=.. confirm=..\" instead"
+                        .into());
+                }
+                (Some("pin"), Some(v)) => p.requireConfirmation = v == "on",
+                (Some("mode"), Some(v)) => {
+                    let m: i32 = v.parse().map_err(|_| "mode takes a number")?;
+                    p.airdrop = m;
+                    p.quickshare = m;
+                }
+                _ => usage(),
+            }
+            svc.setPolicy(&p).map_err(|e| e.to_string())?;
+        }
         _ => usage(),
     }
     Ok(())
