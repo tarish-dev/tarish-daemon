@@ -582,17 +582,50 @@ impl Httpd {
 
     /// Unpack a received archive into the inbox.
     ///
-    /// The payload is Apple's block-framed compression wrapper around a cpio archive in
-    /// the odc dialect -- see framed.rs for the container and why it is not gzip.
+    /// A cpio archive in the odc dialect, inside one of TWO containers.
+    ///
+    /// Apple sends its own block-framed compression wrapper -- see framed.rs for the
+    /// format and why it is not gzip. But `send.rs` emits an ORDINARY GZIP STREAM,
+    /// deliberately, because that is what opendrop sends and what interoperates with
+    /// macOS. So the two halves of Tarish disagreed about the container, and this
+    /// function only understood the Apple one.
+    ///
+    /// The effect was invisible in every test that existed: Tarish -> Mac worked (macOS
+    /// accepts gzip) and Mac -> Tarish worked (framed), so both directions passed against
+    /// a real Apple peer. Only Tarish -> Tarish failed, and nothing exercised that until
+    /// two devices were driven from a script. Every byte arrived -- "524594 bytes
+    /// received" -- and was then thrown away with "block of 529205248 bytes exceeds the
+    /// 8388608 cap", which is gzip payload misread as a cpio size field.
+    ///
+    /// Sniff rather than assume. The two containers are trivially distinguishable by
+    /// their first two bytes and a peer is not obliged to tell us which it used.
     fn extract(&self, archive: &str) -> std::io::Result<Vec<String>> {
         // `new`, `read_next` and `finish` come from the CpioReader trait, so it has to
         // be in scope even though it is never named below.
         use cpio_archive::CpioReader as _;
 
+        let mut magic = [0u8; 2];
+        {
+            use std::io::Read as _;
+            let mut probe = std::fs::File::open(archive)?;
+            // A short read is not an error here: an empty or truncated archive should
+            // fall through to the reader and fail there with a cpio message, rather than
+            // being reported as a compression problem it never had.
+            let _ = probe.read(&mut magic)?;
+        }
+        let gzipped = magic == [0x1f, 0x8b];
+        info!(
+            "/Upload: container is {}",
+            if gzipped { "gzip" } else { "Apple block-framed" }
+        );
+
         let f = std::fs::File::open(archive)?;
-        let mut r = cpio_archive::odc::OdcReader::new(std::io::BufReader::new(
-            crate::framed::FramedReader::new(f),
-        ));
+        let inner: Box<dyn std::io::Read> = if gzipped {
+            Box::new(flate2::read::GzDecoder::new(f))
+        } else {
+            Box::new(crate::framed::FramedReader::new(f))
+        };
+        let mut r = cpio_archive::odc::OdcReader::new(std::io::BufReader::new(inner));
         let mut names = Vec::new();
 
         loop {
