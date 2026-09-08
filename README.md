@@ -176,11 +176,17 @@ adb shell 'ls /sys/class/ieee80211/'     # a `wonder` wiphy is the real test
 | `rango` | Pixel 10 Pro Fold | unverified | unverified | expected to work |
 | `stallion` | Pixel 10a | no `wonder.ko` at all | ❌ impossible | ✅ |
 
-**On BCM4383 (Pixel 10) AirDrop works but is not practical.** There is no `wondertap`, so
-AWDL falls back to a radiotap path that takes the physical radio and wedges Wi-Fi until a
-reboot. Discovery and transfers are fine; *sharing and Wi-Fi at the same time* is not.
-Quick Share needs no AWDL and is unaffected — so on exactly the hardware where AirDrop
-cannot be used, the other half still works.
+**On BCM4383 (Pixel 10) the radio is exclusive.** There is no `wondertap`, so AWDL falls
+back to a radiotap path that takes the physical radio: Wi-Fi drops within about ten seconds
+of AirDrop becoming active, and comes back on its own **10-24 seconds after AirDrop is
+switched off**. Measured over repeated cycles, with the association on 5520 MHz and the
+band correctly reported to the daemon — so this is the silicon, not a band-selection
+mistake, and no software change reaches it.
+
+That is a tradeoff rather than a trap: *sharing and Wi-Fi at the same time* is not
+available on this chip, but nothing needs a reboot and nothing stays broken. Quick Share
+needs no AWDL and is unaffected throughout — so on exactly the hardware where AirDrop is
+awkward, the other half is untouched.
 
 **The Pixel 10a can never do AirDrop.** Its image ships no `wonder.ko`. It still ships
 `mosey_server` and the Mosey app, so finding those proves nothing. Quick Share works.
