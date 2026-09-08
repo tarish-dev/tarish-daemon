@@ -240,10 +240,23 @@ Two devices, driven from a script, no screen taps:
 
 ```bash
 tarishctl peers                     # what this device can see
-tarishctl send <peer-id> <file>     # start a transfer
+tarishctl send <peer-id> <file>     # start a transfer over AirDrop
+tarishctl send-lan <peer-id> <file> # ...or over Quick Share on the LAN
 tarishctl accept <transfer-id>      # answer an offer
+tarishctl policy                    # read the daemon's live policy
 tarishctl policy pin off            # for transport tests
+tarishctl policy airdrop 0          # one protocol only — see below
 ```
+
+**Read the policy back rather than assuming it.** `tarishctl policy` asks the daemon; the
+radio cannot answer the question, because the AWDL session outlives visibility by about
+half a minute, so `mosey0` being up is equally consistent with AirDrop on and with AirDrop
+having just been switched off.
+
+`policy airdrop <mode>` and `policy quickshare <mode>` exist because the interesting case
+is exactly one protocol off, which a single "both to the same mode" cannot express. On a
+device whose radio cannot hold AWDL and Wi-Fi at once, AirDrop has to go off before Quick
+Share has a transport at all.
 
 `tarishctl` is **userdebug and eng only**, enforced in the makefile and again in SELinux
 policy — it can start a transfer and accept an incoming one, which is not something a shell
