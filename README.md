@@ -3,330 +3,257 @@
 **AirDrop and Quick Share on Android, with no Google Play Services — sandboxed or
 otherwise — and no Google account.**
 
-Send a file to a MacBook from a GrapheneOS phone that has never spoken to Google. The Mac
-shows a real device name and a normal AirDrop prompt; the phone shows a normal share
-sheet. Nothing signs in, nothing checks in, and no Google application is installed.
+Send a file to a MacBook from a phone that has never spoken to Google. The Mac shows a real
+device name and a normal AirDrop prompt; the phone shows a normal share sheet. Send to a
+Windows laptop or another Android phone and Quick Share does the same. Nothing signs in,
+nothing checks in, and no Google application is installed.
 
-That is working today, both directions, under SELinux enforcing. Quick Share — the
-Android and Windows side — is in progress: its protocol is complete and tested, and
-discovery finds real devices over BLE with no network at all.
+Two repositories:
+
+| | |
+|---|---|
+| **tarish-daemon** (this one) | the transports, the protocols, the SELinux policy, integration |
+| [**tarish-app**](https://github.com/tarish-dev/tarish-app) | the share sheet, the prompts, and the radio work only the framework can do |
+
+---
+
+## Status
+
+Verified on hardware, under SELinux **enforcing**, on a build with **zero Google
+applications installed**.
+
+| | AirDrop (Apple) | Quick Share (Android / Windows) |
+|---|---|---|
+| discovery | ✅ AWDL + mDNS | ✅ mDNS on Wi-Fi, BLE off-network |
+| send | ✅ | ✅ |
+| receive | ✅ | ✅ |
+| shared network | ✅ | ✅ 22 MB/s measured |
+| off-network | ✅ AWDL is its own link | ✅ Wi-Fi Direct 10.5 MB/s; Bluetooth ~150 KB/s bootstrap |
+| both protocols at once | ✅ verified concurrently, no degradation |
+
+Interoperability is tested against **real peers, not only against ourselves**: macOS and
+iOS for AirDrop, Windows 11 and stock Android for Quick Share. That distinction has caught
+bugs that no amount of self-testing would — see *Testing* below.
+
+---
 
 ## Why, when sandboxed Play Services exists
 
 GrapheneOS's sandboxed Play Services is excellent, and it is not an answer to this.
 
-**It cannot do AirDrop at all.** AirDrop needs Google's `mosey` stack running with
-platform privileges. Getting it working the other way — the route this project took
-first — required *privileged* Google Play Services, not the sandboxed kind, plus a
-successful check-in to Google's servers to receive the feature flag that enables it. That
-is a long way from "install an app".
+**It cannot do AirDrop at all.** AirDrop needs Google's `mosey` stack running with platform
+privileges. Getting it working that way — the route this project took first — required
+*privileged* Play Services, not the sandboxed kind, plus a successful check-in to Google's
+servers to receive a feature flag. That is a long way from "install an app".
 
-**And for many people the objection is not the sandbox, it is the code.** A sandboxed
-Play Services is still Google's code running on your device. Plenty of people who choose
-GrapheneOS do not want it there in any form, at any privilege level. That is a legitimate
-position and it should not cost you file sharing with the people around you.
+**And for many people the objection is not the sandbox, it is the code.** Sandboxed Play
+Services is still Google's code on your device. Plenty of people who choose a
+de-Googled OS do not want it there in any form, at any privilege level. That is a
+legitimate position and it should not cost you file sharing with the people around you.
 
-Tarish needs no Play Services, no Google account, no check-in, and no network path to
-Google. It works on a build with zero Google applications installed.
+---
 
-## What is ours, and what comes from the vendor image
+## The layers, per protocol
 
-Being precise about this matters more than the line count, so here is the whole stack.
+Being precise about what is ours and what is the vendor's matters more than the line count.
 
-**AirDrop** leans on two Google binaries for the radio, and nothing above it:
+### AirDrop
 
-| Layer | Whose |
-|---|---|
-| Radio and MAC — `wonder.ko` | **vendor** (Google/Broadcom kernel module) |
-| AWDL protocol — election, sync, peers, action frames — `libmosey_daemon_ffi.so` | **vendor** (Google userspace blob) |
-| Lifecycle, privilege split, the AWDL interface, routing | **ours** |
-| mDNS `_airdrop._tcp` — advertise, browse, resolve | **ours** |
-| TLS listener and the HTTPS server | **ours** |
-| The AirDrop protocol — `/Discover`, `/Ask`, `/Upload`, Apple plists | **ours** |
-| cpio extraction, the inbox, the consent prompt | **ours** |
-| BLE beacon, share sheet, UI | **ours** |
+| layer | whose | notes |
+|---|---|---|
+| radio and MAC — `wonder.ko` | **vendor** | Google/Broadcom kernel module, already in the stock image. **Zero AWDL protocol strings in it** |
+| AWDL protocol — `libmosey_daemon_ffi.so` | **vendor** | election, sync, peer discovery. 51 protocol strings. This is the piece an OWL-style reimplementation would replace |
+| IP on `mosey0` | ours | including the routing that Android's fwmark model requires |
+| mDNS, TLS, HTTP, Apple's plist dialect, cpio | **ours** | `tarishsharingd` |
+| share sheet, prompts, consent | **ours** | the app |
 
-Both blobs already ship in the vendor image of supported Pixels. Tarish does not install
-them, and a phone running Tarish has nothing on it that a stock phone does not — they are
-radio drivers, not Play Services. Replacing them with an open AWDL implementation is
-possible, and is why the FFI is isolated behind a single file, but it is not what Tarish
-does today.
-
-**Quick Share uses no vendor blobs at all.** Every layer is ours:
-
-| Layer | |
-|---|---|
-| BLE discovery — wake-up pulse and endpoint advertisement | ours |
-| UKEY2 handshake — commitment, P-256 ECDH, key confirmation | ours |
-| D2D key derivation, SecureMessage envelope | ours |
-| Secure channel — traffic keys, sequence numbers, replay refusal | ours |
-| Length-prefixed framing, Nearby Connections offline frames | ours |
-| Payload reassembly, with its bounds checks | ours |
-| Nearby Sharing frames — introduction, response, paired key | ours |
-| Ordering state machines, bandwidth upgrade | ours |
-| Bluetooth transport, socket handling | ours |
-
-That half is **6,600 lines of Rust with 163 tests**, including one that runs a whole
-share between two peers inside a single process: handshake, key derivation, encrypted
-channel, introduction, acceptance, and a file in chunks, reassembled and compared byte
-for byte.
-
-Some of it could not be captured off the air and had to be derived — the RFCOMM service
-UUID a peer listens on never appears in a packet, and the BLE advertisement's field
-layout is documented nowhere public. Where a value came from someone else's work, the
-comment beside it says whose.
-
-## Status
-
-**Bidirectional AirDrop with a Mac, on a GrapheneOS build with no Google
-applications installed, under SELinux enforcing.** Files go both ways, the peer
-shows a real device name, and an incoming transfer has to be accepted by a person.
-
-```
-init.svc.tarishd        = running     u:r:tarishd:s0        user system
-init.svc.tarishsharingd = running     u:r:tarishsharingd:s0 user system_ext_tarish
-
-tarishd:        AWDL session up, handle=0xc00c19599c6bc80, channel=149, country=QA
-tarishd:        rule: oif mosey0 lookup 54
-tarishsharingd: AirDrop server up as "Pixel 10 Pro XL"
-tarishsharingd: advertising as 7249a325a6b8._airdrop._tcp.local
-tarishsharingd: peer 4d1a2c9f8e70 at fe80::… is "K-MBProM5"
-
-notifications ........ 0
-```
-
-| | state |
-|---|---|
-| AWDL bring-up, routing, peers | working |
-| mDNS browse + advertise, with withdrawal | working |
-| TLS, `/Discover`, `/Ask`, `/Upload` | working |
-| receive from a Mac, cpio + AppleDouble extraction | working |
-| send to a Mac, gzip payload, decline reported | working |
-| per-transfer accept/decline prompt | working |
-| radio held only while something wants it | working |
-| AWDL + Wi-Fi at the same time | **chip-dependent** — see below |
-| contacts-only AirDrop | **not implemented, not planned** — it needs a real Apple contact certificate, which expires. Everyone-mode only. |
-
-### AWDL and Wi-Fi share one radio
-
-Tarish puts AWDL in the **opposite band** from the Wi-Fi association: 2.4 GHz when Wi-Fi
-is on 5 GHz and vice versa. The frequency comes from the client through `setActive`,
-because both daemons are native and neither can see the Wi-Fi state.
-
-That is sufficient on **BCM4390** (Pixel 10 Pro XL), where `wondertap` exists,
-`wonder.ko` binds, and AWDL runs on its own wiphy. Verified with both live for 90
-seconds continuously.
-
-It is **not** sufficient on **BCM4383** (Pixel 10), which has no `wondertap`. Tarish
-falls back to driving `radiotap0`, a monitor interface that takes the physical radio
-with it whatever channel is requested — AWDL works, discovery and transfers work, and
-Wi-Fi drops and does not return until the device reboots.
-
-Check the chip, not the model. Every Pixel 10 image ships both drivers:
-
-```bash
-adb shell 'lsmod | grep bcmdhd'        # 4390 = concurrent, 4383 = exclusive
-adb shell 'ls /sys/class/ieee80211/'   # a `wonder` wiphy is the real test
-```
-
-Whether this is inherent to the chip or an artefact of hardcoding
-`is_dbs_supported=true` is the open question — see docs/TODO.md.
-
-### The radio is held on demand
-
-`tarishd` does not hold AWDL from boot any more. An idle session costs **6.5% of a
-core continuously** — `libmosey` runs its own threads inside whichever process
-holds the handle — so the session follows `tarish.awdl.wanted`, which
-`tarishsharingd` sets from *a client is on screen, or a transfer is running, or we
-are advertising*. Released, `tarishd` costs 0.05%.
-
-`tarishd` itself is still started once by `init` at boot and never restarted; only
-the session comes and goes. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for
-why it is a property and not `ctl.start` or binder.
+Both vendor blobs **already ship in the Pixel vendor image** and run on a build with no
+Google packages, so using them adds nothing to the device that was not already there.
+Replacing them is a separate, not-yet-started track.
 
 ### Quick Share
 
-The second protocol, for Android and Windows peers, is in progress. The **protocol is
-complete and tested** — `libtarish_protocol` is 6,600 lines of Rust with 157 tests,
-including one that runs a whole share between two peers in a single process: UKEY2
-handshake, key derivation, encrypted channel, introduction, acceptance, and a file in
-chunks, reassembled and compared byte for byte.
+Entirely ours, top to bottom — there is no vendor component.
 
-Discovery over BLE works against real devices: a Windows machine running Quick Share is
-found by name with no network involved at all.
+| layer | where |
+|---|---|
+| BLE advertise and scan | **app** (framework Bluetooth is unreachable from a native daemon) |
+| mDNS discovery on `wlan0` | daemon |
+| Bluetooth RFCOMM / L2CAP socket | **app**, handed to the daemon as an fd |
+| Wi-Fi Direct group | **app** (`WifiP2pManager` is framework API), socket handed over |
+| UKEY2 handshake, D2D keys, SecureMessage | daemon — `libtarish_protocol` |
+| secure channel, sequence numbers, replay refusal | daemon |
+| offline frames, payload reassembly, sharing FSM | daemon |
+| bandwidth upgrade negotiation | daemon decides, app provides the radio |
 
-What is not finished is the transport plumbing — an mDNS responder for the same-network
-case, and the Wi-Fi Direct half of the no-network case. See
-[docs/TODO.md](docs/TODO.md).
+`libtarish_protocol` is deliberately **Android-free** so it is testable on a build host.
+202 tests, including one that runs a whole share between two peers in-process: handshake,
+key derivation, encrypted channel, introduction, acceptance, a file in chunks, reassembled
+and compared byte for byte.
 
-## Clients
+---
 
-The daemon owns the client contract, in `aidl/dev/tarish/`:
+## Decisions worth explaining
 
-```
-ITarishService.aidl    getStatus, setDiscoverable, setActive, getPeers, sendFiles,
-                     respondToOffer, cancelTransfer, getReceivedFiles,
-                     openReceivedFile, deleteReceivedFile,
-                     register/unregisterCallback, refreshPeers,
-                     setPolicy, getPolicy, setDeviceName, getDeviceName,
-                     reportBlePeer
-ITarishCallback.aidl   onPeerFound/Lost, onTransferOffered/Progress/Finished
-```
+These are the ones that look odd until you know why.
 
-It lives here rather than in the client because the daemon is the server: it
-defines the protocol and a client is written against it. [Tarish
-app](https://github.com/tarish-dev/tarish-app) consumes these files directly instead of
-keeping its own copy,
-so the two cannot drift apart silently.
+### `tarishsharingd` runs as its own uid, and that costs a framework patch
 
-Two rules the contract encodes deliberately:
+The daemon is uid **7500 `system_ext_tarish`**, declared in `config/tarish_aid.txt`.
 
-- **Discoverability is daemon state, not app state.** It survives a client that is
-  merely rebinding. It does not survive the radio being released — see
-  `setActive`, which is a separate signal on purpose, because a client that is
-  *sending* is not discoverable and needs the link more than ever.
-- **Every callback is `oneway`.** The daemon must never block on a UI process
-  that may be slow, frozen, or about to be killed. A client that is not running
-  is the normal case, not an error.
+The split is a privilege boundary. `tarishd` holds the AWDL link and needs
+`CAP_NET_ADMIN`; `tarishsharingd` parses input from strangers and holds **no capabilities
+at all**. Everything that touches a remote byte lives in the process that can do the least.
 
-## How it works
+The AID alone is not enough to reach `wlan0`. Since Android B, only uid 0 and uid 1000 may
+touch the local network; every other uid needs a bit in a BPF map that `PermissionMonitor`
+derives from **packages** — so a native daemon can never earn it, and mDNS `sendto()` fails
+with `EPERM`. The grant is a one-line framework patch
+(`patches/packages_modules_Connectivity/`) that hardcodes 7500 and grants exactly
+`PERMISSION_BIT_ACCESS_LOCAL_NETWORK` and nothing else.
 
-```
-app  --binder-->  tarishsharingd  --property-->  tarishd  --dlopen-->  libmosey
-     setActive()                 tarish.awdl.wanted
+This only ever affected Quick Share. AirDrop rides `mosey0`, which is not a managed network
+and is not gated — which is why the daemon did mDNS correctly for a long time before this
+surfaced. The failure is silent: the daemon starts, advertises, and never sends. The
+installer refuses to proceed if the patch and `tarish_aid.txt` disagree about the number.
 
-init  --(sys.boot_completed)-->  tarishd        (once, and never restarted)
-                                   |  wait for tarish.awdl.wanted
-                                   |
-                                   |  on 1:  mosey_start_5(channels, country, config, ...)
-                                   |             -> wonder.ko over nl80211
-                                   |             -> mosey0 appears with a link-local address
-                                   |         RTM_NEWROUTE  fe80::/64 dev mosey0 table <ifindex>
-                                   |         RTM_NEWRULE   oif mosey0 lookup <ifindex>
-                                   |
-                                   |  on 0:  RTM_DELRULE, then mosey_stop(handle)
-                                   |
-                                   +-- SIGTERM --> mosey_stop(handle)
+**Three alternatives were considered and rejected:** running as `system` (defeats the
+privilege split), running as a package uid (a native daemon has no package), and
+`CAP_NET_RAW` (does not bypass the BPF gate).
 
-init  --(sys.boot_completed)-->  tarishsharingd (no capabilities)
-                                   |  publish dev.tarish.ITarishService
-                                   |  mDNS browse/advertise on mosey0
-                                   |  TLS listener on [fe80::…%mosey0]:8770
-                                   +  rebind both whenever mosey0 is replaced
-```
+### Always-on VPN lockdown
 
-Two details that are not obvious and cost real time to find:
+Android's *Block connections without VPN* is a good setting and enterprises rightly turn it
+on. It also breaks every peer-to-peer transfer that works by IP — AirDrop, Quick Share and
+Tarish alike — because the traffic is on a link-local address that is not the VPN, so it is
+dropped, and nothing tells the person why.
 
-**The session lives exactly as long as the process holding the handle.** Exit and
-`mosey0` disappears. `tarishd` therefore does nothing but hold it — which is also
-why the client app must never be the holder.
+The position taken here: **honour it, do not bypass it.** Under lockdown the device should
+say plainly that sharing is disabled by policy, rather than appearing broken. Design in
+`docs/POLICY.md`. The exemption question — whether uid 7500 already sits inside the BPF
+program's `is_system_uid` exemption, which is wider than the local-network gate's — is
+measured, not assumed.
 
-**It can be stopped and started again in one process.** `mosey_start_5` after
-`mosey_stop` works: new handle, new interface index, new link-local address, ~360 ms
-plus a 2 s settle. This was tested before anything was built on it, because
-`libmosey` is a closed blob and the whole on-demand design depends on it.
+### The AWDL band is negotiated, not guessed
 
-**Every cycle changes the interface index, and the table id IS the index.** So the
-fib rule is deleted before it is added and removed on release, and anything holding
-a socket on `mosey0` has to notice and rebind. Note that a blocking `accept()` on a
-socket bound to an address that no longer exists never returns *and never errors*.
+The chip does 2.4 and 5 GHz simultaneously but **cannot hold two 5 GHz channels**, so AWDL
+must occupy the opposite band from Wi-Fi. Getting it wrong drops the Wi-Fi association in
+about three seconds. The app reports the association frequency to the daemon whenever it
+changes; unknown means the daemon guesses, and a guess is wrong about half the time.
 
-**An address is not enough.** Android routes by fwmark and gives a new interface
-its own routing table, which starts *empty* — `connect()` returns
-`ENETUNREACH` despite a valid address and a reachable neighbour. `tarishd` adds the
-link-local route itself, over netlink rather than by running `ip`, so the daemon
-never needs permission to execute anything.
+### Wi-Fi LAN is a bootstrap, never an upgrade target
 
-## Layout
+A peer on the same subnet publishes an address over mDNS and is reached by connecting to
+it. That is already the fast path. A stock peer will never answer an upgrade request for
+`WIFI_LAN`, and it is not malfunctioning when it stays silent. The bandwidth upgrade exists
+for peers with **no** shared network, and it means Wi-Fi Direct.
 
-```
-src/main.rs              tarishd — the privileged half: session lifecycle, routing
-src/mosey.rs             the vendor FFI, isolated to one file
-src/route.rs             netlink: the link-local route and the fib rule
-sharingd/src/            tarishsharingd — mDNS, TLS, HTTP, plist, cpio, transfers
-aidl/dev/tarish/           the client contract (AIDL)
-init/tarish.rc             init service: user system, group system inet, NET_ADMIN NET_RAW
-Android.bp               rust_binary x2, system_ext
-sepolicy/tarishd.te        SELinux domain, privileged half
-sepolicy/tarishsharingd.te SELinux domain, no capabilities
-sepolicy/tarish.te         types shared between the two
-sepolicy/file_contexts   labels both binaries
-sepolicy/service_contexts labels the binder service name
-sepolicy/property_contexts labels tarish.awdl.wanted
-docs/ARCHITECTURE.md     the two-process split and the Rust decision
-docs/MOSEY-FFI.md        the vendor ABI tarishd calls, and how it was recovered
-docs/INTEGRATING.md      what a platform must provide, and the traps
+### The advertiser hosts the upgrade network; the discoverer joins
+
+Not sender and receiver. A stock sender never asks for an upgrade, and an advertiser
+refuses to join one. So when we send we ask and the peer hosts; when we receive we offer,
+unprompted.
+
+---
+
+## Devices
+
+Tarish needs `wonder.ko` **bound to the Wi-Fi driver**, and that depends on the Wi-Fi chip,
+not the model or the SoC. Every Pixel 10 image ships both `bcmdhd4383.ko` and
+`bcmdhd4390.ko` and loads whichever matches the silicon, so the model name tells you
+nothing. Check the device:
+
+```bash
+adb shell 'lsmod | grep bcmdhd'          # 4390 = good, 4383 = no wondertap
+adb shell 'ls /sys/class/ieee80211/'     # a `wonder` wiphy is the real test
 ```
 
-## Building
+| device | model | chip | AirDrop | Quick Share |
+|---|---|---|---|---|
+| `blazer` | Pixel 10 Pro | BCM4390 | ✅ AWDL and Wi-Fi coexist | ✅ |
+| `mustang` | Pixel 10 Pro XL | BCM4390 | ✅ AWDL and Wi-Fi coexist | ✅ |
+| `frankel` | Pixel 10 | BCM4383 | ⚠️ works, but takes the radio — see below | ✅ |
+| `rango` | Pixel 10 Pro Fold | unverified | unverified | expected to work |
+| `stallion` | Pixel 10a | no `wonder.ko` at all | ❌ impossible | ✅ |
 
-Tarish is built by the platform build, not standalone — it is a system daemon and
-wants the platform toolchain, labelling and signing. Drop it into an AOSP-derived
-tree and add it to a product:
+**On BCM4383 (Pixel 10) AirDrop works but is not practical.** There is no `wondertap`, so
+AWDL falls back to a radiotap path that takes the physical radio and wedges Wi-Fi until a
+reboot. Discovery and transfers are fine; *sharing and Wi-Fi at the same time* is not.
+Quick Share needs no AWDL and is unaffected — so on exactly the hardware where AirDrop
+cannot be used, the other half still works.
+
+**The Pixel 10a can never do AirDrop.** Its image ships no `wonder.ko`. It still ships
+`mosey_server` and the Mosey app, so finding those proves nothing. Quick Share works.
+
+---
+
+## Integration
+
+Everything a platform integrator needs is in **[docs/INTEGRATING.md](docs/INTEGRATING.md)**:
+what the platform must provide, the SELinux policy and why trimming it costs cycles, the
+routing trap, the regulatory-country requirement, and the failures that look like success.
+
+The short version:
 
 ```make
 PRODUCT_PACKAGES += tarishd tarishsharingd
 ```
 
-then install `sepolicy/` into the tree's private policy. The GrapheneOS buildfarm
-does this with `scripts/gos-tarish.sh`.
+plus `sepolicy/*.te` and its four context files, the AID in `TARGET_FS_CONFIG_GEN`, and the
+local-network patch. `docs/GRAPHENEOS.md` covers that build specifically.
 
-All of `sepolicy/` must be installed, not just the `.te` files — `file_contexts`
-labels the executables, `service_contexts` labels the binder service name, and
-`property_contexts` labels `tarish.awdl.wanted`. Each missing one fails differently
-and none of them fails loudly. In particular, `sepolicy/tarishd.te` must be
-installed **with** `sepolicy/file_contexts`. Without
-the label the domain exists but nothing ever runs in it — the build succeeds,
-policy contains `tarishd`, and `init` silently runs the daemon in its own domain
-instead. That failure looks correct from every angle except the one that matters.
+**LineageOS is the next target.** Nothing here is GrapheneOS-specific by design — the
+daemon asks the platform for an AWDL library and a kernel module and does not care where
+they came from, which is exactly why the vendor pin lives with the integrator rather than
+in this repo.
 
-## Requirements
+**If you maintain GrapheneOS or LineageOS and want this in the image, please open an
+issue.** It is built to be adopted: no Google dependency, no network callbacks, an
+unprivileged parser process, policy that an administrator can pin, and a licence that
+imposes nothing.
 
-- `libmosey_daemon_ffi.so` present and loadable. tarishd tries the plain soname
-  first, then the usual paths, and honours `TARISH_MOSEY_LIB` as an override.
-  **Shipping and pinning that library is the integrator's job** — tarishd is
-  distribution-agnostic and only requires that one is there.
-- `wonder.ko` bound to the Wi-Fi driver. On Pixel 10 that is every model except
-  the 10a (`bcmdhd4383` has no `wondertap` support).
-- A build you can add SELinux policy to.
+---
 
-Integration details, and the failures worth knowing about in advance, are in
-**[docs/INTEGRATING.md](docs/INTEGRATING.md)** — including why
-`sepolicy/file_contexts` must be installed alongside the `.te`, and why trimming
-the policy costs a build cycle each time.
+## Testing
 
-## Name
+Two devices, driven from a script, no screen taps:
 
-بَرْق — *tarish*, Arabic for lightning; historically the word for telegraph.
+```bash
+tarishctl peers                     # what this device can see
+tarishctl send <peer-id> <file>     # start a transfer
+tarishctl accept <transfer-id>      # answer an offer
+tarishctl policy pin off            # for transport tests
+```
 
-## Running it on GrapheneOS
+`tarishctl` is **userdebug and eng only**, enforced in the makefile and again in SELinux
+policy — it can start a transfer and accept an incoming one, which is not something a shell
+on a production device should be able to do.
 
-Tarish is built to be integrated into an OS image, not sideloaded: it is two `init`
-services with their own SELinux domains and a dedicated AID, none of which an APK can
-give itself. [docs/GRAPHENEOS.md](docs/GRAPHENEOS.md) is the full procedure — what to
-copy, what to wire into the build, the one framework patch that is required and why, and
-how to verify each step landed.
+**Test against both vendors, always.** Passing against one proves very little:
 
-It is written for GrapheneOS because that is where it was developed, but nothing in it is
-GrapheneOS-specific. The same steps apply to AOSP or to any build you control.
+- Windows sends no confirming `Response` and cannot host Wi-Fi Direct at all
+- macOS accepts a gzip container that Apple itself never sends
+- a stock Pixel does both, and is stricter about frame shapes
 
-## Credits
+And test **two Tarish devices against each other**, which is a different thing again: a
+third-party peer runs its own half of the protocol, so it papers over any place where our
+two halves disagree. Several real bugs were only ever visible device-to-device — a
+container mismatch where our sender gzipped and our receiver did not decompress, and an id
+mismatch that made accepting an incoming transfer impossible.
 
-**[Bada](https://github.com/kyujin-cho/Bada)** is a working Quick Share implementation
-for Android, in Kotlin, under Apache 2.0. `libtarish_protocol` is a Rust port of the
-protocol layers of its `core-protocol` module. The code here is rewritten — different
-language, different process model — but the protocol knowledge is Bada's, and several
-constants in this implementation exist because Bada found them first and wrote down why
-they matter. Where a value came from Bada, the comment beside it says so.
+---
 
-**[OpenDrop](https://github.com/seemoo-lab/opendrop)** and the AWDL research from the
-Secure Mobile Networking Lab at TU Darmstadt are what made the AirDrop side tractable.
+## Acknowledgement
 
-## License
+Thanks to **[Bada](https://github.com/kyujin-cho/Bada)**, an open Quick Share
+implementation for Android. **No code from it is used here** — this is a fresh
+implementation in a different language and process model — but it worked out several
+protocol details independently and documented why they matter, and that saved real time.
+Where a constant exists because Bada found it first, the comment beside it says so.
 
-Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Also to the **openheimer / OWL** research on AWDL, and to **opendrop**, for establishing
+what AirDrop looks like on the wire.
 
-Apache 2.0 rather than MIT deliberately: this is a clean-room implementation of two
-proprietary protocols, and Apache's patent grant matters more here than the shorter
-licence text does. It is also Bada's licence and AOSP's, so nothing downstream has to
-reason about compatibility.
+## Licence
+
+Apache 2.0. See [LICENCE](LICENSE).
