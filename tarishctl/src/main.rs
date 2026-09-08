@@ -10,7 +10,6 @@
 
 use binder::Strong;
 use dev_tarish::aidl::dev::tarish::ITarishService::ITarishService;
-use dev_tarish::aidl::dev::tarish::TarishPolicy::TarishPolicy;
 
 const SERVICE: &str = "dev.tarish.ITarishService/default";
 
@@ -37,8 +36,11 @@ fn usage() -> ! {
   received                    list files this device has received
   refresh                     re-run discovery
   policy                      print the current policy
-  policy pin <on|off>         require a PIN before sending, or do not
-  policy mode <0|1|2|3>       set both protocols: off / contacts / everyone / ...
+  policy pin <on|off>         require the sender to type the receiver's PIN
+  policy confirm <on|off>     ask before accepting an incoming transfer
+  policy mode <0|1|2|3>       both protocols: 0 off, 1 receive, 2 send, 3 both
+  policy airdrop <0|1|2|3>    AirDrop only, leaving Quick Share alone
+  policy quickshare <0..3>    Quick Share only, leaving AirDrop alone
 
 Ids are opaque; take them from `peers` and from the daemon log."
     );
@@ -120,30 +122,69 @@ fn run() -> Result<(), String> {
         }
         "refresh" => svc.refreshPeers().map_err(|e| e.to_string())?,
         // Testing a transfer end to end means answering the PIN, and a harness that
-        // scrapes it out of logcat races the log. Turning the requirement off makes the
+        // scrapes it out of logcat races the log, so `policy pin off` exists to make the
         // transport testable on its own; leaving it on is what a person gets.
         "policy" => {
-            let mut p: TarishPolicy = Default::default();
-            p.airdrop = 3;
-            p.quickshare = 3;
-            p.requireConfirmation = true;
-            match (args.get(1).map(String::as_str), args.get(2).map(String::as_str)) {
-                // NO READBACK. There is no getter on the interface, and printing the
-                // defaults this command was about to send would be inventing an answer:
-                // it read "confirm=true" immediately after successfully setting it false.
-                // The daemon logs the real thing when it changes -- grep its log for
-                // "policy: airdrop=... confirm=..." -- so say that instead of guessing.
-                (None, _) => {
-                    return Err("no getter on the interface; read the daemon's log line \
-                                \"policy: airdrop=.. quickshare=.. confirm=..\" instead"
-                        .into());
+            // READ, MODIFY, WRITE -- never build a policy from defaults.
+            //
+            // setPolicy replaces the WHOLE parcelable, so a subcommand that means to
+            // touch one field has to carry every other field forward or it silently
+            // rewrites them. This used to start from Default::default() with airdrop and
+            // quickshare forced to MODE_BOTH, which meant `policy pin off` -- whose
+            // entire job is the PIN -- ALSO TURNED AIRDROP ON, and cleared the device
+            // name and every *Managed flag on the way past.
+            //
+            // On a device whose radio cannot hold AWDL and Wi-Fi at once that takes wlan0
+            // down. Quick Share then has no LAN route, sendFilesOnLan returns 0, and the
+            // harness reports "no offer reached the receiver" -- six failing rows blaming
+            // the peer for damage done by the tool that was supposed to be observing it.
+            let mut p = svc.getPolicy().map_err(|e| e.to_string())?;
+            let mode = |v: &str| -> Result<i32, String> {
+                match v.parse::<i32>() {
+                    Ok(m) if (0..=3).contains(&m) => Ok(m),
+                    _ => Err("mode takes 0 (off), 1 (receive), 2 (send) or 3 (both)".into()),
                 }
-                (Some("pin"), Some(v)) => p.requireConfirmation = v == "on",
+            };
+            match (args.get(1).map(String::as_str), args.get(2).map(String::as_str)) {
+                // A REAL readback. getPolicy() has always existed on the interface; an
+                // earlier comment here claimed it did not and printed the defaults it was
+                // about to send instead, which reported "confirm=true" immediately after
+                // successfully setting it false.
+                (None, _) => {
+                    println!(
+                        "airdrop={} quickshare={} confirm={} pin={} name={:?}",
+                        p.airdrop,
+                        p.quickshare,
+                        p.requireConfirmation,
+                        p.requirePin,
+                        p.deviceName
+                    );
+                    println!(
+                        "managed airdrop={} quickshare={} confirm={} pin={} name={}",
+                        p.airdropManaged,
+                        p.quickshareManaged,
+                        p.requireConfirmationManaged,
+                        p.requirePinManaged,
+                        p.deviceNameManaged
+                    );
+                    return Ok(());
+                }
+                // requirePin is the PIN the SENDER types. requireConfirmation is the
+                // receiver's accept prompt -- a different question, so a different
+                // subcommand. `pin` used to set requireConfirmation, and only appeared to
+                // work because requirePin happened to be false in Default::default().
+                (Some("pin"), Some(v)) => p.requirePin = v == "on",
+                (Some("confirm"), Some(v)) => p.requireConfirmation = v == "on",
                 (Some("mode"), Some(v)) => {
-                    let m: i32 = v.parse().map_err(|_| "mode takes a number")?;
+                    let m = mode(v)?;
                     p.airdrop = m;
                     p.quickshare = m;
                 }
+                // Per protocol, because the interesting case is exactly one of them off:
+                // an exclusive radio has to drop AWDL for Quick Share to have a transport
+                // at all, and "both to the same mode" cannot express that.
+                (Some("airdrop"), Some(v)) => p.airdrop = mode(v)?,
+                (Some("quickshare"), Some(v)) => p.quickshare = mode(v)?,
                 _ => usage(),
             }
             svc.setPolicy(&p).map_err(|e| e.to_string())?;
