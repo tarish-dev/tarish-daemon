@@ -29,7 +29,7 @@ applications installed**.
 | receive | ✅ | ✅ |
 | shared network | ✅ | ✅ 22 MB/s measured |
 | off-network | ✅ AWDL is its own link | ✅ Wi-Fi Direct 10.5 MB/s; Bluetooth ~150 KB/s bootstrap |
-| both protocols at once | ✅ verified concurrently, no degradation |
+| both protocols at once | ✅ on BCM4390, verified concurrently in opposite directions, no degradation. ⚠️ **not possible on BCM4383** — see Devices |
 
 Interoperability is tested against **real peers, not only against ourselves**: macOS and
 iOS for AirDrop, Windows 11 and stock Android for Quick Share. That distinction has caught
@@ -183,10 +183,24 @@ switched off**. Measured over repeated cycles, with the association on 5520 MHz 
 band correctly reported to the daemon — so this is the silicon, not a band-selection
 mistake, and no software change reaches it.
 
-That is a tradeoff rather than a trap: *sharing and Wi-Fi at the same time* is not
-available on this chip, but nothing needs a reboot and nothing stays broken. Quick Share
-needs no AWDL and is unaffected throughout — so on exactly the hardware where AirDrop is
-awkward, the other half is untouched.
+That is a tradeoff rather than a trap: nothing needs a reboot and nothing stays broken.
+But the consequence is worth stating plainly, because it is the practical answer for this
+device: **on BCM4383, AirDrop and Quick Share over Wi-Fi are mutually exclusive.** Quick
+Share needs no AWDL, but it does need Wi-Fi, and AWDL has taken it. Measured on one device
+within a single minute, toggling nothing but AirDrop:
+
+```
+AirDrop ON   ->  wlan0 has no address,  mosey0 up
+                 quickshare: wlan0 not ready (wlan0 has no IPv4 address)
+AirDrop OFF  ->  wlan0 192.168.0.135,   mosey0 down
+                 quickshare: offer 9 from "Pixel 10": 1 file(s)
+```
+
+So on a 4383 the two protocols take turns, and running both at once is not something the
+radio can do. On BCM4390 they genuinely coexist — verified with `mosey0` up and `wlan0`
+holding its address simultaneously, and with an AirDrop transfer and a Quick Share transfer
+in flight at the same moment, in opposite directions, both completing and both verified by
+hash.
 
 **The Pixel 10a can never do AirDrop.** Its image ships no `wonder.ko`. It still ships
 `mosey_server` and the Mosey app, so finding those proves nothing. Quick Share works.
