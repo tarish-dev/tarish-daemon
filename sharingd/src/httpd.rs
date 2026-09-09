@@ -413,7 +413,28 @@ impl Httpd {
                 let id = self.transfers.begin(true);
                 let (from, names) = describe_offer(&body);
                 info!("offer {id} from {from:?}: {} file(s) {names:?}", names.len());
-                self.offered(id, &from, &names);
+
+                // ASK ONLY IF THERE IS A QUESTION.
+                //
+                // offered() raises an actionable DECLINE/ACCEPT card in the app. Raising
+                // one for a decision this daemon has already made leaves a prompt on
+                // screen for a transfer that is already running, and the only thing that
+                // ever clears it is onTransferFinished at the END of the upload -- so if
+                // the upload stalls, or the peer never sends, or the callback does not
+                // reach the app, the card stays there forever over a file that has
+                // already arrived.
+                //
+                // Reported from the field as "auto-accept still asks", and reproduced on
+                // hardware with require_confirmation=false: the photo landed in the inbox
+                // and the ACCEPT button was still waiting above it.
+                //
+                // The transfer is still registered and still appears in the received
+                // list, which is what "shown" was meant to mean -- what is skipped is the
+                // QUESTION, and now it is skipped in the app too, not only in the answer.
+                let auto = self.auto_accept.load(std::sync::atomic::Ordering::SeqCst);
+                if !auto {
+                    self.offered(id, &from, &names);
+                }
 
                 // ASK, do not assume. Answering 200 here unconditionally meant any
                 // device in range could put a file on this one while the app was open,
@@ -426,7 +447,7 @@ impl Httpd {
                 // An administrator may turn the prompt off. The transfer is still
                 // registered and still shown, so it appears in the UI and in the
                 // received list -- what is skipped is the QUESTION, not the record.
-                let answer = if self.auto_accept.load(std::sync::atomic::Ordering::SeqCst) {
+                let answer = if auto {
                     info!("offer {id} auto-accepted — policy does not require confirmation");
                     self.transfers.answer(id, true);
                     Some(true)
@@ -558,11 +579,37 @@ impl Httpd {
                 return;
             }
         };
-        for cb in cbs.iter() {
-            // A client that died holding a callback must not break receiving for the
-            // next one, so failures are logged and skipped.
+        // DROP A CLIENT THAT IS GONE, do not keep calling it forever.
+        //
+        // Every app restart registers a new callback and the old one was never removed,
+        // so the list filled with dead proxies: one transfer produced five consecutive
+        // "callback failed: DEAD_OBJECT" lines. That is not merely wasted IPC -- a
+        // notification that cannot be delivered is a card that is never dismissed and a
+        // received file the UI never mentions, which reads as a transfer that failed
+        // when it in fact succeeded.
+        //
+        // DEAD_OBJECT is the only failure treated as fatal to the registration: a client
+        // that is merely busy or threw must keep its callback.
+        let mut dead = Vec::new();
+        for (i, cb) in cbs.iter().enumerate() {
             if let Err(e) = f(cb) {
-                debug!("callback failed: {e:?}");
+                if e.transaction_error() == binder::StatusCode::DEAD_OBJECT {
+                    dead.push(i);
+                } else {
+                    debug!("callback failed: {e:?}");
+                }
+            }
+        }
+        if !dead.is_empty() {
+            drop(cbs);
+            if let Ok(mut cbs) = self.callbacks.lock() {
+                // Back to front, so an earlier removal cannot shift a later index.
+                for i in dead.iter().rev() {
+                    if *i < cbs.len() {
+                        cbs.remove(*i);
+                    }
+                }
+                info!("dropped {} dead callback(s); {} left", dead.len(), cbs.len());
             }
         }
     }
