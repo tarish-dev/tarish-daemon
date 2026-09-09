@@ -75,6 +75,19 @@ const IFACE_CHECK_EVERY: u32 = 8;
 /// enough that a device left face-down does not hold the connection open all day.
 const ASK_TIMEOUT: Duration = Duration::from_secs(45);
 
+/// How long to wait for the peer's NEXT request on a connection it is keeping alive.
+///
+/// NOT IO_TIMEOUT. Once we answer /Ask with 200 the sender goes away to prepare the
+/// payload, and for a large video that takes far longer than fifteen seconds -- an
+/// iPhone sending a 1.37 GB .mov took over that just to get started. The old code
+/// applied the ordinary read timeout to that wait, hung up on the sender mid-preparation,
+/// and the phone then sat on "Waiting" forever with nothing left to talk to: the
+/// connection it meant to send /Upload on was gone.
+///
+/// It only ever bit large files. A photo follows its /Ask in well under a second, which
+/// is why every small transfer worked and every big one looked like a size limit.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// What to do with the connection after answering a request.
 enum Disposition {
     KeepAlive,
@@ -258,11 +271,15 @@ impl Httpd {
         let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
         let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
         let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+        // A second handle on the same socket, so the read timeout can be widened while
+        // waiting for a request and narrowed again for the body. The TLS wrapper hides
+        // the TcpStream, and this is the only way back to it.
+        let ctl = stream.try_clone().ok();
 
         match self.acceptor.accept(stream) {
             Ok(mut tls) => {
                 debug!("TLS handshake ok from {peer}");
-                if let Err(e) = self.serve_connection(&mut tls) {
+                if let Err(e) = self.serve_connection(&mut tls, ctl.as_ref()) {
                     debug!("{peer}: {e}");
                 }
                 // Drain whatever the peer still has queued before dropping the
@@ -303,17 +320,36 @@ impl Httpd {
     /// means the upload never arrives: the peer finds the connection gone, retries
     /// `/Ask` once, and gives up. That is a transfer that fails with no error anywhere
     /// -- the log shows two accepted `/Ask`s and no `/Upload`.
-    fn serve_connection<S: Read + Write>(&self, tls: &mut S) -> std::io::Result<()> {
+    fn serve_connection<S: Read + Write>(
+        &self,
+        tls: &mut S,
+        ctl: Option<&TcpStream>,
+    ) -> std::io::Result<()> {
         loop {
-            match self.handle(tls)? {
+            match self.handle(tls, ctl)? {
                 Disposition::KeepAlive => continue,
                 Disposition::Close => return Ok(()),
             }
         }
     }
 
-    fn handle<S: Read + Write>(&self, tls: &mut S) -> std::io::Result<Disposition> {
-        let head = read_head(tls)?;
+    fn handle<S: Read + Write>(
+        &self,
+        tls: &mut S,
+        ctl: Option<&TcpStream>,
+    ) -> std::io::Result<Disposition> {
+        // WAITING FOR A REQUEST IS NOT A STALLED READ. The peer may be preparing a very
+        // large payload before it sends /Upload; fifteen seconds of quiet here is normal
+        // and hanging up on it strands the transfer. Once the head has arrived, everything
+        // after it is ordinary I/O and gets the ordinary timeout back.
+        if let Some(c) = ctl {
+            let _ = c.set_read_timeout(Some(IDLE_TIMEOUT));
+        }
+        let head = read_head(tls);
+        if let Some(c) = ctl {
+            let _ = c.set_read_timeout(Some(IO_TIMEOUT));
+        }
+        let head = head?;
         let mut parts = head.split_whitespace();
         let method = parts.next().unwrap_or_default();
         let path = parts.next().unwrap_or_default();
