@@ -718,7 +718,26 @@ impl Httpd {
             let mut limited = Read::take(&mut r, size);
             let copied = io::copy(&mut limited, &mut out)?;
             if copied != size {
-                warn!("{dest}: expected {size} bytes, wrote {copied}");
+                // A SHORT MEMBER IS A FAILED TRANSFER, not a note in the log.
+                //
+                // This used to warn and carry on. A 1.37 GB video from an iPhone that
+                // stopped at 714 MB was therefore extracted, announced, and moved into
+                // Downloads as a received file: a corrupt .mov presented as a success,
+                // with the only evidence a warning nobody reads. Reported from the field
+                // as "1 GB fails"; it does not fail, which is the problem.
+                //
+                // Refusing is the only honest answer. Silent corruption is worse than a
+                // visible failure, because nothing tells the person to send it again --
+                // and a half-written video opens and plays until it does not.
+                warn!("{dest}: expected {size} bytes, got {copied} — refusing the partial file");
+                drop(out);
+                if let Err(e) = std::fs::remove_file(&dest) {
+                    warn!("could not remove the partial {dest}: {e}");
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("{leaf}: truncated at {copied} of {size} bytes"),
+                ));
             }
             info!("extracted {dest} ({copied} bytes)");
             r.finish().map_err(cpio_err)?;
