@@ -573,13 +573,52 @@ impl Httpd {
     /// What a peer is told when it asks who we are.
     ///
     /// ReceiverRecordData is deliberately absent -- see the module comment.
+    /// What this device can accept without the sender converting it first.
+    ///
+    /// THIS FIELD DECIDES WHETHER A VIDEO ARRIVES OR IS RE-ENCODED FIRST.
+    ///
+    /// It used to be `{"Version":1}`, which declares no codec support at all. An iPhone
+    /// reads that as "this receiver cannot play HEVC" and transcodes before it sends --
+    /// silent work that took **117 seconds** for a 1.37 GB screen recording, measured
+    /// between its /Discover and its /Ask, during which the phone shows "Waiting" and
+    /// this device sees nothing at all. The same file to another iPhone starts at once,
+    /// which is what showed the wait was ours to cause.
+    ///
+    /// The shape here is taken from a real Apple receiver answering the same request,
+    /// not invented: `Version` is 3, `Codecs.hvc1` carries the HEVC profiles, and
+    /// `IsAirDropable` is present. Only the parts we can honestly claim are kept --
+    /// no Dolby Vision, since nothing here has verified it.
+    ///
+    /// Claiming HEVC is true for this hardware: a Pixel decodes HEVC Main and Main10 in
+    /// hardware, and the file is stored either way. Profiles 1 and 2 are what an iPhone
+    /// records -- Main for SDR, Main10 for HDR.
+    fn media_capabilities() -> &'static str {
+        concat!(
+            r#"{"Version":3,"#,
+            r#""Codecs":{"hvc1":{"Profiles":{"#,
+            r#""VTSupportedProfiles":[1,2],"#,
+            r#""VTPerProfileSupport":{"#,
+            r#""1":{"VTMaxPlaybackLevel":186,"VTIsHardwareAccelerated":true,"VTMaxDecodeLevel":186},"#,
+            r#""2":{"VTMaxPlaybackLevel":186,"VTIsHardwareAccelerated":true,"VTMaxDecodeLevel":186}"#,
+            r#"}}}},"#,
+            r#""CodecSupport":{"VTCodecSupportDict":{"hvc1":{"#,
+            r#""VTSupportedProfiles":[1,2],"#,
+            r#""VTPerProfileSupport":{"#,
+            r#""1":{"VTMaxPlaybackLevel":186,"VTIsHardwareAccelerated":true,"VTMaxDecodeLevel":186},"#,
+            r#""2":{"VTMaxPlaybackLevel":186,"VTIsHardwareAccelerated":true,"VTMaxDecodeLevel":186}"#,
+            r#"}}}}}"#,
+        )
+    }
+
     fn discover_body(&self) -> Vec<u8> {
         plist::dict(&[
             ("ReceiverComputerName", Value::Str(crate::device_name())),
             ("ReceiverModelName", Value::Str(self.model.clone())),
+            // A real receiver sends this; we never did. Harmless to state plainly.
+            ("IsAirDropable", Value::Bool(true)),
             (
                 "ReceiverMediaCapabilities",
-                Value::Data(br#"{"Version":1}"#.to_vec()),
+                Value::Data(Self::media_capabilities().as_bytes().to_vec()),
             ),
         ])
     }

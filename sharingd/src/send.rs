@@ -278,6 +278,24 @@ fn read_response<S: Read>(tls: &mut S) -> io::Result<(u16, Vec<u8>)> {
         buf
     };
     debug!("response body: {} bytes", body.len());
+    // WHAT AN APPLE RECEIVER ACTUALLY ADVERTISES.
+    //
+    // Our own /Discover answers ReceiverMediaCapabilities as {"Version":1}, which
+    // declares no codec support at all -- so an iPhone sending us a video converts it
+    // first, which is minutes of silent work on a large file and is why it sits on
+    // "Waiting". iPhone to iPhone is immediate because no conversion is needed.
+    //
+    // The fix needs the real shape of that field, and the only authority on it is a
+    // real Apple device answering the same request. Printed as text where it is
+    // printable, since the capabilities blob is JSON inside a plist.
+    if log::log_enabled!(log::Level::Debug) {
+        let shown: String = body
+            .iter()
+            .take(1400)
+            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+            .collect();
+        debug!("response body text: {shown}");
+    }
     Ok((status, body))
 }
 
