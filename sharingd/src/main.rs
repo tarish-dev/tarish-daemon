@@ -1095,7 +1095,28 @@ impl ITarishService for TarishService {
         // the gate can never ask for the radio while the band is still unknown --
         // tarishd would then pick 5 GHz and take the association down, which is the
         // exact bug this exists to prevent.
-        let f = if (2000..=7200).contains(&sta_frequency_mhz) { sta_frequency_mhz } else { 0 };
+        // LOSING THE ASSOCIATION IS NOT LEARNING A NEW BAND.
+        //
+        // On a radio where AWDL and Wi-Fi cannot coexist (BCM4383), bringing AWDL up
+        // destroys the very association this value is read from: wlan0 has no frequency,
+        // the client reports 0, and tarishd then treats the band as unknown -- which it
+        // is not. We knew it a second ago, and the association will return to the same
+        // network on the same band when AWDL lets go.
+        //
+        // The cost of forgetting is not theoretical. channels_for() prefers 2.4 GHz when
+        // the band is unknown and 5 GHz when the association is on 2.4, so a device that
+        // forgot lands on 2.4 while a device that remembered sits on 5. Two devices, both
+        // behaving exactly as designed, on opposite bands, with no overlapping
+        // availability window -- and AirDrop between them simply never discovers
+        // anything. Measured on blazer (sta_freq=2437, chose 5 GHz) against frankel
+        // (sta_freq=0, chose 2.4 GHz).
+        //
+        // So a real frequency replaces a real frequency, and 0 is treated as "no news"
+        // rather than as news. A genuine band change corrects this the moment the new
+        // association reports its frequency.
+        let reported = if (2000..=7200).contains(&sta_frequency_mhz) { sta_frequency_mhz } else { 0 };
+        let known = self.sta_freq.load(Ordering::SeqCst);
+        let f = if reported == 0 && known > 0 { known } else { reported };
         if self.sta_freq.swap(f, Ordering::SeqCst) != f {
             if write_property(STA_FREQ_PROP, &f.to_string()) {
                 log::info!("Wi-Fi is on {f} MHz");
