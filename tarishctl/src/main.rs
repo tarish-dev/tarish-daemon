@@ -35,6 +35,9 @@ fn usage() -> ! {
   cancel <transfer-id>        cancel a transfer in flight
   received                    list files this device has received
   refresh                     re-run discovery
+  app ping                    is the app's debug bridge listening?
+  app peers                   peers as the APP sees them (psm, BLE address)
+  app send <peer-id> <file>   send VIA THE APP: Bluetooth, and Wi-Fi Direct upgrade
   policy                      print the current policy
   policy pin <on|off>         require the sender to type the receiver's PIN
   policy confirm <on|off>     ask before accepting an incoming transfer
@@ -121,6 +124,24 @@ fn run() -> Result<(), String> {
             }
         }
         "refresh" => svc.refreshPeers().map_err(|e| e.to_string())?,
+
+        // THE TRANSPORTS THE DAEMON DOES NOT OWN.
+        //
+        // sendFilesOnSocket takes a Bluetooth socket and provideWifiDirectGroup takes a
+        // P2P group, and both are framework API a native daemon cannot reach -- so
+        // Bluetooth and Wi-Fi Direct were SKIP in every end-to-end run and had never been
+        // exercised against real hardware. The app listens on a local socket for exactly
+        // this, on a debuggable build only.
+        //
+        // `app send` off-network is the valuable one: QuickShareSender tries the LAN,
+        // falls through to Bluetooth, and the daemon may then ask to upgrade to Wi-Fi
+        // Direct with the app answering. One command drives the bootstrap AND the upgrade.
+        "app" => {
+            if args.len() < 2 {
+                return Err("usage: app <ping|peers|send <peer-id> <path>>".into());
+            }
+            println!("{}", app_command(&args[1..].join(" "))?);
+        }
         // Testing a transfer end to end means answering the PIN, and a harness that
         // scrapes it out of logcat races the log, so `policy pin off` exists to make the
         // transport testable on its own; leaving it on is what a person gets.
@@ -192,6 +213,51 @@ fn run() -> Result<(), String> {
         _ => usage(),
     }
     Ok(())
+}
+
+/// Send one line to the app's debug bridge and return its reply.
+///
+/// Abstract namespace (a leading NUL in sun_path), so there is no filesystem path to label
+/// or clean up. std can only address these behind an unstable feature, so the connect goes
+/// through libc.
+fn app_command(line: &str) -> Result<String, String> {
+    use std::io::{Read, Write};
+    use std::os::unix::io::FromRawFd;
+
+    const NAME: &[u8] = b"tarish-debug";
+    // SAFETY: a zeroed sockaddr_un is valid, and NAME is written inside sun_path below.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    if NAME.len() + 1 > addr.sun_path.len() {
+        return Err("socket name too long".into());
+    }
+    for (i, b) in NAME.iter().enumerate() {
+        // sun_path[0] stays NUL: that leading zero is what makes it abstract.
+        addr.sun_path[i + 1] = *b as libc::c_char;
+    }
+    let len = (std::mem::size_of::<libc::sa_family_t>() + 1 + NAME.len()) as libc::socklen_t;
+
+    // SAFETY: fd is closed by the UnixStream taking ownership, or explicitly on error.
+    let mut stream = unsafe {
+        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+        if fd < 0 {
+            return Err("socket() failed".into());
+        }
+        if libc::connect(fd, &addr as *const _ as *const libc::sockaddr, len) != 0 {
+            libc::close(fd);
+            return Err("the app is not listening on @tarish-debug — is it running, and \
+                        is this a debuggable build?"
+                .into());
+        }
+        std::os::unix::net::UnixStream::from_raw_fd(fd)
+    };
+
+    stream.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+    stream.write_all(b"\n").map_err(|e| e.to_string())?;
+    // The app answers one line and closes, so read to end rather than guessing a length.
+    let mut out = String::new();
+    stream.read_to_string(&mut out).map_err(|e| e.to_string())?;
+    Ok(out.trim_end().to_string())
 }
 
 fn main() {

@@ -23,4 +23,17 @@ userdebug_or_eng(`
     allow tarishsharingd shell:fd use;
     allow tarishsharingd shell_data_file:file { read getattr };
     allow tarishsharingd shell_data_file:dir search;
+
+    # THE APP'S SHELL CONTROL CHANNEL.
+    #
+    # Bluetooth and Wi-Fi Direct sends are framework API the daemon cannot reach, so an
+    # end-to-end harness cannot drive them through tarishctl at all -- both transports were
+    # reported SKIP in every run and had never been exercised on real hardware. DebugBridge
+    # is an abstract-namespace socket in the app that accepts one line and performs the
+    # same call the share sheet would.
+    #
+    # This is the THIRD gate on it. Android.bp excludes the class from a non-debuggable
+    # build and it re-checks Build.IS_DEBUGGABLE at runtime; without this rule the socket
+    # is unreachable even when the class is present.
+    allow shell platform_app:unix_stream_socket connectto;
 ')

@@ -20,6 +20,9 @@ rust_binary {
     rustlibs: [
         "libbinder_rs",
         "dev.tarish-rust",
+        // For the abstract-namespace socket the app listens on. std can do this only
+        // behind an unstable feature, so the connect is done through libc directly.
+        "liblibc",
     ],
     system_ext_specific: true,
     // Absent from user builds. `m tarishctl` still works for a local check.
