@@ -1005,7 +1005,13 @@ impl TarishService {
             visibility_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             discoverable,
             active: Arc::new(AtomicBool::new(false)),
-            sta_freq: Arc::new(std::sync::atomic::AtomicI32::new(-1)),
+            // NOT -1: that now MEANS something. -1 is the client saying the Wi-Fi
+            // adapter is off, and this field is only written when the value changes --
+            // so sharing the sentinel meant a daemon that started with Wi-Fi already
+            // off saw no change, never published, and tarishd read an empty property
+            // and fell back to "unknown". Observed on frankel: the client reported the
+            // adapter off, tarish.awdl.sta_freq stayed empty, and AWDL chose 2.4 GHz.
+            sta_freq: Arc::new(std::sync::atomic::AtomicI32::new(i32::MIN)),
             peers,
             ble_peers: Arc::new(Mutex::new(std::collections::HashMap::new())),
             qs_lan: Arc::new(Mutex::new(Vec::new())),
