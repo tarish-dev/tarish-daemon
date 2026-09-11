@@ -53,9 +53,16 @@ interface ITarishService {
      * updated.
      *
      * staFrequencyMhz is the frequency the device's Wi-Fi is currently associated
-     * on, or 0 if it is not associated. It is passed HERE rather than through its
-     * own call so there is no window where the daemon knows it should bring the
-     * radio up but not yet which band is safe.
+     * on, 0 if it is not associated, or -1 if the adapter is off. It is passed HERE
+     * rather than through its own call so there is no window where the daemon knows
+     * it should bring the radio up but not yet which band is safe.
+     *
+     * The three values are NOT interchangeable. The daemon remembers the last real
+     * frequency and treats 0 as "no news", because raising AWDL on a chip that cannot
+     * hold both destroys the association it would otherwise read. -1 says the adapter
+     * is off, which is the one case where the memory is wrong rather than stale: there
+     * is no association to protect, and remembering one keeps AWDL out of 5 GHz for
+     * nothing.
      *
      * The client is the only component that can see this. Both daemons are native
      * and have no framework access, and nothing exposes the association frequency

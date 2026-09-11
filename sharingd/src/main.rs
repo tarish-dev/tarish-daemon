@@ -1144,12 +1144,40 @@ impl ITarishService for TarishService {
         // So a real frequency replaces a real frequency, and 0 is treated as "no news"
         // rather than as news. A genuine band change corrects this the moment the new
         // association reports its frequency.
-        let reported = if (2000..=7200).contains(&sta_frequency_mhz) { sta_frequency_mhz } else { 0 };
+        //
+        // WI-FI BEING OFF IS THE ONE THING THAT DOES CLEAR THE MEMORY.
+        //
+        // Everything above is about an association that is coming back. A switched-off
+        // adapter is not that: there is nothing to protect, nothing returning, and the
+        // remembered band is now actively harmful -- it keeps AWDL out of 5 GHz to
+        // avoid a network this device is not on. Measured on frankel with Wi-Fi off:
+        // "Wi-Fi is on 5520 MHz -- putting AWDL in the other band, [6]", then
+        // "not offering [[149, 44]]", and AirDrop ran on channel 6 at 0.87 MB/s.
+        //
+        // The client distinguishes the two because only it can: isWifiEnabled() is the
+        // user's setting and stays true right through AWDL taking the radio, which is
+        // exactly the case the memory exists for. A client too old to send -1 sends 0
+        // and gets the old behaviour.
+        let reported = if (2000..=7200).contains(&sta_frequency_mhz) {
+            sta_frequency_mhz
+        } else if sta_frequency_mhz < 0 {
+            -1
+        } else {
+            0
+        };
         let known = self.sta_freq.load(Ordering::SeqCst);
-        let f = if reported == 0 && known > 0 { known } else { reported };
+        let f = match reported {
+            -1 => 0,
+            0 if known > 0 => known,
+            other => other,
+        };
         if self.sta_freq.swap(f, Ordering::SeqCst) != f {
             if write_property(STA_FREQ_PROP, &f.to_string()) {
-                log::info!("Wi-Fi is on {f} MHz");
+                if f > 0 {
+                    log::info!("Wi-Fi is on {f} MHz");
+                } else {
+                    log::info!("Wi-Fi is off or unassociated — AWDL may use any band");
+                }
             } else {
                 log::warn!("could not publish {STA_FREQ_PROP} — tarishd will guess the band");
             }
