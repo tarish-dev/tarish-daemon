@@ -35,8 +35,9 @@
 # 1000, and gets EPERM as BOTH 9999 and 7500. The AID is not what fixed it.
 #
 # The grant is a framework patch carried by the integrator, not by Tarish:
-# grapheneos/patches/packages_modules_Connectivity/0001-grant-tarish-daemon-local-network-access.patch
-# It hardcodes the number below. gos-tarish.sh refuses to install if the two disagree,
+# patches/packages_modules_Connectivity/0001-grant-tarish-daemon-local-network-access.patch
+# (a copy ships in this repository for integrators to apply). It hardcodes the number
+# below, so an integration should refuse to install if the two disagree,
 # because the failure is silent -- the daemon starts, advertises, and never sends.
 #
 # On a build without that patch, run tarishsharingd as `system` and accept that its

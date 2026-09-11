@@ -165,8 +165,8 @@ pub(crate) struct TransferState {
     ///
     /// AirDrop does; Quick Share never does -- it runs over Bluetooth, Wi-Fi LAN or
     /// Wi-Fi Direct and has no use for mosey0. The radio gate needs to tell them
-    /// apart, because on a BCM4383 device AWDL cannot coexist with Wi-Fi (BUILD-NOTES
-    /// 40, 42): bringing it up for a Quick Share transfer drops wlan0 and kills the
+    /// apart, because on a BCM4383 device AWDL cannot coexist with Wi-Fi:
+    /// bringing it up for a Quick Share transfer drops wlan0 and kills the
     /// very transfer that asked for it.
     needs_awdl: AtomicBool,
 }
@@ -577,7 +577,7 @@ fn write_property(name: &str, value: &str) -> bool {
 /// ALL OF IT IS THEN AND-ED WITH THE AIRDROP POLICY, and that is not an optimisation.
 /// AWDL serves AirDrop and nothing else: Quick Share runs over Bluetooth, Wi-Fi LAN or
 /// Wi-Fi Direct and never touches mosey0. On a BCM4383 device the two cannot coexist
-/// (BUILD-NOTES 40, 42) -- bringing AWDL up drops the Wi-Fi association -- so a device
+/// -- bringing AWDL up drops the Wi-Fi association -- so a device
 /// with AirDrop switched off that lost its Wi-Fi the moment the app opened was losing it
 /// for a link nothing was going to use. Worse, it took Quick Share's own Wi-Fi LAN
 /// upgrade path down with it.

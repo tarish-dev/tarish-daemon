@@ -24,7 +24,7 @@ init_daemon_domain(tarishsharingd)
 # This covers the AirDrop HTTPS listener -- create/bind/listen/accept on a
 # tcp_socket and node_bind on the link-local address. No rule is added here
 # speculatively: if a denial shows up, it gets derived from the real AVC with
-# gos-selinux.sh rather than guessed at in advance.
+# audit2allow rather than guessed at in advance.
 net_domain(tarishsharingd)
 
 # Publish ITarishService, and talk binder to the clients that bind it.

@@ -1,7 +1,8 @@
 # tarish-daemon
 
-The transports for **[Tarish](https://github.com/tarish-dev/tarish-app)** — AirDrop and Quick
-Share on Android with no Google Play Services and no Google account.
+The transports for **[Tarish](https://github.com/tarish-dev/tarish-app)** — file sharing for
+Android that works with AirDrop and Quick Share, with no Google Play Services and no Google
+account.
 
 > ### 📖 Documentation lives in the app repository
 >
@@ -57,3 +58,7 @@ carrying one integrator's vendor decisions.
 ## Licence
 
 Apache 2.0. See [LICENSE](LICENSE).
+
+AirDrop is a trademark of Apple Inc., registered in the U.S. and other countries and regions.
+Quick Share, Android and Pixel are trademarks of their respective owners. Tarish is an
+independent project and is not affiliated with or endorsed by Apple, Google or Samsung.

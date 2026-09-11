@@ -2,7 +2,7 @@
 //
 // Vendored inside Tarish rather than added to external/rust/ so the daemon builds
 // outside this tree -- on LineageOS or plain AOSP -- without the consumer having
-// to place dependencies for us. gos-tarish.sh copies this whole checkout, so it
+// to place dependencies for us. An integration copies this whole checkout, so it
 // comes along on its own.
 //
 // Module names are suffixed _tarish so they cannot collide if AOSP later carries

@@ -8,7 +8,7 @@ Tarish is meant to build outside the GrapheneOS tree — on LineageOS, or plain 
 though someone else wrote it. A dependency placed in `external/rust/` would make that
 untrue: every consumer would have to know to put our dependencies there first.
 
-`gos-tarish.sh` copies this whole checkout into `vendor/tarish/`, so anything here comes
+An integration copies this whole checkout into the tree (e.g. `vendor/tarish/`), so anything here comes
 along on its own with no change on the consumer side.
 
 The one deliberate exception to vendoring is **`libmosey_daemon_ffi.so`**, which is
