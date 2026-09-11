@@ -1166,8 +1166,12 @@ impl ITarishService for TarishService {
             0
         };
         let known = self.sta_freq.load(Ordering::SeqCst);
+        // -1 is PUBLISHED, not folded into 0. tarishd prefers 2.4 GHz when the band is
+        // unknown, to keep an adapter that is trying to associate from being locked out
+        // of 5 GHz -- which is exactly the wrong instinct when the adapter is off, and
+        // 2.4 GHz is where AirDrop measured 0.87 MB/s.
         let f = match reported {
-            -1 => 0,
+            -1 => -1,
             0 if known > 0 => known,
             other => other,
         };
@@ -1175,8 +1179,10 @@ impl ITarishService for TarishService {
             if write_property(STA_FREQ_PROP, &f.to_string()) {
                 if f > 0 {
                     log::info!("Wi-Fi is on {f} MHz");
+                } else if f < 0 {
+                    log::info!("Wi-Fi is off — AWDL can have the 5 GHz radio");
                 } else {
-                    log::info!("Wi-Fi is off or unassociated — AWDL may use any band");
+                    log::info!("Wi-Fi band unknown — AWDL will keep clear of 5 GHz");
                 }
             } else {
                 log::warn!("could not publish {STA_FREQ_PROP} — tarishd will guess the band");

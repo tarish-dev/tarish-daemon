@@ -58,14 +58,27 @@ const CHANNELS_5: &[u8] = &[149, 44];
 /// With no association we prefer 2.4 GHz, NOT 5 GHz -- see the comment on the `0`
 /// arm below. The list is still tried in order and the vendor library refuses a
 /// channel it may not use, so regulatory domains remain its decision, not ours.
-fn channels_for(sta_freq_mhz: u32) -> Vec<&'static [u8]> {
+fn channels_for(sta_freq_mhz: i32) -> Vec<&'static [u8]> {
     match sta_freq_mhz {
+        // THE ADAPTER BEING OFF IS NOT THE SAME UNKNOWN.
+        //
+        // The 2.4 GHz preference below exists to keep Wi-Fi able to come back: take 5
+        // GHz while the band is unknown and the association cannot re-form there, so
+        // the client keeps reporting nothing and we keep taking 5 GHz. That loop needs
+        // an adapter that is trying to associate. A switched-off one is not, and cannot
+        // be locked out of anything.
+        //
+        // It is also the case where the choice matters most. AirDrop on 2.4 GHz measured
+        // 0.87 MB/s on frankel; 5 GHz is where the bandwidth is, and with Wi-Fi off the
+        // whole radio is free. The user switching Wi-Fi back on ends this immediately --
+        // the client then reports 0, not -1, and the next session picks 2.4 again.
         // UNKNOWN IS NOT "NOTHING TO AVOID". Taking 5 GHz here stops Wi-Fi from
         // ASSOCIATING on 5 GHz at all, which is how a phone gets stuck: the radio is
         // up, Wi-Fi cannot come back, so the client keeps reporting 0, so we keep
         // taking 5 GHz. Observed exactly that. 2.4 GHz is the safer unknown -- these
         // devices are usually on 5 GHz, and same-band only clashes when the channels
         // differ.
+        f if f < 0 => vec![CHANNELS_5, CHANNELS_24],     // Wi-Fi off -> take the good band
         0 => vec![CHANNELS_24, CHANNELS_5],
         f if f >= 5000 => vec![CHANNELS_24, CHANNELS_5], // Wi-Fi on 5 GHz -> AWDL on 2.4
         _ => vec![CHANNELS_5, CHANNELS_24],              // Wi-Fi on 2.4 -> AWDL on 5
@@ -87,8 +100,8 @@ fn channels_for(sta_freq_mhz: u32) -> Vec<&'static [u8]> {
 /// and `is_dbs_supported` means 2.4 plus ONE of the upper bands, not all three. A 6 GHz
 /// association therefore has to be protected from 5 GHz AWDL exactly as a 5 GHz one is,
 /// which is what this grouping does.
-fn same_band_as_sta(channels: &[u8], sta_freq_mhz: u32) -> bool {
-    if sta_freq_mhz == 0 {
+fn same_band_as_sta(channels: &[u8], sta_freq_mhz: i32) -> bool {
+    if sta_freq_mhz <= 0 {
         return false;
     }
     let sta_is_24 = sta_freq_mhz < 5000;
@@ -125,12 +138,12 @@ const CFG_STA_FREQ_TAG: u8 = 0x10;                    // field 2, varint
 /// Stock does not do this, which is the point: Google's daemon knows the STA channel
 /// and can interleave its availability windows with it. Told the same thing, the
 /// library can schedule around the association instead of standing on it.
-fn mosey_config(sta_freq_mhz: u32) -> Vec<u8> {
+fn mosey_config(sta_freq_mhz: i32) -> Vec<u8> {
     let mut v = Vec::with_capacity(8);
     v.extend_from_slice(&CFG_DBS_SUPPORTED);
     if sta_freq_mhz > 0 {
         v.push(CFG_STA_FREQ_TAG);
-        let mut n = sta_freq_mhz;
+        let mut n = sta_freq_mhz as u32;
         while n >= 0x80 {
             v.push((n as u8 & 0x7f) | 0x80);
             n >>= 7;
@@ -193,7 +206,7 @@ fn channel_override() -> Option<Vec<u8>> {
     Some(list)
 }
 
-fn sta_frequency() -> u32 {
+fn sta_frequency() -> i32 {
     // tarish.awdl.sta_freq is what tarishsharingd publishes from the client, which is the
     // only component that can see the Wi-Fi state at all -- tarishd and tarishsharingd are
     // native daemons with no framework access, and nothing exposes the association
@@ -205,21 +218,27 @@ fn sta_frequency() -> u32 {
         .filter(|f| (2000..=7200).contains(f))
     {
         log::warn!("using persist.tarish.sta_freq override: {f} MHz");
-        return f;
+        return f as i32;
     }
 
     // Then ask the kernel directly. This is the path that actually runs: the property
     // below is published by tarishsharingd from the client, and the client is closed for
     // almost all of the device's life by design.
     match nl80211::frequency_of(STA_IFACE) {
-        Ok(f) if (2000..=7200).contains(&f) => return f,
+        Ok(f) if (2000..=7200).contains(&f) => return f as i32,
         Ok(_) => {}  // up but not associated -- no channel to avoid, 0 is correct
         Err(e) => log::warn!("nl80211 could not report {STA_IFACE} frequency: {e}"),
     }
 
+    // -1 IS A REAL ANSWER HERE, NOT A PARSE FAILURE.
+    //
+    // The client publishes -1 when the Wi-Fi adapter is switched off, which the kernel
+    // query above cannot distinguish from "the interface is missing for some other
+    // reason" -- with Wi-Fi off, wlan0 is simply gone and nl80211 errors. Folding it
+    // into 0 loses the one case where 5 GHz is free, so it is kept.
     read_property("tarish.awdl.sta_freq")
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .filter(|f| (2000..=7200).contains(f))
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .map(|f| if (2000..=7200).contains(&f) { f } else if f < 0 { -1 } else { 0 })
         .unwrap_or(0)
 }
 
@@ -441,6 +460,11 @@ impl Link {
         if sta > 0 {
             log::info!(
                 "Wi-Fi is on {sta} MHz — putting AWDL in the other band, {:?}",
+                channels_for(sta).first().unwrap_or(&CHANNELS_5)
+            );
+        } else if sta < 0 {
+            log::info!(
+                "Wi-Fi is off — the radio is ours, trying {:?} first",
                 channels_for(sta).first().unwrap_or(&CHANNELS_5)
             );
         } else {
