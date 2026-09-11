@@ -145,6 +145,21 @@ pub(crate) struct TransferState {
     /// `Some((id, None))` is an explicit decline, distinct from nobody having answered yet:
     /// it lets the waiter stop at once rather than sitting out the whole timeout.
     group: Mutex<Option<(i64, Option<TarishGroup>)>>,
+    /// The transfer a group request is outstanding for, or 0.
+    ///
+    /// AN ANSWER NOBODY ASKED FOR IS NOT AN ANSWER. Two app components can both respond to
+    /// onGroupNeeded, and the second arrives after the upgrade has already happened. Stored
+    /// unconditionally it sits in `group` as a stale answer, and the next await_group takes
+    /// it instantly -- so the receiver stands up a SECOND listener on a new port and waits
+    /// for a sender that joined the first one and is already streaming:
+    ///
+    ///     upgraded the inbound transfer to Wi-Fi Direct
+    ///     hosting ... on 192.168.49.1:38617 for the sender   <- second listener
+    ///     the sender never joined; staying put
+    ///     inbound transfer failed: Connection reset by peer
+    ///
+    /// while the sender had sent the whole file in 0.3s over the first one.
+    group_wanted: std::sync::atomic::AtomicI64,
     group_answered: std::sync::Condvar,
     /// Whether the transfer in flight actually rides the AWDL link.
     ///
@@ -274,10 +289,25 @@ impl TransferState {
 
     /// A client's answer to onGroupNeeded. `None` declines.
     pub(crate) fn provide_group(&self, id: i64, group: Option<TarishGroup>) {
+        // Only while a request is outstanding -- see the note on `group_wanted`.
+        if self.group_wanted.load(Ordering::SeqCst) != id {
+            log::debug!("quickshare: ignoring a group answer for {id}; nothing is waiting");
+            return;
+        }
         if let Ok(mut g) = self.group.lock() {
             *g = Some((id, group));
         }
         self.group_answered.notify_all();
+    }
+
+    /// Open a group request for `id`, so an answer will be accepted.
+    pub(crate) fn want_group(&self, id: i64) {
+        self.group_wanted.store(id, Ordering::SeqCst);
+    }
+
+    /// Close it, whatever the outcome.
+    pub(crate) fn stop_wanting_group(&self) {
+        self.group_wanted.store(0, Ordering::SeqCst);
     }
 
     /// Block until a client answers the group request for `id`, or we give up.
@@ -2807,8 +2837,12 @@ impl quickshare::connection::Host for QsHost {
         let deadline = std::time::Instant::now() + GROUP_WAIT;
         let mut asked_anyone = false;
         while std::time::Instant::now() < deadline {
+            // Open the request BEFORE asking: an answer that races back before the flag
+            // is set would be discarded as unsolicited.
+            self.transfers.want_group(self.id);
             {
                 let Ok(cbs) = self.callbacks.lock() else {
+                    self.transfers.stop_wanting_group();
                     return None;
                 };
                 for cb in cbs.iter() {
@@ -2817,6 +2851,7 @@ impl quickshare::connection::Host for QsHost {
                 }
             }
             if let Some(g) = self.transfers.await_group(self.id, GROUP_ASK_INTERVAL) {
+                self.transfers.stop_wanting_group();
                 return Some(quickshare::connection::WifiGroup {
                     ssid: g.ssid,
                     passphrase: g.passphrase,
@@ -2825,6 +2860,7 @@ impl quickshare::connection::Host for QsHost {
                 });
             }
         }
+        self.transfers.stop_wanting_group();
         if asked_anyone {
             log::info!("quickshare: no client answered the group request; staying put");
         } else {
