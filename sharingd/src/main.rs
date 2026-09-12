@@ -415,6 +415,28 @@ pub(crate) fn device_name() -> String {
         .unwrap_or_else(|| "Tarish".to_string())
 }
 
+/// The model string sent to a peer as `ReceiverModelName` / `SenderModelName`.
+///
+/// **This is an identity claim, and peers act on it.** Apple's own share sheet picks an
+/// icon from it, and it is the clearest signal we give that we are not an Apple device —
+/// we say `Pixel 10 Pro` where an Apple peer says `iPhone` or `MacBookPro18,3`.
+///
+/// The override exists because whether that signal gates anything is an open question:
+/// recent iOS shows a confirmation code before an AirDrop to a non-contact, but only ever
+/// between two Apple devices, and nobody knows whether the gate is the model, the AWDL
+/// version, or the absence of an Apple-signed identity. Being able to change this without
+/// a rebuild is what makes that testable.
+///
+/// **The default is the truth, and it should stay that way.** A recipient reads this when
+/// deciding whether to accept a transfer, so shipping a value that claims to be hardware
+/// we are not is misrepresenting the device to someone making a trust decision. Use the
+/// override for diagnosis, not for release.
+pub(crate) fn device_model() -> String {
+    read_property("persist.tarish.model")
+        .or_else(|| read_property("ro.product.model"))
+        .unwrap_or_else(|| "Android".to_string())
+}
+
 /// Persist the advertised name, or clear it back to the device-model default.
 ///
 /// A `persist.` property survives reboot, which is what makes the name stick without
@@ -1724,7 +1746,7 @@ impl ITarishService for TarishService {
         let peer_instance = peer_id.to_string();
         let callbacks = self.callbacks.clone();
         let name = device_name();
-        let model = read_property("ro.product.model").unwrap_or_else(|| "Android".into());
+        let model = device_model();
 
         // Sending happens off the binder thread: a transfer runs for as long as it runs,
         // and holding a binder worker for that would block every other call into us.
@@ -2095,7 +2117,7 @@ fn start_airdrop_server(
         let name = read_property("persist.tarish.name")
             .or_else(|| read_property("ro.product.model"))
             .unwrap_or_else(|| "Tarish".to_string());
-        let model = read_property("ro.product.model").unwrap_or_else(|| "Android".to_string());
+        let model = device_model();
 
         loop {
             match httpd::Httpd::new(
