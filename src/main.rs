@@ -19,7 +19,21 @@ mod route;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-const IFACE: &str = "mosey0";
+/// The AWDL data interface. Configurable so the daemon can run over Google's `libmosey`
+/// (`mosey0`) or over `tarish-libawdl` (`tawdl0`): `$TARISH_IFACE`, then
+/// `persist.tarish.iface`, else the historical default. Resolved once.
+fn iface() -> &'static str {
+    use std::sync::OnceLock;
+    static IFACE: OnceLock<String> = OnceLock::new();
+    IFACE
+        .get_or_init(|| {
+            std::env::var("TARISH_IFACE")
+                .ok()
+                .or_else(|| read_property("persist.tarish.iface"))
+                .unwrap_or_else(|| "mosey0".to_string())
+        })
+        .as_str()
+}
 /// The infrastructure interface whose channel AWDL has to schedule around.
 const STA_IFACE: &str = "wlan0";
 
@@ -553,13 +567,14 @@ impl Link {
 
         // The interface appears a moment after the call returns.
         std::thread::sleep(Duration::from_secs(2));
-        match route::add_link_local(IFACE) {
+        let ifc = iface();
+        match route::add_link_local(ifc) {
             Ok(()) => log::info!(
-                "route: fe80::/64 dev {IFACE} table {}",
-                route::table_id(IFACE)
+                "route: fe80::/64 dev {ifc} table {}",
+                route::table_id(ifc)
             ),
             Err(e) => log::warn!(
-                "link-local route not added ({e}) — sockets on {IFACE} will get ENETUNREACH"
+                "link-local route not added ({e}) — sockets on {ifc} will get ENETUNREACH"
             ),
         }
 
@@ -567,10 +582,10 @@ impl Link {
         // fib rules keyed on fwmark, and gets no rule for an interface it does not
         // manage -- so the route above sat in table N, was never looked up, and every
         // lookup fell through to "32000: from all unreachable".
-        match route::add_rule(IFACE) {
-            Ok(()) => log::info!("rule: oif {IFACE} lookup {}", route::table_id(IFACE)),
+        match route::add_rule(ifc) {
+            Ok(()) => log::info!("rule: oif {ifc} lookup {}", route::table_id(ifc)),
             Err(e) => log::warn!(
-                "routing rule not added ({e}) — the route on {IFACE} exists but nothing \
+                "routing rule not added ({e}) — the route on {ifc} exists but nothing \
                  will consult it, so the device stays unreachable"
             ),
         }

@@ -41,9 +41,21 @@ use dev_tarish::aidl::dev::tarish::{
 
 const SERVICE_NAME: &str = "dev.tarish.ITarishService/default";
 
-/// The AWDL interface tarishd brings up. Presence of a link-local address on it is
-/// how this process knows the transport is alive, without talking to tarishd.
-const IFACE: &str = "mosey0";
+/// The AWDL data interface. Configurable so the daemon runs over Google's `libmosey`
+/// (`mosey0`) or over `tarish-libawdl` (`tawdl0`): `$TARISH_IFACE`, then
+/// `persist.tarish.iface`, else the historical default. Resolved once.
+fn iface() -> &'static str {
+    use std::sync::OnceLock;
+    static IFACE: OnceLock<String> = OnceLock::new();
+    IFACE
+        .get_or_init(|| {
+            std::env::var("TARISH_IFACE")
+                .ok()
+                .or_else(|| read_property("persist.tarish.iface"))
+                .unwrap_or_else(|| "mosey0".to_string())
+        })
+        .as_str()
+}
 
 /// The property tarishd watches to decide whether to hold the AWDL radio.
 /// Its default when absent is ON, so a policy denial here degrades to the old
@@ -1059,7 +1071,8 @@ impl TarishService {
     /// Is the AWDL link up? Asked of the kernel rather than of tarishd, so this
     /// process needs no privilege and no IPC to answer it.
     fn link_up(&self) -> bool {
-        std::fs::read_to_string(format!("/sys/class/net/{IFACE}/operstate"))
+        let ifc = iface();
+        std::fs::read_to_string(format!("/sys/class/net/{ifc}/operstate"))
             .map(|s| !s.trim().is_empty())
             .unwrap_or(false)
     }
@@ -1074,6 +1087,7 @@ impl TarishService {
     /// port comes from one and the address from the other, and mDNS delivers them in
     /// whatever order it likes.
     fn resolve(&self, peer_id: &str) -> Option<send::Target> {
+        let ifc = iface();
         let peers = self.peers.lock().ok()?;
         let peer = peers.iter().find(|p| p.short_id() == peer_id || p.instance == peer_id)?;
 
@@ -1085,7 +1099,7 @@ impl TarishService {
         // browser should never have offered it and the server would now refuse it, but
         // this is the step that actually dials, so it checks too.
         if let Some(a) = peer.addr {
-            if mdns::link_local_of(IFACE) == Some(a) {
+            if mdns::link_local_of(ifc) == Some(a) {
                 log::warn!("refusing to send to our own address {a} — ignoring peer {peer_id}");
                 return None;
             }
@@ -1094,7 +1108,7 @@ impl TarishService {
         Some(send::Target {
             addr: peer.addr?,
             port: if peer.port != 0 { peer.port } else { return None },
-            scope: mdns::ifindex_of(IFACE).ok()?,
+            scope: mdns::ifindex_of(ifc).ok()?,
         })
     }
 }
@@ -1903,15 +1917,16 @@ fn start_discovery(
     query_now: QueryNow,
     refresh_now: QueryNow,
 ) {
+        let ifc = iface();
     std::thread::spawn(move || {
         let mut browser = loop {
-            match mdns::Browser::new(IFACE) {
+            match mdns::Browser::new(ifc) {
                 Ok(b) => {
-                    log::info!("browsing {} on {IFACE}", mdns::AIRDROP_SERVICE);
+                    log::info!("browsing {} on {ifc}", mdns::AIRDROP_SERVICE);
                     break b;
                 }
                 Err(e) => {
-                    log::info!("waiting for {IFACE} ({e})");
+                    log::info!("waiting for {ifc} ({e})");
                     std::thread::sleep(Duration::from_secs(5));
                 }
             }
@@ -1923,7 +1938,7 @@ fn start_discovery(
         // Which instance of the interface we are bound to. The table id IS the index,
         // and tarishd recreates mosey0 with a new one every time it re-acquires the
         // radio, so this is the identity that matters -- not the name.
-        let mut bound_idx = mdns::ifindex_of(IFACE).unwrap_or(0);
+        let mut bound_idx = mdns::ifindex_of(ifc).unwrap_or(0);
         let mut waiting_logged = false;
         let mut failures = 0u32;
         let mut since_query = Duration::from_secs(99);
@@ -1943,10 +1958,10 @@ fn start_discovery(
             // longer how the common case is detected -- it used to take up to twelve
             // seconds, which is most of the time a person is willing to stare at an
             // empty list.
-            let now_idx = mdns::ifindex_of(IFACE).unwrap_or(0);
+            let now_idx = mdns::ifindex_of(ifc).unwrap_or(0);
             if now_idx == 0 {
                 if bound_idx != 0 {
-                    log::info!("{IFACE} is gone — discovery idle until it returns");
+                    log::info!("{ifc} is gone — discovery idle until it returns");
                     bound_idx = 0;
                     was_advertising = false;
                     if let Ok(mut shared) = peers.lock() {
@@ -1957,9 +1972,9 @@ fn start_discovery(
                 continue;
             }
             if now_idx != bound_idx {
-                match mdns::Browser::new(IFACE) {
+                match mdns::Browser::new(ifc) {
                     Ok(b) => {
-                        log::info!("{IFACE} is up as index {now_idx} — bound");
+                        log::info!("{ifc} is up as index {now_idx} — bound");
                         browser = b;
                         bound_idx = now_idx;
                         failures = 0;
@@ -1971,7 +1986,7 @@ fn start_discovery(
                         // Usually just the address not being assigned yet, a moment
                         // after the index appears. Say it once, then wait quietly.
                         if !waiting_logged {
-                            log::info!("waiting for an address on {IFACE} ({e})");
+                            log::info!("waiting for an address on {ifc} ({e})");
                             waiting_logged = true;
                         }
                         std::thread::sleep(Duration::from_millis(500));
@@ -1997,7 +2012,7 @@ fn start_discovery(
                 }
             }
             for (instance, addr, port) in to_probe {
-                if let Ok(scope) = mdns::ifindex_of(IFACE) {
+                if let Ok(scope) = mdns::ifindex_of(ifc) {
                     probe_name(names.clone(), instance, send::Target { addr, port, scope });
                 }
             }
@@ -2067,15 +2082,15 @@ fn start_discovery(
             // interface exists, and the address looks fine -- it is simply a different
             // interface than the one we are bound to.
             if failures >= 3 {
-                log::warn!("mDNS socket is stale — rebinding to {IFACE}");
-                match mdns::Browser::new(IFACE) {
+                log::warn!("mDNS socket is stale — rebinding to {ifc}");
+                match mdns::Browser::new(ifc) {
                     Ok(b) => {
                         browser = b;
-                        bound_idx = mdns::ifindex_of(IFACE).unwrap_or(0);
+                        bound_idx = mdns::ifindex_of(ifc).unwrap_or(0);
                         failures = 0;
                         was_advertising = false;   // re-assert on the new socket
                         since_query = Duration::from_secs(99);
-                        log::info!("rebound to {IFACE}");
+                        log::info!("rebound to {ifc}");
                     }
                     Err(e) => log::warn!("rebind failed ({e}) — will retry"),
                 }
@@ -2113,6 +2128,7 @@ fn start_airdrop_server(
     transfers: Transfers,
     auto_accept: Arc<AtomicBool>,
 ) {
+        let ifc = iface();
     std::thread::spawn(move || {
         let name = read_property("persist.tarish.name")
             .or_else(|| read_property("ro.product.model"))
@@ -2121,7 +2137,7 @@ fn start_airdrop_server(
 
         loop {
             match httpd::Httpd::new(
-                IFACE,
+                ifc,
                 mdns::AIRDROP_PORT,
                 &name,
                 &model,
@@ -2145,7 +2161,7 @@ fn start_airdrop_server(
             // looking at a device that cannot yet receive. If it does not exist, the
             // radio is released and nothing is coming; polling fast would be a wakeup
             // source for as long as the phone is in a pocket.
-            let coming_up = mdns::ifindex_of(IFACE).is_ok();
+            let coming_up = mdns::ifindex_of(ifc).is_ok();
             std::thread::sleep(if coming_up {
                 Duration::from_millis(500)
             } else {
