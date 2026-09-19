@@ -236,9 +236,10 @@ impl Httpd {
                         .name("tarish-httpd-conn".into())
                         .spawn(move || me.serve_one(stream))
                     {
-                        // Out of threads: fall back to serving inline rather than dropping it.
-                        warn!("could not spawn connection thread ({e}); serving inline");
-                        self.serve_one(stream);
+                        // Out of threads (rare). `stream` was moved into the closure and is gone,
+                        // so drop this connection; the peer opens another and this loop takes it.
+                        // Better than blocking the accept loop trying to serve inline.
+                        warn!("could not spawn connection thread ({e}); dropping this connection");
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
