@@ -197,7 +197,7 @@ impl Httpd {
 
     /// Accept forever. Each connection is handled on its own thread and closed after
     /// one exchange, because AirDrop sets `Connection: close` on every response.
-    pub fn serve(&self) {
+    pub fn serve(self: std::sync::Arc<Self>) {
         // Non-blocking accept, so this loop can notice the interface going out from
         // under it.
         //
@@ -223,7 +223,23 @@ impl Httpd {
                     // The listener is non-blocking; the accepted socket must not be,
                     // or every read in the transfer path returns WouldBlock.
                     let _ = stream.set_nonblocking(false);
-                    self.serve_one(stream);
+                    // Handle each connection on its own thread so a slow TLS handshake, a
+                    // transfer, or one peer's stalled socket does not block the accept loop.
+                    // iOS opens several /Discover connections at once when it decides whether
+                    // to render us; serving them one at a time made the extras pile up in the
+                    // backlog and get RST, so we never appeared — the discovery failure prod
+                    // users hit on libmosey too, since this loop is above the transport. The
+                    // shared state (acceptor, transfers, callbacks) is all Arc, so a clone per
+                    // connection is cheap and safe.
+                    let me = std::sync::Arc::clone(&self);
+                    if let Err(e) = std::thread::Builder::new()
+                        .name("tarish-httpd-conn".into())
+                        .spawn(move || me.serve_one(stream))
+                    {
+                        // Out of threads: fall back to serving inline rather than dropping it.
+                        warn!("could not spawn connection thread ({e}); serving inline");
+                        self.serve_one(stream);
+                    }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     ticks += 1;

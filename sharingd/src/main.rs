@@ -2148,7 +2148,7 @@ fn start_airdrop_server(
             ) {
                 Ok(server) => {
                     log::info!("AirDrop server up as \"{name}\"");
-                    server.serve();
+                    std::sync::Arc::new(server).serve();
                     // serve() only returns if the listener itself died.
                     log::warn!("AirDrop server stopped — rebinding");
                 }
