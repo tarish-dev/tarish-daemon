@@ -742,6 +742,10 @@ struct TarishService {
     names: PeerNames,
     query_now: QueryNow,
     refresh_now: QueryNow,
+    /// Set by resetIdentity(); the browser loop consumes it to withdraw the old
+    /// AirDrop identity, mint a fresh one, and re-advertise. Same signalling shape
+    /// as refresh_now -- a binder thread sets it, the loop swaps it.
+    reset_identity: QueryNow,
     /// Bumped by every setDiscoverable call so an older auto-off timer knows it has
     /// been superseded and must not switch visibility off under a newer request.
     visibility_generation: Arc<std::sync::atomic::AtomicU64>,
@@ -1036,6 +1040,7 @@ impl TarishService {
             names: Arc::new(Mutex::new(std::collections::HashMap::new())),
             query_now: Arc::new(AtomicBool::new(false)),
             refresh_now: Arc::new(AtomicBool::new(false)),
+            reset_identity: Arc::new(AtomicBool::new(false)),
             visibility_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             discoverable,
             active: Arc::new(AtomicBool::new(false)),
@@ -1307,6 +1312,17 @@ impl ITarishService for TarishService {
 
     fn getDeviceName(&self) -> BinderResult<String> {
         Ok(device_name())
+    }
+
+    fn resetIdentity(&self) -> BinderResult<()> {
+        // Signal the browser loop, which owns the Browser: it withdraws the old
+        // instance, mints a fresh one, and re-advertises. Doing it here on the
+        // binder thread would race the loop's exclusive access to the mDNS socket.
+        self.reset_identity.store(true, Ordering::SeqCst);
+        // Nudge a query too, so peers we know are refreshed against the new us.
+        self.query_now.store(true, Ordering::SeqCst);
+        log::info!("identity reset requested");
+        Ok(())
     }
 
     fn reportBlePeer(&self, address: &str, rssi: i32, service_data: &[u8]) -> BinderResult<()> {
@@ -1916,6 +1932,7 @@ fn start_discovery(
     discoverable: Discoverable,
     query_now: QueryNow,
     refresh_now: QueryNow,
+    reset_identity: QueryNow,
 ) {
         let ifc = iface();
     std::thread::spawn(move || {
@@ -2015,6 +2032,19 @@ fn start_discovery(
                 if let Ok(scope) = mdns::ifindex_of(ifc) {
                     probe_name(names.clone(), instance, send::Target { addr, port, scope });
                 }
+            }
+
+            // A requested identity reset: withdraw the OLD instance first (so a peer
+            // drops it rather than keeping it as a ghost pointing at a name we will no
+            // longer answer for), then mint the new one. Clearing was_advertising makes
+            // the block just below re-advertise under the new identity this same pass.
+            if reset_identity.swap(false, Ordering::SeqCst) {
+                if was_advertising {
+                    let _ = browser.stop_advertising();
+                }
+                let new_id = browser.reset_identity();
+                was_advertising = false;
+                log::info!("identity reset — now {new_id}.{}", mdns::AIRDROP_SERVICE);
             }
 
             let want = discoverable.load(Ordering::SeqCst);
@@ -2461,6 +2491,7 @@ fn main() {
         discoverable.clone(),
         service.query_now.clone(),
         service.refresh_now.clone(),
+        service.reset_identity.clone(),
     );
     // The HTTP server refuses transfers while invisible and announces finished ones,
     // so it needs both the flag and the callback list the service owns.

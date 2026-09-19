@@ -143,6 +143,21 @@ impl Browser {
         &self.instance
     }
 
+    /// Forget the current AirDrop identity and mint a fresh random one, persisting it.
+    ///
+    /// The deliberate privacy escape hatch behind the app's "reset identity" control:
+    /// it trades the cross-session continuity a stable identity buys (a peer keeps
+    /// recognising this device) for unlinkability -- peers that had this device saved
+    /// will no longer recognise it. Returns the new instance name.
+    ///
+    /// The caller MUST withdraw the old instance (`stop_advertising`) before this and
+    /// re-announce after, or the old name lingers in a peer's cache for the record TTL
+    /// -- a ghost, the very thing the stable identity exists to remove.
+    pub fn reset_identity(&mut self) -> String {
+        self.instance = mint_identity(&self.iface);
+        self.instance.clone()
+    }
+
     /// Start advertising this device as an AirDrop peer, and announce now.
     ///
     /// Announcing is not optional politeness: a peer that is already browsing
@@ -536,6 +551,15 @@ fn stable_instance(iface: &str) -> String {
             return s.to_lowercase();
         }
     }
+    mint_identity(iface)
+}
+
+/// Mint a fresh random 12-hex identity and persist it, replacing any existing one.
+///
+/// Used both to create the identity on first run (via `stable_instance`) and to
+/// deliberately rotate it (`Browser::reset_identity`). Falls back to the
+/// MAC-derived name if getrandom fails, so it is never a hard failure.
+fn mint_identity(iface: &str) -> String {
     let mut b = [0u8; 6];
     // SAFETY: getrandom(2) writing exactly b.len() bytes into a live buffer.
     let n = unsafe { libc::getrandom(b.as_mut_ptr() as *mut libc::c_void, b.len(), 0) };

@@ -348,4 +348,22 @@ interface ITarishService {
      * APPENDED LAST -- transaction codes are positional.
      */
     void provideWifiDirectGroup(long transferId, in TarishGroup group);
+
+    /**
+     * Forget this device's AirDrop identity and generate a fresh random one.
+     *
+     * The identity is a persisted random 12-hex handle (NOT the MAC, which the radio
+     * randomises on every acquire). It exists so an Apple peer sees ONE stable device
+     * across sessions instead of a new "ghost" tile every time the radio cycles.
+     *
+     * Resetting it is a privacy vs. continuity trade the user owns: it makes this device
+     * unlinkable to peers that had it saved (good for privacy), at the cost that those
+     * peers no longer recognise it and AirDrop to the same devices gets less seamless.
+     * The old identity is withdrawn and the new one advertised immediately; the change
+     * survives reboots. Intended for a "reset identity" control in settings.
+     *
+     * APPENDED LAST -- transaction codes are positional; a new method goes at the end so
+     * an app built against an older interface keeps calling the right transaction.
+     */
+    void resetIdentity();
 }
