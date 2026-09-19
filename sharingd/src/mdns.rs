@@ -98,7 +98,7 @@ impl Browser {
             peers: HashMap::new(),
             ifindex,
             iface: iface.to_string(),
-            instance: instance_name(iface),
+            instance: stable_instance(iface),
             advertising: false,
             can_respond,
         })
@@ -187,7 +187,12 @@ impl Browser {
         if instance == self.full_instance() {
             return true;
         }
-        let now = format!("{}.{}", instance_name(&self.iface), AIRDROP_SERVICE);
+        // Now that the identity is persisted (`stable_instance`), this recompute
+        // equals `self.instance` and the check above already covers it -- but keep
+        // it against the same source so it stays correct if persistence changes
+        // under us mid-session. (Address-based `is_self_addr` remains the
+        // drift-proof self-test.)
+        let now = format!("{}.{}", stable_instance(&self.iface), AIRDROP_SERVICE);
         instance == now
     }
 
@@ -496,19 +501,62 @@ fn short(instance: &str) -> &str {
     instance.split('.').next().unwrap_or(instance)
 }
 
+/// Where the deliberate, MAC-independent AirDrop identity is persisted.
+///
+/// `/data/misc/tarish` is our data dir (0700, `tarish_data_file`, owned by
+/// `system_ext_tarish`); we already create files under it (`inbox/`), so this
+/// needs no new SELinux policy.
+const IDENTITY_PATH: &str = "/data/misc/tarish/identity";
+
+/// A stable 12-hex AirDrop instance name, persisted across sessions.
+///
+/// The instance name is what an Apple peer keys its cache on. Deriving it from
+/// the interface MAC (see `instance_name`) makes it change every time the radio
+/// is acquired -- mosey0 is destroyed and recreated with a fresh random MAC on
+/// demand, not just per reboot -- so every session a peer sees a brand-new
+/// device and the previous ones linger as unreachable "ghost" tiles pointing at
+/// a now-dead link-local address. The `is_self_instance` / cache-flush handling
+/// keeps *us* consistent within a session, but nothing collapses the peer's view
+/// across sessions.
+///
+/// The fix the old `instance_name` comment asked for: a deliberate identity, not
+/// a side effect. Read the persisted value if well-formed; otherwise mint one
+/// (6 random bytes, 12 hex) and persist it. Apple's own instance names are
+/// arbitrary 12-hex and need not equal the AWDL MAC, so an invented value
+/// interoperates fine while giving the peer a constant handle -- one tile per
+/// device, whose AAAA we refresh (cache-flush) each session.
+///
+/// If persistence is unavailable (getrandom or the write fails), fall back to
+/// the MAC-derived name: no worse than the pre-existing behaviour, never a
+/// hard failure.
+fn stable_instance(iface: &str) -> String {
+    if let Ok(s) = std::fs::read_to_string(IDENTITY_PATH) {
+        let s = s.trim();
+        if s.len() == 12 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+            return s.to_lowercase();
+        }
+    }
+    let mut b = [0u8; 6];
+    // SAFETY: getrandom(2) writing exactly b.len() bytes into a live buffer.
+    let n = unsafe { libc::getrandom(b.as_mut_ptr() as *mut libc::c_void, b.len(), 0) };
+    if n != b.len() as isize {
+        log::error!("getrandom failed minting AirDrop identity — using MAC-derived name");
+        return instance_name(iface);
+    }
+    let id: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    // Best-effort persist. A failure only means the id is not stable *yet* -- we
+    // still return this session's id and retry next start; the pre-existing
+    // (unstable) behaviour, not a regression.
+    if let Err(e) = std::fs::write(IDENTITY_PATH, &id) {
+        log::warn!("could not persist AirDrop identity to {IDENTITY_PATH}: {e} — id not stable yet");
+    }
+    id
+}
+
 /// A 12-hex-character instance name derived from the interface MAC, matching the
-/// shape Apple uses.
-///
-/// NOT stable across sessions, despite what an earlier version of this comment
-/// claimed: AWDL randomises the interface MAC every time the link comes up, so
-/// the name changes on every restart of tarishd. Observed going from
-/// c66a180ad90e to 92c8e169f34a across one reboot.
-///
-/// That is arguably correct for privacy -- a fixed identifier is a tracking
-/// handle -- but it means a peer cannot recognise this device as one it has seen
-/// before. If pairing ever needs continuity, the identity has to come from
-/// somewhere other than the MAC, and be a deliberate choice rather than a
-/// side effect.
+/// shape Apple uses. **Fallback only** now -- see `stable_instance`, which is
+/// what the Browser is built with. Kept because it is the last resort when the
+/// persisted identity cannot be read or minted.
 fn instance_name(iface: &str) -> String {
     if let Ok(mac) = std::fs::read_to_string(format!("/sys/class/net/{iface}/address")) {
         let hex: String = mac.trim().split(':').collect();
