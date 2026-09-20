@@ -1424,6 +1424,16 @@ impl ITarishService for TarishService {
     }
 
     fn quickShareAdvertisement(&self, bluetooth_mac: &str) -> BinderResult<Vec<u8>> {
+        // Do not advertise Quick Share at all when policy forbids receiving it. Otherwise the app
+        // publishes a BLE endpoint + RFCOMM listener, a sender (e.g. a Pixel) discovers us as a
+        // Quick Share target, connects, and only THEN gets refused at receiveOnSocket — which reads
+        // as "failed" on the sender, and for a peer that also speaks AirDrop it stops there rather
+        // than ever trying AirDrop. An empty advertisement makes QuickShareReceiver.start() bail
+        // before it listens or advertises, so a disabled Quick Share is genuinely invisible.
+        if !allows_receive(self.quickshare_mode()) {
+            log::info!("quickShareAdvertisement: Quick Share receive is off — not advertising");
+            return Ok(Vec::new());
+        }
         let Some(mac) = parse_mac(bluetooth_mac) else {
             log::warn!("quickShareAdvertisement: {bluetooth_mac:?} is not a Bluetooth address");
             return Ok(Vec::new());
