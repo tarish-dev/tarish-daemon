@@ -552,7 +552,14 @@ impl Httpd {
                     Ok(path) => {
                         info!("/Upload stored at {path}");
                         self.transfers.finish(id);
-                        respond(tls, 200, None, keep_alive)?
+                        // /Upload is the LAST request in an AirDrop exchange (Discover -> Ask ->
+                        // Upload). Even though the connection arrived keep-alive (the Mac reuses the
+                        // /Ask socket for /Upload), nothing follows /Upload -- so answer `close` and
+                        // hang up. Leaving it keep-alive left the sender waiting on a connection we
+                        // would never speak on again: it hung ~30 s then RST, which is the "takes
+                        // time to finish" delay (the bytes were already all received).
+                        respond(tls, 200, None, false)?;
+                        return Ok(Disposition::Close);
                     }
                     Err(e) => {
                         error!("/Upload failed: {e}");
