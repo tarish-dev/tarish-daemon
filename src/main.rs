@@ -74,27 +74,24 @@ const CHANNELS_5: &[u8] = &[149, 44];
 /// channel it may not use, so regulatory domains remain its decision, not ours.
 fn channels_for(sta_freq_mhz: i32) -> Vec<&'static [u8]> {
     match sta_freq_mhz {
-        // THE ADAPTER BEING OFF IS NOT THE SAME UNKNOWN.
+        // PREFER 5 GHz (ch149) WHENEVER THERE IS NO 5 GHz ASSOCIATION TO PROTECT.
         //
-        // The 2.4 GHz preference below exists to keep Wi-Fi able to come back: take 5
-        // GHz while the band is unknown and the association cannot re-form there, so
-        // the client keeps reporting nothing and we keep taking 5 GHz. That loop needs
-        // an adapter that is trying to associate. A switched-off one is not, and cannot
-        // be locked out of anything.
+        // Finding 120: on ch149 the AWDL link is ~3.4 MB/s and discovers reliably; on ch6 it is
+        // ~138 KB/s and flaky. Both symptoms the test team reported (slow transfers, unstable
+        // discovery) were this channel choice, not the daemon. So default to 5 GHz.
         //
-        // It is also the case where the choice matters most. AirDrop on 2.4 GHz measured
-        // 0.87 MB/s on frankel; 5 GHz is where the bandwidth is, and with Wi-Fi off the
-        // whole radio is free. The user switching Wi-Fi back on ends this immediately --
-        // the client then reports 0, not -1, and the next session picks 2.4 again.
-        // UNKNOWN IS NOT "NOTHING TO AVOID". Taking 5 GHz here stops Wi-Fi from
-        // ASSOCIATING on 5 GHz at all, which is how a phone gets stuck: the radio is
-        // up, Wi-Fi cannot come back, so the client keeps reporting 0, so we keep
-        // taking 5 GHz. Observed exactly that. 2.4 GHz is the safer unknown -- these
-        // devices are usually on 5 GHz, and same-band only clashes when the channels
-        // differ.
-        f if f < 0 => vec![CHANNELS_5, CHANNELS_24],     // Wi-Fi off -> take the good band
-        0 => vec![CHANNELS_24, CHANNELS_5],
-        f if f >= 5000 => vec![CHANNELS_24, CHANNELS_5], // Wi-Fi on 5 GHz -> AWDL on 2.4
+        // The one case we still keep on 2.4 GHz is a LIVE 5 GHz Wi-Fi association (`f >= 5000`):
+        // this chip is DBS (2.4 + ONE 5 GHz channel), so AWDL on a *different* 5 GHz channel kills
+        // that association (measured). That guard stays.
+        //
+        // The old code also kept the `0` (adapter on, not associated) case on 2.4, to avoid AWDL
+        // locking Wi-Fi out of associating on 5 GHz. That trade is no longer worth it: AWDL is
+        // on-demand (up only during an active AirDrop session, released when idle), so Wi-Fi can
+        // associate on 5 GHz whenever AirDrop is not in use, and during an active transfer the
+        // ch149 speed/discovery win beats a background join. So `0` now prefers 5 GHz too.
+        f if f < 0 => vec![CHANNELS_5, CHANNELS_24],     // Wi-Fi off -> the good band (5 GHz)
+        0 => vec![CHANNELS_5, CHANNELS_24],              // no association -> 5 GHz too (finding 120)
+        f if f >= 5000 => vec![CHANNELS_24, CHANNELS_5], // live 5 GHz assoc -> AWDL on 2.4 (DBS guard)
         _ => vec![CHANNELS_5, CHANNELS_24],              // Wi-Fi on 2.4 -> AWDL on 5
     }
 }
