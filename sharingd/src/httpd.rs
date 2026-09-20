@@ -150,6 +150,30 @@ fn describe_offer(body: &[u8]) -> (String, Vec<String>) {
     (from, names)
 }
 
+/// What the /Ask wait resolved to. Distinguishes a sender cancel (the connection closed
+/// while we were asking) from a local decline or a timeout, so we can take the prompt
+/// down instead of leaving it up.
+enum AskOutcome {
+    Accept,
+    Decline,
+    Cancelled,
+    Timeout,
+}
+
+/// True if the peer has closed its end of `ctl` (the /Ask connection). A one-byte
+/// non-blocking peek returns Ok(0) at EOF; anything else means still connected (unexpected
+/// early data is treated as still connected). `ctl` is a second handle on the same socket as
+/// the TLS stream, so blocking mode is restored before returning — the /Upload reads need it.
+fn peer_hung_up(ctl: &TcpStream) -> bool {
+    if ctl.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let mut b = [0u8; 1];
+    let gone = matches!(ctl.peek(&mut b), Ok(0));
+    let _ = ctl.set_nonblocking(false);
+    gone
+}
+
 impl Httpd {
     /// Bind TLS on `iface`'s link-local address at `port`.
     pub fn new(
@@ -503,16 +527,20 @@ impl Httpd {
                 let answer = if auto {
                     info!("offer {id} auto-accepted — policy does not require confirmation");
                     self.transfers.answer(id, true);
-                    Some(true)
+                    AskOutcome::Accept
                 } else {
-                    self.transfers.await_answer(id, ASK_TIMEOUT)
+                    // Wait for the local decision, but also watch the sender's connection.
+                    // The sender holds this /Ask socket open until we answer; if the person
+                    // cancels on the SENDING device it closes, and we must take the prompt
+                    // down rather than leave a stale Accept/Decline card up until the timeout.
+                    self.await_answer_watching(id, ASK_TIMEOUT, ctl)
                 };
                 match answer {
-                    Some(true) => {
+                    AskOutcome::Accept => {
                         info!("offer {id} accepted");
                         respond(tls, 200, Some(&self.ask_body()), keep_alive)?
                     }
-                    Some(false) => {
+                    AskOutcome::Decline => {
                         info!("offer {id} declined");
                         self.transfers.finish(id);
                         // 401 is what an Apple receiver sends on decline, and what our
@@ -520,7 +548,17 @@ impl Httpd {
                         respond(tls, 401, None, false)?;
                         return Ok(Disposition::Close);
                     }
-                    None => {
+                    AskOutcome::Cancelled => {
+                        info!("offer {id} cancelled by the sender — taking the prompt down");
+                        // The sender is gone; tell the app so the Accept/Decline card comes
+                        // down instead of hanging until the 45 s timeout. -3 (STATUS_CANCELLED
+                        // in the app) so it reads "Cancelled", not "Could not send" -- nothing
+                        // failed, the sender backed out.
+                        self.each_callback(|cb| cb.onTransferFinished(id, -3));
+                        self.transfers.finish(id);
+                        return Ok(Disposition::Close);
+                    }
+                    AskOutcome::Timeout => {
                         warn!("offer {id} went unanswered for {ASK_TIMEOUT:?} — refusing");
                         self.transfers.finish(id);
                         respond(tls, 401, None, false)?;
@@ -562,10 +600,20 @@ impl Httpd {
                         return Ok(Disposition::Close);
                     }
                     Err(e) => {
-                        error!("/Upload failed: {e}");
-                        // -1 tells the client this ended without files rather than
-                        // leaving its progress bar stuck at whatever it last saw.
-                        self.each_callback(|cb| cb.onTransferFinished(id, -1));
+                        // A sender that closed the connection mid-upload cancelled the
+                        // transfer (see sender_cancelled): report -3 ("Cancelled"), the same
+                        // as a cancel at the prompt. Any other error is a genuine failure:
+                        // -1 ("Could not send"). Either way the app is told, so its progress
+                        // screen comes down instead of hanging at whatever it last saw.
+                        let cancelled = e.kind() == std::io::ErrorKind::ConnectionAborted;
+                        let status = if cancelled {
+                            info!("/Upload: sender cancelled mid-transfer");
+                            -3
+                        } else {
+                            error!("/Upload failed: {e}");
+                            -1
+                        };
+                        self.each_callback(|cb| cb.onTransferFinished(id, status));
                         self.transfers.finish(id);
                         respond(tls, 500, None, false)?;
                         return Ok(Disposition::Close);
@@ -653,6 +701,34 @@ impl Httpd {
             ("ReceiverModelName", Value::Str(self.model.clone())),
             ("ReceiverComputerName", Value::Str(crate::device_name())),
         ])
+    }
+
+    /// Wait for the local Accept/Decline, but also watch the sender's /Ask connection.
+    /// The sender holds it open until we answer; if it closes, the person cancelled on the
+    /// sending device — return Cancelled so the caller can take the prompt down instead of
+    /// leaving it up for the full timeout.
+    fn await_answer_watching(
+        &self,
+        id: i64,
+        timeout: Duration,
+        ctl: Option<&TcpStream>,
+    ) -> AskOutcome {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match self.transfers.await_answer(id, ACCEPT_POLL) {
+                Some(true) => return AskOutcome::Accept,
+                Some(false) => return AskOutcome::Decline,
+                None => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                return AskOutcome::Timeout;
+            }
+            if let Some(c) = ctl {
+                if peer_hung_up(c) {
+                    return AskOutcome::Cancelled;
+                }
+            }
+        }
     }
 
     fn offered(&self, id: i64, from: &str, names: &[String]) {
@@ -922,8 +998,16 @@ impl Httpd {
                 self.announce(id, &names);
             }
             // Kept on failure: it is the only copy of what the peer sent, and deleting
-            // it would destroy the evidence needed to work out why.
-            Err(e) => error!("/Upload: extraction failed ({e}) — archive kept at {path}"),
+            // it would destroy the evidence needed to work out why. This is most often a
+            // sender who cancelled mid-upload — stream_chunked reads the early close as a
+            // clean end of stream, so the archive is truncated and extract refuses it.
+            // Propagate the error rather than returning Ok: it is what makes the /Upload
+            // handler tell the app the transfer failed (onTransferFinished), instead of
+            // leaving the receiver stuck on the progress screen forever.
+            Err(e) => {
+                error!("/Upload: extraction failed ({e}) — archive kept at {path}");
+                return Err(e);
+            }
         }
         Ok(path)
     }
@@ -1209,7 +1293,13 @@ fn stream_chunked<S: Read, W: std::io::Write>(
             let want = left.min(buf.len());
             let n = s.read(&mut buf[..want])?;
             if n == 0 {
-                return Ok(total); // peer went away mid-chunk
+                // EOF inside a chunk, before its declared size was satisfied. A completed
+                // transfer instead reaches the size==0 terminating chunk above; this is the
+                // sender tearing the request body down early. A chunked POST body has no
+                // in-band HTTP abort, so closing the connection mid-body IS how AirDrop
+                // cancels an in-flight upload. Surface it distinctly so the caller can tell
+                // the app "Cancelled" rather than treating a partial file as success.
+                return Err(sender_cancelled());
             }
             if sniff.len() < 16 {
                 sniff.extend_from_slice(&buf[..n.min(16 - sniff.len())]);
@@ -1242,7 +1332,11 @@ fn stream_exact<S: Read, W: std::io::Write>(
         let want = ((len - total) as usize).min(buf.len());
         let n = s.read(&mut buf[..want])?;
         if n == 0 {
-            break;
+            // Fewer than content-length bytes and the socket closed: the sender aborted the
+            // upload mid-body -- the same cancel signal as the chunked case (a closed
+            // connection is how an in-flight POST is cancelled). Report it as a cancel
+            // instead of ending quietly with a partial file.
+            return Err(sender_cancelled());
         }
         if sniff.len() < 16 {
             sniff.extend_from_slice(&buf[..n.min(16 - sniff.len())]);
@@ -1256,6 +1350,18 @@ fn stream_exact<S: Read, W: std::io::Write>(
     }
     out.flush()?;
     Ok(total)
+}
+
+/// The error marking a sender that closed the upload connection before sending all the bytes
+/// it promised -- i.e. cancelled an in-flight AirDrop transfer. A chunked POST body cannot be
+/// aborted with an in-band message, so a mid-transfer connection close is the cancel signal.
+/// The `/Upload` handler recognises this `ErrorKind` and tells the app "Cancelled" rather
+/// than "Could not send".
+fn sender_cancelled() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::ConnectionAborted,
+        "sender cancelled mid-transfer",
+    )
 }
 
 /// Leaf names of files waiting to be collected.
