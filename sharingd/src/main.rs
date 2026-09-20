@@ -2071,9 +2071,14 @@ fn start_discovery(
                 was_advertising = false;
             }
 
-            // Re-announce periodically: a peer that started browsing after us has
-            // no reason to query again, so silence means invisibility.
-            if was_advertising && since_announce >= Duration::from_secs(20) {
+            // Re-announce frequently: a peer that started browsing after us has no reason to
+            // query again, so silence means invisibility — and worse, an Apple sender waits for
+            // a fresh announce to refresh our address before it sends the offer, so a slow cadence
+            // shows up directly as tap->prompt latency (finding 124: ~3-5s vs libmosey ~1s, which
+            // announces in reactive bursts). 20s was far too slow for that; 1s keeps a current
+            // record in front of the sender at all times. The loop ticks every 500ms, so this is
+            // one extra small multicast every ~1s while visible — cheap.
+            if was_advertising && since_announce >= Duration::from_secs(1) {
                 let _ = browser.announce();
                 since_announce = Duration::ZERO;
             }
