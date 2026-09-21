@@ -1,0 +1,38 @@
+# tarishctl — shell access to the daemon, for testing. NOT SHIPPED. USERDEBUG DEV ONLY.
+#
+# This file is named *-review.te on purpose: scripts/gos-sepolicy.sh globs every *.te
+# EXCEPT *-review.te, so nothing here is compiled into the image. It is reference, not
+# policy. Read on for why it cannot be shipped as-is, and why it does not need to be.
+#
+# WHY NOT SHIPPED. The gating idiom below, userdebug_or_eng(`...'), is undefined in this
+# tree: the macro exists nowhere in system/sepolicy, and gos-sepolicy installs into
+# product-private (vendor/localsepolicy/product/private), whose m4 pass does not define
+# it. So checkpolicy sees the raw backtick/apostrophe and fails BOTH product_sepolicy.conf
+# and recovery_sepolicy.conf with "unrecognized character at token '''". Dropping the
+# guard and shipping the bare allows is worse: with no variant gate they would compile
+# into a USER/RELEASE image and hand every shell on a locked device the ability to start a
+# transfer and send files off it — exactly the widening the guard was meant to prevent.
+#
+# WHY IT DOES NOT NEED SHIPPING. tarishctl is a debug tool used only under SELinux
+# permissive: every harness run does `setenforce 0` first (see qs-suite2.sh and
+# docs/APP-INTEGRATION.md), and on a permissive build no allow rule is required for the
+# shell to reach the service. The binary itself is still confined to userdebug/eng by the
+# PRODUCT_PACKAGES guard in tarish.mk, so it never lands on a production image at all.
+#
+# If tarishctl on an ENFORCING userdebug build is ever wanted, the correct fix is to gate
+# these rules with a define that DOES exist in the product-private m4 pass (verify which
+# one first) rather than userdebug_or_eng, then rename this file back to tarishctl.te.
+#
+# ---- reference policy (not compiled) ----------------------------------------------
+#
+#   allow shell tarish_service:service_manager find;
+#   binder_call(shell, tarishsharingd)
+#   binder_call(tarishsharingd, shell)
+#
+#   # Sending needs the daemon to read the file descriptors the shell passes it.
+#   allow tarishsharingd shell:fd use;
+#   allow tarishsharingd shell_data_file:file { read getattr };
+#   allow tarishsharingd shell_data_file:dir search;
+#
+#   # The app's shell control channel (DebugBridge abstract-namespace socket).
+#   allow shell platform_app:unix_stream_socket connectto;
