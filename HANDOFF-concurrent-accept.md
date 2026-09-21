@@ -6,7 +6,7 @@ connections (SYN/RST storm) and blocks live transfers for seconds. Prod users on
 libmosey transport report the same discovery unreliability, so this is a prod fix, not a
 dev-only one.
 
-Full diagnosis: `tarish-libawdl/docs/FINDINGS.md` findings 109 and 110.
+Full diagnosis: `tarish-link/docs/FINDINGS.md` findings 109 and 110.
 
 ## What changed (commit 82d94cc)
 
@@ -69,7 +69,7 @@ independent on-air witness.
 
 ## If it helps, then revisit (in this order)
 
-1. **immediate-ACK is already in** `tarish-libawdl` (c1976b9) — keep it.
+1. **immediate-ACK is already in** `tarish-link` (c1976b9) — keep it.
 2. Only after churn is fixed, re-evaluate **ACK redundancy** (`ACK_REPEAT` knob in
-   `libawdl-session`, currently a no-op) with a proper multi-run A/B — it was inconclusive and
+   `tlink-session`, currently a no-op) with a proper multi-run A/B — it was inconclusive and
    possibly contention-negative while churn dominated (finding 110).
