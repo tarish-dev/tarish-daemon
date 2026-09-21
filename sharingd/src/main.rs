@@ -41,6 +41,59 @@ use dev_tarish::aidl::dev::tarish::{
 
 const SERVICE_NAME: &str = "dev.tarish.ITarishService/default";
 
+/// This build's version, shown in the app's About screen (getDaemonVersion). The daemon is
+/// Soong-built, not cargo, so it is a plain constant rather than CARGO_PKG_VERSION.
+const TARISH_VERSION: &str = "0.3.0";
+
+/// The AWDL stack (tlink) version, read from the shim's optional `mosey_version` symbol.
+///
+/// The shim is loaded by tarishd, not this process, so we dlopen it here purely to read the
+/// string (RTLD_LAZY, nothing is started -- mosey_start_5 is never called). Resolved once
+/// and cached. "unknown" when the loaded library does not export the symbol: an older pin,
+/// or Google's own libmosey.
+fn link_version() -> String {
+    use std::ffi::{c_char, c_int, c_void, CStr, CString};
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<String> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            const RTLD_LAZY: c_int = 1;
+            extern "C" {
+                fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
+                fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+            }
+            let candidates = [
+                "libmosey_daemon_ffi.so\0",
+                "/system_ext/lib64/libmosey_daemon_ffi.so\0",
+                "/vendor/lib64/libmosey_daemon_ffi.so\0",
+            ];
+            let sym = CString::new("mosey_version").unwrap();
+            for path in candidates {
+                // SAFETY: NUL-terminated literals; we only READ the static string the symbol
+                // returns and never call any transport function.
+                unsafe {
+                    let h = dlopen(path.as_ptr() as *const c_char, RTLD_LAZY);
+                    if h.is_null() {
+                        continue;
+                    }
+                    let p = dlsym(h, sym.as_ptr());
+                    if p.is_null() {
+                        continue;
+                    }
+                    let f: unsafe extern "C" fn() -> *const c_char = std::mem::transmute(p);
+                    let vp = f();
+                    if !vp.is_null() {
+                        if let Ok(s) = CStr::from_ptr(vp).to_str() {
+                            return s.to_string();
+                        }
+                    }
+                }
+            }
+            "unknown".to_string()
+        })
+        .clone()
+}
+
 /// The AWDL data interface. Configurable so the daemon runs over Google's `libmosey`
 /// (`mosey0`) or over `tarish-link` (`tlink0`): `$TARISH_IFACE`, then
 /// `persist.tarish.iface`, else the default. Resolved once.
@@ -1328,6 +1381,14 @@ impl ITarishService for TarishService {
         self.query_now.store(true, Ordering::SeqCst);
         log::info!("identity reset requested");
         Ok(())
+    }
+
+    fn getDaemonVersion(&self) -> BinderResult<String> {
+        Ok(TARISH_VERSION.to_string())
+    }
+
+    fn getLinkVersion(&self) -> BinderResult<String> {
+        Ok(link_version())
     }
 
     fn reportBlePeer(&self, address: &str, rssi: i32, service_data: &[u8]) -> BinderResult<()> {

@@ -366,4 +366,20 @@ interface ITarishService {
      * an app built against an older interface keeps calling the right transaction.
      */
     void resetIdentity();
+
+    /**
+     * Version of tarishd itself (its crate version), for the app's About screen.
+     *
+     * APPENDED LAST -- transaction codes are positional.
+     */
+    String getDaemonVersion();
+
+    /**
+     * Version of the AWDL stack (tlink) the daemon is running: the shim it dlopened, read
+     * from that library's optional `mosey_version` symbol. Returns "unknown" when the
+     * loaded library does not export it -- an older pin, or Google's own libmosey.
+     *
+     * APPENDED LAST -- transaction codes are positional.
+     */
+    String getLinkVersion();
 }
