@@ -530,12 +530,13 @@ where
     )
     .map_err(|_| bad("could not derive session keys"))?;
     // Four digits of the auth string, the value stock Quick Share shows so two people
-    // can compare screens. Logged rather than surfaced because there is nowhere to show
-    // it yet; it is the same value the peer computes.
-    debug!(
-        "quickshare: session pin {:04}",
+    // can compare screens. Now surfaced to the receiver's app via onTransferPinDisplay
+    // (below, with the offer), so the person can read it out to the sender.
+    let session_pin = format!(
+        "{:04}",
         u16::from_be_bytes([secrets.auth_string[0], secrets.auth_string[1]]) % 10_000
     );
+    debug!("quickshare: session pin {session_pin}");
     let mut channel = SecureChannel::new(keys, Role::Server);
     info!("quickshare: encrypted channel up with {peer_name:?}");
 
@@ -597,6 +598,11 @@ where
                             total_bytes as i64,
                             1,
                         )
+                    });
+                    // Show the session PIN on THIS (receiving) device so the person can
+                    // read it to the sender, who types it when Require PIN is on.
+                    notify(callbacks, |cb| {
+                        cb.onTransferPinDisplay(transfer_id, &session_pin)
                     });
 
                     let accepted = host.ask(transfer_id, &peer_name, &intro.files);

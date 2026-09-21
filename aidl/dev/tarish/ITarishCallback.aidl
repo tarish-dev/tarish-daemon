@@ -87,4 +87,18 @@ oneway interface ITarishCallback {
      * APPENDED LAST -- transaction codes are positional.
      */
     void onGroupNeeded(long transferId);
+
+    /**
+     * Show the session PIN on the RECEIVING device so the person can read it out to the
+     * sender, who types it to confirm they are sending to the right device.
+     *
+     * This is the counterpart to onTransferPinRequired, and unlike that call it DOES carry
+     * the value -- correctly: the whole point is for the receiver to display it. The
+     * security rule (a sender must never see its own copy) is about the SENDER, so the PIN
+     * still never reaches the sending side over the wire or this interface. Fired on the
+     * receiver when the encrypted channel comes up, alongside onTransferOffered.
+     *
+     * APPENDED LAST -- transaction codes are positional.
+     */
+    void onTransferPinDisplay(long transferId, String pin);
 }
