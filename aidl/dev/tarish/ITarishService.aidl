@@ -382,4 +382,14 @@ interface ITarishService {
      * APPENDED LAST -- transaction codes are positional.
      */
     String getLinkVersion();
+
+    /**
+     * The Quick Share peers currently discovered over the LAN (mDNS on wlan0), each as
+     * "endpointId|name|addr:port". This is the table sendFilesOnLan resolves against, so a
+     * caller (e.g. tarishctl for automated testing) can see exactly what a LAN send would
+     * reach without parsing rotating log lines. Empty off-network or before discovery.
+     *
+     * APPENDED LAST -- transaction codes are positional.
+     */
+    String[] getQuickShareLanPeers();
 }

@@ -80,6 +80,14 @@ fn run() -> Result<(), String> {
                 println!("{} {} {}", p.id, p.protocol, p.name);
             }
         }
+        "qs-peers" => {
+            // Quick Share LAN peers (mDNS on wlan0) as "endpointId|name|addr:port" -- the
+            // table send-lan resolves against. Lets a test script pick a live endpoint id
+            // deterministically instead of scraping rotating log lines.
+            for line in svc.getQuickShareLanPeers().map_err(|e| e.to_string())? {
+                println!("{line}");
+            }
+        }
         "name" => match args.get(1) {
             Some(n) => svc.setDeviceName(n).map_err(|e| e.to_string())?,
             None => println!("{}", svc.getDeviceName().map_err(|e| e.to_string())?),

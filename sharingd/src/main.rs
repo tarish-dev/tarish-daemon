@@ -1391,6 +1391,31 @@ impl ITarishService for TarishService {
         Ok(link_version())
     }
 
+    fn getQuickShareLanPeers(&self) -> BinderResult<Vec<String>> {
+        let out = self
+            .qs_lan
+            .lock()
+            .map(|t| {
+                t.iter()
+                    .map(|p| {
+                        let addr = p
+                            .addr
+                            .map(|a| a.to_string())
+                            .unwrap_or_else(|| p.host.clone());
+                        format!(
+                            "{}|{}|{}:{}",
+                            p.endpoint_id,
+                            p.name.as_deref().unwrap_or(""),
+                            addr,
+                            p.port
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(out)
+    }
+
     fn reportBlePeer(&self, address: &str, rssi: i32, service_data: &[u8]) -> BinderResult<()> {
         let Some(a) = tarish_protocol::ble::parse_advertisement(service_data) else {
             return Ok(()); // not an advertisement we understand; nothing to report
