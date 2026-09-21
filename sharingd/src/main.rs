@@ -240,12 +240,6 @@ pub(crate) struct TransferState {
     /// bringing it up for a Quick Share transfer drops wlan0 and kills the
     /// very transfer that asked for it.
     needs_awdl: AtomicBool,
-    /// Set while a Quick Share transfer is using (or standing up) Wi-Fi Direct. The chip
-    /// cannot host a P2P group owner while AWDL is active -- the driver refuses createGroup
-    /// with "active iface = WL_IF_TYPE_ART, can't support new iface = WL_IF_TYPE_P2P_GO" --
-    /// so AWDL has to yield the radio for the duration. The radio gate forces the AWDL
-    /// property off while this is set, and finish() clears it so AWDL comes straight back.
-    wifi_direct: AtomicBool,
 }
 
 impl TransferState {
@@ -266,19 +260,6 @@ impl TransferState {
         self.current.load(Ordering::SeqCst) != 0 && self.needs_awdl.load(Ordering::SeqCst)
     }
 
-    /// Claim the radio for Wi-Fi Direct: AWDL must yield the P2P slot. Returns true if this
-    /// call is the one that flipped it on (so the caller waits for AWDL to actually drop
-    /// before creating/joining the group); false if it was already held.
-    pub(crate) fn hold_wifi_direct(&self) -> bool {
-        !self.wifi_direct.swap(true, Ordering::SeqCst)
-    }
-
-    /// True while any Quick Share transfer needs Wi-Fi Direct — the radio gate keeps AWDL
-    /// off while this holds.
-    pub(crate) fn wifi_direct_held(&self) -> bool {
-        self.wifi_direct.load(Ordering::SeqCst)
-    }
-
     pub(crate) fn current(&self) -> i64 {
         self.current.load(Ordering::SeqCst)
     }
@@ -289,9 +270,6 @@ impl TransferState {
         // descriptor parked in that slot. Nothing will ever read it, and it would sit open
         // until the next upgrade replaced it, so drop it with the transfer that asked.
         self.clear_upgrade(id);
-        // Release the Wi-Fi Direct hold so AWDL comes back up. Tied to finish() rather than
-        // to the group teardown so it ALWAYS runs, however the transfer ended.
-        self.wifi_direct.store(false, Ordering::SeqCst);
     }
 
     /// Cancel by id rather than "whatever is running": a stale tap from a client that
@@ -670,23 +648,6 @@ fn write_property(name: &str, value: &str) -> bool {
     unsafe { __system_property_set(n.as_ptr(), v.as_ptr()) == 0 }
 }
 
-/// Make AWDL yield the radio so a Wi-Fi Direct group can form, and wait for it to drop.
-///
-/// The chip cannot host a P2P group owner while AWDL holds the P2P slot, so a Quick Share
-/// transfer that upgrades to (or hosts) Wi-Fi Direct off-network has to pause AWDL for its
-/// duration. Idempotent per transfer via `hold_wifi_direct`; the hold is released in
-/// `finish()` and the radio gate brings AWDL back. Only the first caller pushes the property
-/// off and waits — tarishd polls it every 500 ms, then tears the session down.
-fn yield_radio_for_wifi_direct(transfers: &Transfers) {
-    if transfers.hold_wifi_direct() {
-        write_property(WANT_PROP, "0");
-        log::info!("quickshare: pausing AWDL to free the radio for Wi-Fi Direct");
-        // tarishd's poll (500 ms) plus the session teardown; give it room so createGroup
-        // does not race a still-active AWDL and fail with the ART/P2P_GO role conflict.
-        std::thread::sleep(Duration::from_millis(2500));
-    }
-}
-
 /// Tell tarishd whether the AWDL radio is wanted.
 ///
 /// WHY A THREAD AND NOT A WRITE AT EACH CALL SITE
@@ -777,10 +738,7 @@ fn start_radio_gate(
                 let since = *idle_since.get_or_insert_with(std::time::Instant::now);
                 since.elapsed() < LINGER
             };
-            // A Quick Share Wi-Fi Direct transfer forces AWDL down for its duration: the
-            // chip won't host a P2P group owner while AWDL holds the P2P slot. finish()
-            // clears the hold and AWDL comes straight back.
-            let want = permitted && want_by_activity && !transfers.wifi_direct_held();
+            let want = permitted && want_by_activity;
 
             // Compare against what the property ACTUALLY says, not only against our own
             // last write. Tracking just our own writes means that if the value is
@@ -1056,10 +1014,6 @@ impl quickshare::outbound::Progress for TransferProgress {
         &self,
         req: &quickshare::outbound::WifiJoin,
     ) -> Option<std::net::TcpStream> {
-        // FREE THE RADIO FIRST. Joining a Wi-Fi Direct group stands up a P2P client iface,
-        // which the chip also refuses while AWDL holds the P2P slot. Pause AWDL and wait for
-        // it to drop before the client tries to join. Released in finish() when the send ends.
-        yield_radio_for_wifi_direct(&self.transfers);
         // Ask whoever is bound. No client means no radio, so there is nothing to wait for
         // -- return at once rather than parking the transfer for thirty seconds to
         // discover that. A transfer running with no client bound is ordinary: the send was
@@ -3133,10 +3087,6 @@ impl quickshare::connection::Host for QsHost {
     }
 
     fn host_group(&self) -> Option<quickshare::connection::WifiGroup> {
-        // FREE THE RADIO FIRST. The client is about to call createGroup, which the chip
-        // refuses while AWDL holds the P2P slot. Pause AWDL and wait for it to drop before
-        // we ask, or the very first createGroup races a live AWDL and fails.
-        yield_radio_for_wifi_direct(&self.transfers);
         // ASKED REPEATEDLY, NOT ONCE.
         //
         // onGroupNeeded is oneway, so it reaches whoever is registered at the instant it is
