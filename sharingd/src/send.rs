@@ -135,10 +135,26 @@ pub fn send(
                 header.name = format!("./{}", item.name);
                 header.file_size = item.size;
                 header.mode = 0o100644;
-                let mut counting = Counting { inner: &mut item.file, seen: 0 };
-                cpio.append_header_with_reader(header, &mut counting)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-                done += counting.seen;
+                // Report progress WHILE the file streams, not just once when it finishes.
+                // A single-file send used to call progress() one time, at 100%, so the
+                // sender's ring only ever spun -- the counting reader now reports
+                // incrementally, throttled to ~1% steps so it does not flood the callback.
+                let step = (total / 100).max(64 * 1024);
+                let seen = {
+                    let mut counting = Counting {
+                        inner: &mut item.file,
+                        seen: 0,
+                        base: done,
+                        total,
+                        last: done,
+                        step,
+                        report: &mut progress,
+                    };
+                    cpio.append_header_with_reader(header, &mut counting)
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    counting.seen
+                };
+                done += seen;
                 progress(done, total);
             }
             cpio.finish()
@@ -395,12 +411,23 @@ impl<S: Write> Write for ChunkedWriter<'_, S> {
 struct Counting<'a, R: Read> {
     inner: &'a mut R,
     seen: u64,
+    base: u64,
+    total: u64,
+    last: u64,
+    step: u64,
+    report: &'a mut dyn FnMut(u64, u64),
 }
 
 impl<R: Read> Read for Counting<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.read(buf)?;
         self.seen += n as u64;
+        // Report on ~1% steps (`step`) so a large file does not spam the binder callback.
+        let done = self.base + self.seen;
+        if done >= self.last + self.step {
+            self.last = done;
+            (self.report)(done, self.total);
+        }
         Ok(n)
     }
 }
