@@ -175,6 +175,7 @@ pub(crate) type Transfers = Arc<TransferState>;
 const STATUS_OK: i32 = 0;
 const STATUS_FAILED: i32 = -1;
 const STATUS_DECLINED: i32 = -2;
+const STATUS_CANCELLED: i32 = -3; // must match TarishApp MainActivity.STATUS_CANCELLED
 
 /// The one transfer that can be in flight, and whether the user has cancelled it.
 ///
@@ -2411,7 +2412,26 @@ fn start_quickshare_server(
                     // nothing ever said the transfer was over. serve() has no notion of
                     // this -- the send path had the same hole and it presents identically,
                     // as a transfer "stuck at completion".
-                    let status = match &outcome {
+                    // CANCELLED MID-TRANSFER IS NOT A RECEIVE. serve() streams the payload
+                    // straight to the inbox, so a cancel leaves a TRUNCATED file there; without
+                    // this it was reported as "received 1 file(s)" and the app collected the
+                    // partial as if it were whole. Discard it and report the cancel instead.
+                    let status = if transfers.is_cancelled(id) {
+                        if let Ok(names) = &outcome {
+                            for n in names {
+                                if let Some(leaf) = httpd::safe_leaf(n) {
+                                    let _ = std::fs::remove_file(
+                                        std::path::Path::new(httpd::INBOX).join(&leaf),
+                                    );
+                                }
+                            }
+                        }
+                        log::info!(
+                            "quickshare: transfer {id} cancelled — discarded the partial from {peer}"
+                        );
+                        STATUS_CANCELLED
+                    } else {
+                        match &outcome {
                         Ok(names) if !names.is_empty() => {
                             log::info!("quickshare: received {} file(s) from {peer}", names.len());
                             STATUS_OK
@@ -2432,6 +2452,7 @@ fn start_quickshare_server(
                                 log::warn!("quickshare: inbound transfer {id} failed: {e}");
                             }
                             STATUS_FAILED
+                        }
                         }
                     };
                     if let Ok(cbs) = callbacks.lock() {
