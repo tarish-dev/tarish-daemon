@@ -2955,10 +2955,11 @@ struct QsHost {
     transfers: Transfers,
     callbacks: Callbacks,
     auto_accept: Arc<AtomicBool>,
-    // The actual on-disk paths this connection created. Tracked because non_clobbering()
-    // may rename a file, so the destination is not derivable from the peer's name -- and
-    // discard() on a mid-transfer cancel has to delete exactly what was opened.
-    created: std::sync::Mutex<Vec<std::path::PathBuf>>,
+    // The actual on-disk paths this connection created (non_clobbering returns a String).
+    // Tracked because non_clobbering() may rename a file, so the destination is not
+    // derivable from the peer's name -- and discard() on a mid-transfer cancel has to
+    // delete exactly what was opened.
+    created: std::sync::Mutex<Vec<String>>,
 }
 
 impl quickshare::connection::Host for QsHost {
