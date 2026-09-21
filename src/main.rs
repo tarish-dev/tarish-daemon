@@ -21,7 +21,12 @@ use std::time::Duration;
 
 /// The AWDL data interface. Configurable so the daemon can run over Google's `libmosey`
 /// (`mosey0`) or over `tarish-libawdl` (`tawdl0`): `$TARISH_IFACE`, then
-/// `persist.tarish.iface`, else the historical default. Resolved once.
+/// `persist.tarish.iface`, else the default. Resolved once.
+///
+/// Default is `tawdl0` -- our libawdl shim's interface. It MUST match the shim's own default
+/// (libawdl-mosey-shim `data_iface()` also defaults to `tawdl0`), or on a clean device with
+/// the property unset the shim brings up `tawdl0` while this waits for a different name
+/// forever. It was `mosey0` back when we ran over Google's libmosey; libawdl replaced it.
 fn iface() -> &'static str {
     use std::sync::OnceLock;
     static IFACE: OnceLock<String> = OnceLock::new();
@@ -30,7 +35,7 @@ fn iface() -> &'static str {
             std::env::var("TARISH_IFACE")
                 .ok()
                 .or_else(|| read_property("persist.tarish.iface"))
-                .unwrap_or_else(|| "mosey0".to_string())
+                .unwrap_or_else(|| "tawdl0".to_string())
         })
         .as_str()
 }
