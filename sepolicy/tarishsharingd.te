@@ -122,7 +122,7 @@ allow tarishsharingd tarish_data_file:file unlink;
 #   no capability of any kind
 #   no netlink_generic_socket   -- driving the radio is tarishd's job
 #   no packet_socket            -- raw frames are tarishd's job
-#   no tun_device               -- creating mosey0 is tarishd's job
+#   no tun_device               -- creating tlink0 is tarishd's job
 #   no execute of anything
 #   no sdcard / media_rw access -- Downloads/Tarish is reached by the app, never here
 

@@ -18,7 +18,7 @@ AWDL interface.
 Used to verify tarishsharingd's browser end to end:
 
 ```
-Mac awdl0  --[ff02::fb]-->  phone mosey0
+Mac awdl0  --[ff02::fb]-->  phone tlink0
 tarishsharingd::mdns: peer discovered: beefcafe1234
 ```
 

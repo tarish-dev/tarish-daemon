@@ -52,9 +52,9 @@ adb shell su 0 setprop ctl.restart tarishsharingd   # (or ctl.restart tarishd to
 1. **Discovery:** reboot an iPhone (clears its cache), set AirDrop to **Everyone**, open the
    share sheet. It should render "Pixel 10 Pro" promptly and repeatably, not "declined first
    time / works second." Test on both iPhones.
-2. **Connection churn gone:** capture `mosey0` TCP during a receive and count SYN/RST:
+2. **Connection churn gone:** capture `tlink0` TCP during a receive and count SYN/RST:
    ```bash
-   adb shell su 0 tcpdump -i mosey0 -nn -S "tcp port 8770"
+   adb shell su 0 tcpdump -i tlink0 -nn -S "tcp port 8770"
    ```
    The ~95-SYN / ~33-RST storm should be gone (a handful of clean connections instead).
 3. **Throughput/stalls:** send the same file 3–5× and look at the inbound gaps. Before, the

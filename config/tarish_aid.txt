@@ -41,7 +41,7 @@
 # because the failure is silent -- the daemon starts, advertises, and never sends.
 #
 # On a build without that patch, run tarishsharingd as `system` and accept that its
-# traffic is attributed to uid 1000. AirDrop is unaffected either way: it rides mosey0,
+# traffic is attributed to uid 1000. AirDrop is unaffected either way: it rides tlink0,
 # which is not a managed network and is not gated.
 
 [AID_SYSTEM_EXT_TARISH]

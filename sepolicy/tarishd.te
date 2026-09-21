@@ -11,7 +11,7 @@
 #   netlink_generic       nl80211 -- the vendor commands to wonder.ko
 #   netlink_route         adding the route and the peer's neighbour entry
 #   packet_socket         libmosey uses libpcap (it logs "libpcap version 1.9.1")
-#   tun_device/tun_socket mosey0 is a TUN interface libmosey creates
+#   tun_device/tun_socket tlink0 is a TUN interface libmosey creates
 #   sysfs_net             reading interface state
 #
 # NOT copied from Google: binder, service_manager, dumpstate. tarishd publishes no
@@ -53,7 +53,7 @@ allow tarishd tun_device:chr_file { ioctl read write getattr lock append map ope
 #     avc: denied { ioctl } path="/dev/tun" ioctlcmd=0x54ca tclass=chr_file
 # with mosey_start_5 returning NULL, even though `allow ... ioctl` was present.
 #
-# 0x54ca is TUNSETIFF, i.e. creating mosey0 itself. The rest are the standard
+# 0x54ca is TUNSETIFF, i.e. creating tlink0 itself. The rest are the standard
 # interface ioctls: 0x8913 SIOCGIFFLAGS, 0x8914 SIOCSIFFLAGS, 0x8946 SIOCETHTOOL,
 # 0x8994 SIOCGIFNAME. Sets are Google's verbatim, for the same reason as above.
 allowxperm tarishd tun_device:chr_file ioctl { 0x54ca 0x54d2 };

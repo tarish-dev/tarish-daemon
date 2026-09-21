@@ -41,6 +41,6 @@ there.
 
 ### Why AirDrop did not need this
 
-AirDrop rides `mosey0`, which is not a *managed network* and is not gated at all. Quick
+AirDrop rides `tlink0`, which is not a *managed network* and is not gated at all. Quick
 Share rides `wlan0`, which is. The daemon did mDNS correctly for weeks before this
 surfaced, because only one of the two protocols crosses that gate.
