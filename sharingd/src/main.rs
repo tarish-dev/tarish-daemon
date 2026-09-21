@@ -1997,8 +1997,21 @@ impl ITarishService for TarishService {
     }
 
     fn registerCallback(&self, cb: &Strong<dyn ITarishCallback>) -> BinderResult<()> {
-        self.callbacks.lock().unwrap().push(cb.clone());
-        log::info!("client registered");
+        let mut cbs = self.callbacks.lock().unwrap();
+        // PRUNE DEAD, then DEDUP. Registering is not idempotent by nature: `connect()` in the
+        // client re-registers the SAME callback on every (re)connect, and a client that is
+        // killed never unregisters. Left unchecked the list grew a copy per reconnect and a
+        // permanent entry per dead client, and EVERY oneway callback fanned out to all of
+        // them -- onGroupNeeded then span up one Wi-Fi Direct Channel per stale entry and the
+        // receiver was killed for "too many Binders sent to uid 1000" mid-transfer. Drop dead
+        // proxies and refuse duplicates so the list stays the size of the live clients.
+        cbs.retain(|c| c.as_binder().is_binder_alive());
+        if cbs.iter().any(|c| c.as_binder() == cb.as_binder()) {
+            log::debug!("client already registered; not adding a duplicate");
+        } else {
+            cbs.push(cb.clone());
+            log::info!("client registered ({} live)", cbs.len());
+        }
         Ok(())
     }
 
