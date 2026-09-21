@@ -1595,6 +1595,7 @@ impl ITarishService for TarishService {
                 transfers: transfers.clone(),
                 callbacks: callbacks.clone(),
                 auto_accept,
+                created: std::sync::Mutex::new(Vec::new()),
             };
             log::info!("quickshare: inbound Bluetooth connection (transfer {id})");
             let outcome = quickshare::connection::serve(
@@ -1605,18 +1606,23 @@ impl ITarishService for TarishService {
                 &transfers,
                 &callbacks,
             );
+            use quickshare::connection::ServeOutcome;
             let status = match &outcome {
                 // NOT "over Bluetooth": the transport may have been swapped underneath by
                 // then. Bluetooth is where the connection STARTED, and a line claiming a
                 // 5 GHz Wi-Fi Direct transfer arrived over Bluetooth is the kind of log that
                 // sends someone looking in the wrong place later.
-                Ok(names) if !names.is_empty() => {
+                Ok(ServeOutcome::Received(names)) if !names.is_empty() => {
                     log::info!("quickshare: received {} file(s) from a Bluetooth connection", names.len());
                     STATUS_OK
                 }
-                Ok(_) => {
+                Ok(ServeOutcome::Received(_)) => {
                     log::info!("quickshare: nothing received");
                     STATUS_DECLINED
+                }
+                Ok(ServeOutcome::Cancelled) => {
+                    log::info!("quickshare: inbound Bluetooth transfer {id} cancelled — partial discarded");
+                    STATUS_CANCELLED
                 }
                 Err(e) => {
                     log::warn!("quickshare: inbound transfer {id} failed: {e}");
@@ -2397,6 +2403,7 @@ fn start_quickshare_server(
                         transfers: transfers.clone(),
                         callbacks: callbacks.clone(),
                         auto_accept,
+                        created: std::sync::Mutex::new(Vec::new()),
                     };
                     log::info!("quickshare: inbound connection from {peer} (transfer {id})");
                     let outcome = quickshare::connection::serve(
@@ -2412,35 +2419,23 @@ fn start_quickshare_server(
                     // nothing ever said the transfer was over. serve() has no notion of
                     // this -- the send path had the same hole and it presents identically,
                     // as a transfer "stuck at completion".
-                    // CANCELLED MID-TRANSFER IS NOT A RECEIVE. serve() streams the payload
-                    // straight to the inbox, so a cancel leaves a TRUNCATED file there; without
-                    // this it was reported as "received 1 file(s)" and the app collected the
-                    // partial as if it were whole. Discard it and report the cancel instead.
-                    let status = if transfers.is_cancelled(id) {
-                        if let Ok(names) = &outcome {
-                            for n in names {
-                                if let Some(leaf) = httpd::safe_leaf(n) {
-                                    let _ = std::fs::remove_file(
-                                        std::path::Path::new(httpd::INBOX).join(&leaf),
-                                    );
-                                }
-                            }
-                        }
-                        log::info!(
-                            "quickshare: transfer {id} cancelled — discarded the partial from {peer}"
-                        );
-                        STATUS_CANCELLED
-                    } else {
-                        match &outcome {
-                        Ok(names) if !names.is_empty() => {
+                    use quickshare::connection::ServeOutcome;
+                    let status = match &outcome {
+                        Ok(ServeOutcome::Received(names)) if !names.is_empty() => {
                             log::info!("quickshare: received {} file(s) from {peer}", names.len());
                             STATUS_OK
                         }
                         // Nothing arrived. A person declining is the ordinary reason, and it
                         // is an answer rather than a fault.
-                        Ok(_) => {
+                        Ok(ServeOutcome::Received(_)) => {
                             log::info!("quickshare: nothing received from {peer}");
                             STATUS_DECLINED
+                        }
+                        // Cancelled mid-stream. serve() already discarded the partial, so
+                        // there is nothing in the inbox for the app to collect.
+                        Ok(ServeOutcome::Cancelled) => {
+                            log::info!("quickshare: transfer {id} cancelled by {peer} — partial discarded");
+                            STATUS_CANCELLED
                         }
                         Err(e) => {
                             // A peer that opens a connection and closes it without a word is
@@ -2452,7 +2447,6 @@ fn start_quickshare_server(
                                 log::warn!("quickshare: inbound transfer {id} failed: {e}");
                             }
                             STATUS_FAILED
-                        }
                         }
                     };
                     if let Ok(cbs) = callbacks.lock() {
@@ -2961,6 +2955,10 @@ struct QsHost {
     transfers: Transfers,
     callbacks: Callbacks,
     auto_accept: Arc<AtomicBool>,
+    // The actual on-disk paths this connection created. Tracked because non_clobbering()
+    // may rename a file, so the destination is not derivable from the peer's name -- and
+    // discard() on a mid-transfer cancel has to delete exactly what was opened.
+    created: std::sync::Mutex<Vec<std::path::PathBuf>>,
 }
 
 impl quickshare::connection::Host for QsHost {
@@ -3040,8 +3038,25 @@ impl quickshare::connection::Host for QsHost {
             .write(true)
             .create_new(true)
             .open(&dest)?;
+        // Remember the real path so a cancel can delete exactly this file, whatever
+        // non_clobbering named it.
+        if let Ok(mut v) = self.created.lock() {
+            v.push(dest.clone());
+        }
         log::info!("quickshare: writing {leaf} to the inbox");
         Ok(Box::new(f))
+    }
+
+    fn discard(&self) {
+        // A cancelled transfer streamed a partial straight to the inbox. Remove every file
+        // this connection opened so the app never collects a truncated one.
+        if let Ok(mut v) = self.created.lock() {
+            for p in v.drain(..) {
+                if let Err(e) = std::fs::remove_file(&p) {
+                    log::warn!("quickshare: could not discard partial {p:?}: {e}");
+                }
+            }
+        }
     }
 
     fn progress(&self, done: u64, total: u64) {

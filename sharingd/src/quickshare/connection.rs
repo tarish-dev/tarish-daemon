@@ -85,6 +85,25 @@ pub trait Host {
     fn host_group(&self) -> Option<WifiGroup> {
         None
     }
+
+    /// Throw away everything created for this transfer.
+    ///
+    /// Called when the transfer is cancelled mid-stream. serve() writes each file straight
+    /// to its destination as the bytes arrive, so a cancel leaves a TRUNCATED file behind;
+    /// without this it is indistinguishable from a completed one and gets collected as if
+    /// whole. The default is a no-op, for a host with nothing on disk to roll back.
+    fn discard(&self) {}
+}
+
+/// What an inbound connection ended up doing, so the caller can tell a completed transfer
+/// from a cancelled one -- the two must not be reported the same way, and a cancel must not
+/// look like "received N files".
+pub enum ServeOutcome {
+    /// Files that landed. Empty means the peer connected but sent nothing (a probe, or a
+    /// refusal), which is not a fault.
+    Received(Vec<String>),
+    /// The peer cancelled mid-stream. Any partial has already been discarded by serve().
+    Cancelled,
 }
 
 /// A network we have stood up for a sender to join.
@@ -452,7 +471,7 @@ pub fn serve<H>(
     host: &H,
     transfers: &Transfers,
     callbacks: &Callbacks,
-) -> io::Result<Vec<String>>
+) -> io::Result<ServeOutcome>
 where
     H: Host,
 {
@@ -668,14 +687,19 @@ where
                     if transfer_id != 0 {
                         transfers.finish(transfer_id);
                     }
-                    return Ok(written);
+                    return Ok(ServeOutcome::Received(written));
                 }
                 Effect::Cancelled => {
-                    warn!("quickshare: cancelled");
+                    // Drop the writers first so the files are closed, then let the host
+                    // delete whatever it opened. A partial left in the inbox would be
+                    // collected by the app as if it were a whole file.
+                    warn!("quickshare: cancelled — discarding the partial");
+                    sinks.clear();
+                    host.discard();
                     if transfer_id != 0 {
                         transfers.finish(transfer_id);
                     }
-                    return Ok(written);
+                    return Ok(ServeOutcome::Cancelled);
                 }
                 Effect::Failed(why) => {
                     if transfer_id != 0 {
@@ -817,7 +841,7 @@ where
                 if transfer_id != 0 {
                     transfers.finish(transfer_id);
                 }
-                return Ok(written);
+                return Ok(ServeOutcome::Received(written));
             }
             other => debug!("quickshare: ignoring {other:?}"),
         }
