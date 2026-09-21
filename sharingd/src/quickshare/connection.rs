@@ -570,6 +570,12 @@ where
     let mut written: Vec<String> = Vec::new();
     let mut done_bytes: u64 = 0;
     let mut total_bytes: u64 = 0;
+    // Throttle progress reporting. Every FileChunk used to fire onTransferProgress, which on
+    // a slow transport (Bluetooth, thousands of small chunks) flooded the app with oneway
+    // binder calls -- each progress notify() posts a Notification token to system_server, and
+    // the receiver was KILLED for "too many Binders sent to uid 1000" mid-transfer. Emit at
+    // most ~1% steps (and always the final one), matching the send path.
+    let mut reported_bytes: u64 = 0;
     let mut transfer_id: i64 = 0;
 
     let mut pending = fsm.start();
@@ -767,14 +773,20 @@ where
                         };
                         sink.write_all(&data)?;
                         done_bytes += data.len() as u64;
-                        host.progress(done_bytes, total_bytes);
-                        notify(callbacks, |cb| {
-                            cb.onTransferProgress(
-                                transfer_id,
-                                done_bytes as i64,
-                                total_bytes as i64,
-                            )
-                        });
+                        // Report on ~1% steps, on the first chunk, and always on the last one
+                        // of a payload. A step of 0 (unknown total) falls back to every 512 KiB.
+                        let step = (total_bytes / 100).max(512 * 1024);
+                        if last || reported_bytes == 0 || done_bytes - reported_bytes >= step {
+                            reported_bytes = done_bytes;
+                            host.progress(done_bytes, total_bytes);
+                            notify(callbacks, |cb| {
+                                cb.onTransferProgress(
+                                    transfer_id,
+                                    done_bytes as i64,
+                                    total_bytes as i64,
+                                )
+                            });
+                        }
 
                         if last {
                             if let Some(mut s) = sinks.remove(&id) {
