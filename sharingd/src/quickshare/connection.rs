@@ -548,14 +548,16 @@ where
         &result.server_init_msg,
     )
     .map_err(|_| bad("could not derive session keys"))?;
-    // Four digits of the auth string, the value stock Quick Share shows so two people
-    // can compare screens. Now surfaced to the receiver's app via onTransferPinDisplay
-    // (below, with the offer), so the person can read it out to the sender.
-    let session_pin = format!(
-        "{:04}",
-        u16::from_be_bytes([secrets.auth_string[0], secrets.auth_string[1]]) % 10_000
-    );
-    debug!("quickshare: session pin {session_pin}");
+    // The confirmation PIN, through the REAL derivation -- tarish_protocol::pin::derive,
+    // the same call the send side uses (outbound.rs). It MUST match: the receiver shows
+    // this via onTransferPinDisplay and the sender checks what the person types against
+    // its own derive() of the same auth_string. This used to be the first two bytes as a
+    // big-endian u16 mod 10000 -- a stable four-digit number that was simply NOT the value
+    // the sender expects, so a correct-looking PIN did nothing and the transfer stalled.
+    let session_pin = tarish_protocol::pin::derive(&secrets.auth_string);
+    // Not logged: on a userdebug build logcat is readable by anything in the log group,
+    // and a PIN in the log is one nobody had to read off the other device.
+    debug!("quickshare: session pin derived");
     let mut channel = SecureChannel::new(keys, Role::Server);
     info!("quickshare: encrypted channel up with {peer_name:?}");
 
