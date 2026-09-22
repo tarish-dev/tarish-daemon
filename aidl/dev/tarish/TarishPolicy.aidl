@@ -34,6 +34,9 @@ parcelable TarishPolicy {
     boolean deviceNameManaged;
 
     /**
+     * DISABLED — see docs/PIN-DISABLED.md. PIN verification is intentionally off; this field
+     * is retained in the interface but no longer gates anything (the daemon ignores it).
+     *
      * Whether the person sending must type the PIN shown on the receiving device before
      * anything is sent.
      *

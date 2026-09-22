@@ -33,6 +33,9 @@ oneway interface ITarishCallback {
     void onTransferFinished(long transferId, int status);
 
     /**
+     * DISABLED — see docs/PIN-DISABLED.md. PIN verification is intentionally off; the daemon
+     * never raises this callback now. Retained in the interface (positional codes) for revival.
+     *
      * Ask the person sending to type the PIN shown on the RECEIVING device.
      *
      * **The PIN itself is deliberately not in this call.** Both ends derive the same
@@ -89,6 +92,9 @@ oneway interface ITarishCallback {
     void onGroupNeeded(long transferId);
 
     /**
+     * DISABLED — see docs/PIN-DISABLED.md. PIN verification is intentionally off; the daemon
+     * no longer derives or sends a PIN, so this callback is not raised. Retained for revival.
+     *
      * Show the session PIN on the RECEIVING device so the person can read it out to the
      * sender, who types it to confirm they are sending to the right device.
      *

@@ -1,5 +1,8 @@
 //! The four-digit PIN a person compares across two screens.
 //!
+//! CURRENTLY UNUSED — PIN verification is intentionally disabled; see `docs/PIN-DISABLED.md`.
+//! This module is kept (and still derivable) for revival.
+//!
 //! This is the only part of the handshake a human checks. UKEY2 gives both ends the same
 //! `auth_string` only if nobody sat in the middle, so two matching PINs mean the channel
 //! is end-to-end. A PIN that does not match the peer's is worse than showing none at all:
