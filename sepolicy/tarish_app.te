@@ -12,7 +12,9 @@
 # Direct, notifications, file access, the share sheet, binding the daemon) and folded in below.
 # The domain stays `permissive` until that set is complete and verified, and it must NOT ship
 # enforcing (and never in a release build, which forbids permissive domains) until then.
-type tarish_app, domain;
+# coredomain: the app ships on a core partition (system_ext/priv-app), and Treble requires
+# every platform app's domain to be a coredomain type.
+type tarish_app, domain, coredomain;
 app_domain(tarish_app)
 permissive tarish_app;
 
