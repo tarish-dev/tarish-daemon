@@ -411,3 +411,79 @@ impl<'a> Parser<'a> {
 fn be(b: &[u8]) -> u64 {
     b.iter().fold(0u64, |acc, x| (acc << 8) | *x as u64)
 }
+
+// Regression test for reference amplification in the binary plist reader (finding #1 of the
+// external security review). The fix is MAX_TOTAL_OBJECTS in this file: MAX_DEPTH and
+// MAX_ELEMENTS bound one container and one nesting chain, but not how many times an object may
+// be referenced — the shared total budget does. Contributed by the reviewer. Runs under
+// `cargo test` (a host shim for sharingd), not the Soong build, which excludes cfg(test).
+#[cfg(test)]
+mod reference_amplification {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// A bplist whose object `k` is an array of `fan` references to object `k+1`.
+    /// Every reference is legal, every container is under `MAX_ELEMENTS`, and the nesting is
+    /// under `MAX_DEPTH`. The materialised cost is `fan^levels`, not `fan*levels`.
+    fn amplifying_plist(fan: usize, levels: usize) -> Vec<u8> {
+        let mut out = b"bplist00".to_vec();
+        let mut offsets = Vec::new();
+        for k in 0..levels {
+            offsets.push(out.len());
+            out.push(0xAF); // array, length escapes to the next object
+            out.push(0x11); // 2-byte integer
+            out.extend_from_slice(&(fan as u16).to_be_bytes());
+            for _ in 0..fan {
+                out.extend_from_slice(&((k + 1) as u16).to_be_bytes()); // ref_size = 2
+            }
+        }
+        offsets.push(out.len());
+        out.extend_from_slice(&[0x51, b'x']); // the leaf: the string "x"
+
+        let table_start = out.len();
+        for o in &offsets {
+            out.extend_from_slice(&(*o as u32).to_be_bytes()); // offset_size = 4
+        }
+        let mut trailer = [0u8; 32];
+        trailer[6] = 4; // offset size
+        trailer[7] = 2; // reference size
+        trailer[8..16].copy_from_slice(&(offsets.len() as u64).to_be_bytes());
+        trailer[16..24].copy_from_slice(&0u64.to_be_bytes()); // root = object 0
+        trailer[24..32].copy_from_slice(&(table_start as u64).to_be_bytes());
+        out.extend_from_slice(&trailer);
+        out
+    }
+
+    /// Parse on another thread so an unfixed parser fails this test rather than hanging.
+    fn parse_within(body: Vec<u8>, limit: Duration) -> Result<bool, ()> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let accepted = super::parse(&body).is_some();
+            let _ = tx.send(accepted);
+        });
+        rx.recv_timeout(limit).map_err(|_| ())
+    }
+
+    #[test]
+    fn a_body_that_reuses_references_is_refused_not_expanded() {
+        // ~8.9 million leaves if every reference is followed; well under 1 KiB on the wire.
+        let body = amplifying_plist(24, 5);
+        assert!(body.len() < 1024, "the point is that this is small: {} bytes", body.len());
+        match parse_within(body, Duration::from_millis(500)) {
+            Ok(accepted) => assert!(
+                !accepted,
+                "the parser expanded a reference-amplifying body instead of refusing it"
+            ),
+            Err(()) => panic!("parse did not finish in 500 ms — the object budget is missing"),
+        }
+    }
+
+    #[test]
+    fn a_real_shaped_body_still_parses() {
+        // What AirDrop actually sends is shallow and small; the budget must not touch it.
+        let body = amplifying_plist(3, 3);
+        let accepted = parse_within(body, Duration::from_millis(500))
+            .expect("a small document must not be slow");
+        assert!(accepted, "the budget rejected a document AirDrop would really send");
+    }
+}
