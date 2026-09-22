@@ -254,6 +254,18 @@ pub(crate) struct TransferState {
     /// through the whole transfer. This overrides that, and applies immediately (no linger).
     /// Restored when the guard drops. AirDrop is unaffected -- it never uses Wi-Fi Direct.
     wifi_direct_active: AtomicBool,
+    /// The id of an AirDrop transfer that is active OR pending-accept (0 = none), tracked
+    /// SEPARATELY from `current` because the two protocols can race.
+    ///
+    /// THE RADIO SERVES ONE AT A TIME, AND AIRDROP HAS PRIORITY. `current` models a single
+    /// transfer, so when a Quick Share receive calls `begin(false)` it OVERWRITES the id of an
+    /// AirDrop offer that is still on screen waiting to be accepted -- and, before this,
+    /// `arm_wifi_direct` then tore AWDL down under that pending offer, killing it. Both
+    /// transfers failed. This field survives that overwrite (Quick Share's `begin` does not
+    /// touch it), so the gate can keep AWDL up for a pending AirDrop and `arm_wifi_direct` can
+    /// yield to it instead of stomping it. Set at AirDrop `/Ask` (`begin(true)`), cleared by
+    /// the same transfer's `finish`. See docs/COEXISTENCE.md.
+    airdrop_pending: std::sync::atomic::AtomicI64,
 }
 
 impl TransferState {
@@ -265,6 +277,12 @@ impl TransferState {
     pub(crate) fn begin(&self, needs_awdl: bool) -> i64 {
         let id = self.next.fetch_add(1, Ordering::SeqCst) + 1;
         self.needs_awdl.store(needs_awdl, Ordering::SeqCst);
+        // An AirDrop transfer (needs_awdl) also claims the separate airdrop_pending slot, so a
+        // later Quick Share begin() overwriting `current` cannot make the gate forget that
+        // AirDrop still owns the radio. Cleared by this transfer's finish().
+        if needs_awdl {
+            self.airdrop_pending.store(id, Ordering::SeqCst);
+        }
         self.current.store(id, Ordering::SeqCst);
         id
     }
@@ -272,6 +290,13 @@ impl TransferState {
     /// True while a transfer that genuinely needs the AWDL link is in flight.
     pub(crate) fn current_needs_awdl(&self) -> bool {
         self.current.load(Ordering::SeqCst) != 0 && self.needs_awdl.load(Ordering::SeqCst)
+    }
+
+    /// True while an AirDrop transfer is active or waiting to be accepted. AirDrop owns the
+    /// radio while this holds: the gate keeps AWDL up, and a Quick Share Wi-Fi Direct request
+    /// yields to it (see `arm_wifi_direct`) rather than tearing AWDL down under it.
+    pub(crate) fn airdrop_busy(&self) -> bool {
+        self.airdrop_pending.load(Ordering::SeqCst) != 0
     }
 
     /// True while a Wi-Fi Direct transfer is holding AWDL down. The radio gate reads this
@@ -295,10 +320,43 @@ impl TransferState {
     /// the write by reading the property back, then allow a fixed settle for the teardown.
     /// Best-effort: if AWDL was never up (Quick Share with AirDrop off), the property is
     /// already "0" and this returns almost at once.
-    pub(crate) fn arm_wifi_direct(&self) {
-        if self.wifi_direct_active.swap(true, Ordering::SeqCst) {
+    /// Returns `true` if the radio was acquired for Wi-Fi Direct, `false` if AirDrop owns it
+    /// and would not yield in time -- in which case the caller must NOT form a group (present
+    /// the peer as busy) rather than tearing AWDL down under a live AirDrop transfer.
+    pub(crate) fn arm_wifi_direct(&self) -> bool {
+        if self.wifi_direct_active.load(Ordering::SeqCst) {
             // Already armed for this transfer (both join and a later re-ask can call in).
-            return;
+            return true;
+        }
+        // AIRDROP HAS PRIORITY FOR THE RADIO. If an AirDrop transfer is active or an offer is
+        // on screen waiting to be accepted, do not take the radio out from under it. Wait a
+        // little in case it finishes promptly; if it does not, refuse -- Quick Share then
+        // presents the device as busy rather than killing both transfers (the exact failure
+        // this arbitration exists to prevent). Symmetric guard: while we hold the radio, the
+        // AirDrop `/Ask` path refuses new offers as busy.
+        if self.airdrop_busy() {
+            let give_up = std::time::Instant::now() + Duration::from_secs(15);
+            while self.airdrop_busy() {
+                if std::time::Instant::now() >= give_up {
+                    log::info!(
+                        "quickshare: AirDrop owns the radio; not taking it for Wi-Fi Direct \
+                         (presenting busy)"
+                    );
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+        if self.wifi_direct_active.swap(true, Ordering::SeqCst) {
+            // Someone armed it while we waited out AirDrop.
+            return true;
+        }
+        // Re-check: an AirDrop offer that arrived in the instant between the wait and the swap
+        // has priority, so yield the radio straight back to it.
+        if self.airdrop_busy() {
+            self.wifi_direct_active.store(false, Ordering::SeqCst);
+            log::info!("quickshare: AirDrop claimed the radio first; yielding (presenting busy)");
+            return false;
         }
         log::info!("quickshare: taking AWDL down for a Wi-Fi Direct transfer (freeing the P2P slot)");
         // Stage 1: wait for the gate to write WANT_PROP=0 (<=~500 ms once it runs).
@@ -314,6 +372,7 @@ impl TransferState {
         // comfortably enough and is only paid on the off-network path (vs a 150 KB/s
         // Bluetooth fallback, which is what this avoids).
         std::thread::sleep(Duration::from_millis(1000));
+        true
     }
 
     pub(crate) fn current(&self) -> i64 {
@@ -322,6 +381,12 @@ impl TransferState {
 
     pub(crate) fn finish(&self, id: i64) {
         let _ = self.current.compare_exchange(id, 0, Ordering::SeqCst, Ordering::SeqCst);
+        // If this was the AirDrop transfer holding the radio, release the priority claim so a
+        // waiting Quick Share can now take it. compare_exchange so a still-live AirDrop
+        // transfer's claim is never cleared by some other transfer finishing.
+        let _ = self
+            .airdrop_pending
+            .compare_exchange(id, 0, Ordering::SeqCst, Ordering::SeqCst);
         // A client that answered an upgrade request after we stopped waiting left a
         // descriptor parked in that slot. Nothing will ever read it, and it would sit open
         // until the next upgrade replaced it, so drop it with the transfer that asked.
@@ -790,6 +855,7 @@ fn start_radio_gate(
 
             let busy = active.load(Ordering::SeqCst)
                 || transfers.current_needs_awdl()
+                || transfers.airdrop_busy()
                 || discoverable.load(Ordering::SeqCst);
 
             let want_by_activity = if busy {
@@ -1106,8 +1172,13 @@ impl quickshare::outbound::Progress for TransferProgress {
             // free BEFORE the client calls connect(), or the join fails against a live ART
             // interface. Held until finish() at transfer end. Wi-Fi LAN joins do not reach
             // here -- the peer is reached directly by its mDNS address, no group.
-            if req.medium == tarish_protocol::upgrade::Medium::WifiDirect {
-                self.transfers.arm_wifi_direct();
+            // If AirDrop owns the radio and will not yield, do not join -- return None (we stay
+            // on the current medium / the send does not upgrade) rather than stomping AirDrop.
+            if req.medium == tarish_protocol::upgrade::Medium::WifiDirect
+                && !self.transfers.arm_wifi_direct()
+            {
+                log::info!("quickshare: not joining a Wi-Fi Direct group -- AirDrop owns the radio");
+                return None;
             }
             for cb in cbs.iter() {
                 let _ = cb.onUpgradeNeeded(self.id, &upgrade);
@@ -3180,7 +3251,13 @@ impl quickshare::connection::Host for QsHost {
         // Wi-Fi P2P slot that AWDL holds. Take AWDL down and wait for the slot to free before
         // the client calls createGroup(), or the group cannot form against a live ART
         // interface. Held until finish() at transfer end so the group survives the transfer.
-        self.transfers.arm_wifi_direct();
+        // If AirDrop owns the radio and will not yield, do NOT host -- return None so the
+        // transfer stays on its current medium (the peer sees us busy) rather than tearing
+        // AWDL down under a live AirDrop transfer.
+        if !self.transfers.arm_wifi_direct() {
+            log::info!("quickshare: not hosting a Wi-Fi Direct group -- AirDrop owns the radio");
+            return None;
+        }
         let deadline = std::time::Instant::now() + GROUP_WAIT;
         let mut asked_anyone = false;
         while std::time::Instant::now() < deadline {

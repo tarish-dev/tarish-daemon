@@ -49,10 +49,40 @@ So AWDL is only shut off for the **off-network Quick Share** case. Everything el
    - **kick a targeted Wi-Fi scan** on the STA channel to shorten Wi-Fi recovery;
    - keep the AirDrop **name** stable across restarts so the device stays recognisable.
 
+## Arbitration: one owner at a time, AirDrop has priority
+
+The radio serves **one** peer-to-peer protocol at a time, so when both want it at once, one
+must yield — it must not be taken out from under the other. This was found the hard way
+(2026-09-22): with an **iPhone AirDrop offer on screen waiting to be accepted**, a Quick Share
+request arrived from another Android and **both transfers failed**. Two causes:
+
+1. `arm_wifi_direct` tore AWDL down unconditionally — killing the pending AirDrop offer's radio.
+2. `TransferState` models **one** transfer (`current`), so the Quick Share `begin()` overwrote
+   the AirDrop offer's id; the radio gate then no longer saw AirDrop as busy.
+
+The rule now (operator's choice: *"wait, then show busy"*, **AirDrop wins**):
+
+- AirDrop's active/pending state is tracked in a **separate** `airdrop_pending` slot that a
+  Quick Share `begin()` does not touch. Set at `/Ask` (`begin(true)`), cleared by that
+  transfer's `finish()`. The radio gate ORs it into `busy`, so a pending AirDrop keeps AWDL up
+  even after its `current` slot was overwritten.
+- `arm_wifi_direct()` **yields to AirDrop**: if `airdrop_busy()`, it waits (~15 s) for AirDrop
+  to finish; if it does not, it **returns false** and Quick Share does **not** form a group —
+  `host_group`/`join_wifi` return `None`, so the transfer stays on its current medium and the
+  peer sees the device as busy. It never tears AWDL down under a live/pending AirDrop.
+- Symmetric guard: while a Quick Share Wi-Fi Direct transfer owns the radio
+  (`wifi_direct_active`), the AirDrop `/Ask` handler refuses new offers with `401` (the peer
+  reports "Declined") rather than interrupting the transfer in flight.
+
+So whoever holds the radio keeps it; the newcomer waits briefly, then shows busy. Same-network
+Quick Share (Wi-Fi LAN) never contends and is unaffected.
+
 ## Graceful signalling
 
 While one protocol owns the radio, present the device to the other as **busy/unavailable**
-(stock's "screen off"), rather than hanging or crawling on Bluetooth.
+(stock's "screen off"), rather than hanging or crawling on Bluetooth. Per-transfer this is
+implemented (see Arbitration above); doing it at **discovery** level too — hiding one
+advertiser while the other transfers — is still open.
 
 ## Multi-channel AWDL (so every iPhone peers, not just the ch149 cluster)
 

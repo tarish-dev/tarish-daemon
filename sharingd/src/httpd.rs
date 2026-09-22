@@ -483,6 +483,16 @@ impl Httpd {
                 respond(tls, 401, None, false)?;
                 return Ok(Disposition::Close);
             }
+            // The radio serves one peer-to-peer protocol at a time. If a Quick Share Wi-Fi
+            // Direct transfer currently owns it, refuse the AirDrop offer as busy rather than
+            // starting one that cannot get AWDL (and would clobber the in-flight transfer's
+            // slot). Symmetric with the Quick Share side yielding to a live AirDrop transfer.
+            // The peer reports this as "Declined", which is the honest answer: we are busy.
+            ("POST", "/Ask") if self.transfers.wifi_direct_active() => {
+                info!("/Ask refused — busy with a Quick Share Wi-Fi Direct transfer");
+                respond(tls, 401, None, false)?;
+                return Ok(Disposition::Close);
+            }
             ("POST", "/Ask") => {
                 // A new transfer starts here, not at /Upload: /Ask is the first point
                 // the peer commits, and the UI should show something before any bytes
