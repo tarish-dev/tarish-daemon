@@ -34,9 +34,14 @@ So AWDL is only shut off for the **off-network Quick Share** case. Everything el
 
 ## Off-network Quick Share sequence (the only teardown case)
 
-1. Fully release the P2P slot: **`mosey_stop` is not enough** — `wonder.ko`'s `wondertap0`
-   (the ART iface) persists and keeps the slot. The slot only frees when the wonder interface
-   is actually torn down (module unload, or a wonder/shim-level teardown).
+1. Fully release the P2P slot: **`mosey_stop` is not enough** — it drops `tlink0` but leaves
+   `wondertap0` (the `WL_IF_TYPE_ART` monitor iface) registered, so `createGroup` still fails.
+   **The trigger is bringing `wondertap0` + `wonder0` DOWN** (validated on blazer): the driver
+   then `del_iface`s wondertap0 and idles the monitor (`dhd_monitor_stop`), releasing the ART
+   role. **No `rmmod` needed** — a plain `ip link set … down` (inverse of tlink's start trigger).
+   Implementation: a tlink HAL `stop()` that downs `wondertap0`+`wonder0`, called from the
+   shim's `mosey_stop`; restore goes through the daemon's normal start (a bare `ip link up`
+   does not resume the session cleanly).
 2. Form/join the Wi-Fi Direct group; run the transfer (wlan0-speed).
 3. Restore AWDL, and do what stock does on resume:
    - **send an mDNS goodbye** for the previous AWDL identity (the MAC rotates each session, so
