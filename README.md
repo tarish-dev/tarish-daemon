@@ -48,9 +48,13 @@ and how to verify each stage separately — is in
 
 ## The vendor pin is the integrator's job, not this repository's
 
-`tarishsharingd` requires `libmosey_daemon_ffi.so` to be present and does not care where it
-came from: it tries the soname, then the usual paths, then `TARISH_MOSEY_LIB`. Shipping and
-pinning that blob belongs to whoever is building the OS.
+`tarishd` needs a library providing the `libmosey_daemon_ffi.so` ABI (soname + five FFI
+symbols). **In production that is our own open `tlink` shim, not Google's `libmosey`** (see
+[tarish-link](https://github.com/tarish-dev/tarish-link) and
+[docs/CURRENT-ARCHITECTURE.md](docs/CURRENT-ARCHITECTURE.md)); Google's `libmosey` also
+satisfies the ABI and is the reference/fallback. The daemon does not care where the file came
+from: it tries the soname, then the usual paths, then `TARISH_MOSEY_LIB`. Shipping and pinning
+it (tlink or libmosey) belongs to whoever is building the OS.
 
 Keeping it out of here is what lets the daemon run on LineageOS, or plain AOSP, without
 carrying one integrator's vendor decisions.
