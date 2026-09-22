@@ -483,21 +483,22 @@ impl Httpd {
                 respond(tls, 401, None, false)?;
                 return Ok(Disposition::Close);
             }
-            // The radio serves one peer-to-peer protocol at a time. If a Quick Share Wi-Fi
-            // Direct transfer currently owns it, refuse the AirDrop offer as busy rather than
-            // starting one that cannot get AWDL (and would clobber the in-flight transfer's
-            // slot). Symmetric with the Quick Share side yielding to a live AirDrop transfer.
-            // The peer reports this as "Declined", which is the honest answer: we are busy.
-            ("POST", "/Ask") if self.transfers.wifi_direct_active() => {
-                info!("/Ask refused — busy with a Quick Share Wi-Fi Direct transfer");
-                respond(tls, 401, None, false)?;
-                return Ok(Disposition::Close);
-            }
             ("POST", "/Ask") => {
                 // A new transfer starts here, not at /Upload: /Ask is the first point
                 // the peer commits, and the UI should show something before any bytes
                 // arrive rather than sitting idle through the whole handshake.
-                let id = self.transfers.begin(true);
+                //
+                // ONE TRANSFER AT A TIME, ACROSS BOTH PROTOCOLS. try_begin claims the single
+                // slot only if nothing else is running -- a Quick Share transfer (of either
+                // medium) or another AirDrop. If something is, refuse the offer as busy; the
+                // peer reports "Declined", which is the honest answer. This is what stops an
+                // AirDrop offer from stomping an in-flight Quick Share transfer (and vice
+                // versa, from the Quick Share side).
+                let Some(id) = self.transfers.try_begin(true) else {
+                    info!("/Ask refused — busy with another transfer");
+                    respond(tls, 401, None, false)?;
+                    return Ok(Disposition::Close);
+                };
                 let (from, names) = describe_offer(&body);
                 info!("offer {id} from {from:?}: {} file(s) {names:?}", names.len());
 
@@ -750,6 +751,9 @@ impl Httpd {
     }
 
     fn progress(&self, id: i64, done: u64, total: u64) {
+        // Keep the transfer slot alive while the upload runs, however large the file, so the
+        // stale-reclaim in TransferState::try_begin never takes a live AirDrop transfer.
+        self.transfers.touch();
         self.each_callback(|cb| cb.onTransferProgress(id, done as i64, total as i64));
     }
 

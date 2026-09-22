@@ -266,25 +266,81 @@ pub(crate) struct TransferState {
     /// yield to it instead of stomping it. Set at AirDrop `/Ask` (`begin(true)`), cleared by
     /// the same transfer's `finish`. See docs/COEXISTENCE.md.
     airdrop_pending: std::sync::atomic::AtomicI64,
+    /// When the current transfer last showed activity (claimed, or reported progress).
+    ///
+    /// The transfer slot is exclusive -- one transfer at a time across BOTH protocols -- so a
+    /// transfer that ends without calling `finish` (a hung peer, a half-closed socket, a
+    /// crash between `try_begin` and the transfer loop) would otherwise leave the slot claimed
+    /// and block ALL sharing forever. This timestamp lets `try_begin` reclaim a slot that has
+    /// shown no activity for `STALE_TRANSFER`, so a dead transfer self-heals. `None` when idle.
+    last_activity: Mutex<Option<std::time::Instant>>,
 }
 
+/// A claimed transfer slot with no activity for this long is presumed dead and may be
+/// reclaimed, so a hung or improperly-closed transfer cannot block sharing indefinitely.
+/// Comfortably longer than the accept-prompt window (a pending offer shows no progress until
+/// bytes flow), and a live transfer touches this on every progress report, so only a genuinely
+/// stalled one is ever reclaimed.
+const STALE_TRANSFER: Duration = Duration::from_secs(180);
+
 impl TransferState {
-    /// Claim the transfer slot.
+    /// Claim the single transfer slot, EXCLUSIVELY. Returns the new transfer id, or `None` if
+    /// a transfer is already in progress (either protocol) -- the caller must then refuse the
+    /// request as busy rather than starting a second one.
     ///
-    /// `needs_awdl` says whether this transfer rides the AWDL link -- true for AirDrop,
-    /// false for Quick Share. Stored BEFORE the id is published, so the radio gate can
-    /// never observe a live transfer still carrying the previous one's answer.
-    pub(crate) fn begin(&self, needs_awdl: bool) -> i64 {
+    /// ONE TRANSFER AT A TIME, ACROSS BOTH PROTOCOLS. AirDrop and Quick Share share the device
+    /// (the radio, the file store, the prompt), so a new request/accept checks here first and
+    /// is turned away if anything is running. The one exception is a slot whose transfer has
+    /// gone **stale** -- no activity for `STALE_TRANSFER`, i.e. it hung or closed improperly
+    /// without calling `finish` -- which is reclaimed so a dead transfer cannot wedge sharing.
+    pub(crate) fn try_begin(&self, needs_awdl: bool) -> Option<i64> {
+        let cur = self.current.load(Ordering::SeqCst);
+        if cur != 0 {
+            if !self.is_stale() {
+                return None; // busy with a live transfer
+            }
+            log::warn!(
+                "transfer {cur} shows no activity for {}s — reclaiming the slot (presumed dead)",
+                STALE_TRANSFER.as_secs()
+            );
+            self.finish(cur);
+        }
         let id = self.next.fetch_add(1, Ordering::SeqCst) + 1;
+        // Claim only if still free; another request may have taken it since the load above.
+        if self
+            .current
+            .compare_exchange(0, id, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return None; // lost the race — someone else is now transferring
+        }
         self.needs_awdl.store(needs_awdl, Ordering::SeqCst);
-        // An AirDrop transfer (needs_awdl) also claims the separate airdrop_pending slot, so a
-        // later Quick Share begin() overwriting `current` cannot make the gate forget that
-        // AirDrop still owns the radio. Cleared by this transfer's finish().
+        // An AirDrop transfer also marks airdrop_pending so the radio gate keeps AWDL up for
+        // it (and it reads as busy to the Quick Share side). Cleared by this transfer's finish.
         if needs_awdl {
             self.airdrop_pending.store(id, Ordering::SeqCst);
         }
-        self.current.store(id, Ordering::SeqCst);
-        id
+        self.touch();
+        Some(id)
+    }
+
+    /// Mark the current transfer as active now. Called on claim and on every progress report,
+    /// so a live transfer is never seen as stale by [`try_begin`].
+    pub(crate) fn touch(&self) {
+        if let Ok(mut t) = self.last_activity.lock() {
+            *t = Some(std::time::Instant::now());
+        }
+    }
+
+    /// True if the claimed transfer has shown no activity for `STALE_TRANSFER` — hung, or
+    /// closed without a `finish`. A `None` timestamp (idle) is not stale.
+    fn is_stale(&self) -> bool {
+        self.last_activity
+            .lock()
+            .ok()
+            .and_then(|t| *t)
+            .map(|t| t.elapsed() > STALE_TRANSFER)
+            .unwrap_or(false)
     }
 
     /// True while a transfer that genuinely needs the AWDL link is in flight.
@@ -398,6 +454,10 @@ impl TransferState {
         // pass if activity/policy still want it.
         if self.wifi_direct_active.swap(false, Ordering::SeqCst) {
             log::info!("quickshare: released the AWDL hold for Wi-Fi Direct — radio may return");
+        }
+        // Clear the activity clock so the now-free slot is not seen as a stale claim.
+        if let Ok(mut t) = self.last_activity.lock() {
+            *t = None;
         }
     }
 
@@ -1107,6 +1167,9 @@ impl TransferProgress {
 
 impl quickshare::outbound::Progress for TransferProgress {
     fn progress(&self, done: u64, total: u64) {
+        // Keep the transfer slot alive: a transfer that is moving bytes is not stale, however
+        // long it runs (see TransferState::try_begin / STALE_TRANSFER).
+        self.transfers.touch();
         let cbs = match self.callbacks.lock() {
             Ok(c) => c,
             Err(_) => return,
@@ -1729,7 +1792,11 @@ impl ITarishService for TarishService {
             }
         };
 
-        let id = self.transfers.begin(false);
+        // One transfer at a time across both protocols: refuse if anything is running.
+        let Some(id) = self.transfers.try_begin(false) else {
+            log::info!("receiveOnSocket refused — busy with another transfer");
+            return Ok(0);
+        };
         let transfers = self.transfers.clone();
         let callbacks = self.callbacks.clone();
         let auto_accept = self.auto_accept.clone();
@@ -2026,7 +2093,11 @@ impl ITarishService for TarishService {
             });
         }
 
-        let id = self.transfers.begin(true);
+        // One transfer at a time across both protocols: refuse the send if anything is running.
+        let Some(id) = self.transfers.try_begin(true) else {
+            log::warn!("sendFiles refused — busy with another transfer");
+            return Err(Status::from(StatusCode::WOULD_BLOCK));
+        };
         let transfers = self.transfers.clone();
         let peers_for_send = self.peers.clone();
         let peer_instance = peer_id.to_string();
@@ -2557,7 +2628,12 @@ fn start_quickshare_server(
                     // Same reason as every other socket here: a peer that stops reading
                     // must cost this transfer, not the thread forever.
                     let _ = sock.set_write_timeout(Some(Duration::from_secs(20)));
-                    let id = transfers.begin(false);
+                    // One transfer at a time across both protocols: if anything is running,
+                    // drop this connection rather than serving a second transfer at once.
+                    let Some(id) = transfers.try_begin(false) else {
+                        log::info!("quickshare: refusing an inbound LAN connection — busy");
+                        return;
+                    };
                     let host = QsHost {
                         id,
                         peer: peer.clone(),
@@ -2868,7 +2944,11 @@ impl TarishService {
             });
         }
 
-        let id = self.transfers.begin(false);
+        // One transfer at a time across both protocols: refuse the send if anything is running.
+        let Some(id) = self.transfers.try_begin(false) else {
+            log::warn!("sendFilesOnSocket refused — busy with another transfer");
+            return Err(Status::from(StatusCode::WOULD_BLOCK));
+        };
         let device = device_name();
         // FOUR CHARACTERS. Not the mDNS instance label.
         //
@@ -3052,7 +3132,11 @@ impl TarishService {
             });
         }
 
-        let id = self.transfers.begin(false);
+        // One transfer at a time across both protocols: refuse the send if anything is running.
+        let Some(id) = self.transfers.try_begin(false) else {
+            log::warn!("sendFilesOnLan refused — busy with another transfer");
+            return Err(Status::from(StatusCode::WOULD_BLOCK));
+        };
         let device = device_name();
         let endpoint = String::from_utf8_lossy(&quickshare::random_endpoint_id()).into_owned();
         let peer = peer_id.to_string();
@@ -3222,6 +3306,8 @@ impl quickshare::connection::Host for QsHost {
     }
 
     fn progress(&self, done: u64, total: u64) {
+        // Keep the transfer slot alive while bytes move (see try_begin / STALE_TRANSFER).
+        self.transfers.touch();
         let Ok(cbs) = self.callbacks.lock() else {
             return;
         };

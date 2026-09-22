@@ -60,22 +60,30 @@ request arrived from another Android and **both transfers failed**. Two causes:
 2. `TransferState` models **one** transfer (`current`), so the Quick Share `begin()` overwrote
    the AirDrop offer's id; the radio gate then no longer saw AirDrop as busy.
 
-The rule now (operator's choice: *"wait, then show busy"*, **AirDrop wins**):
+The rule now (operator's choice): **exactly one transfer at a time, across BOTH protocols** —
+including same-network (Wi-Fi LAN) Quick Share, which has no radio conflict but is still
+serialised for predictability (the device, the prompt and the file store are shared too).
 
-- AirDrop's active/pending state is tracked in a **separate** `airdrop_pending` slot that a
-  Quick Share `begin()` does not touch. Set at `/Ask` (`begin(true)`), cleared by that
-  transfer's `finish()`. The radio gate ORs it into `busy`, so a pending AirDrop keeps AWDL up
-  even after its `current` slot was overwritten.
-- `arm_wifi_direct()` **yields to AirDrop**: if `airdrop_busy()`, it waits (~15 s) for AirDrop
-  to finish; if it does not, it **returns false** and Quick Share does **not** form a group —
-  `host_group`/`join_wifi` return `None`, so the transfer stays on its current medium and the
-  peer sees the device as busy. It never tears AWDL down under a live/pending AirDrop.
-- Symmetric guard: while a Quick Share Wi-Fi Direct transfer owns the radio
-  (`wifi_direct_active`), the AirDrop `/Ask` handler refuses new offers with `401` (the peer
-  reports "Declined") rather than interrupting the transfer in flight.
+- **Exclusive claim.** `TransferState::try_begin` claims the single `current` slot with a
+  compare-exchange from 0. Every transfer entry point — AirDrop `/Ask`, Quick Share inbound
+  (Bluetooth and LAN), and all three send paths — calls it and, on `None` (something already
+  running), **refuses busy**: AirDrop answers `/Ask` with `401` (peer shows "Declined"), an
+  inbound Quick Share connection is dropped, and a send returns `WOULD_BLOCK`.
+- **AirDrop still keeps the radio while it holds the slot.** `airdrop_pending` (set for an
+  AirDrop claim) keeps the radio gate holding AWDL up, and `arm_wifi_direct` yields to it —
+  belt-and-suspenders now that the slot is exclusive.
+- **Reliable release, including hangs and improper closes.** An exclusive slot is only safe if
+  it is *always* released, or a dead transfer would wedge all sharing. Every path calls
+  `finish` (which frees the slot and clears the radio holds), and as a backstop each transfer
+  stamps a `last_activity` time — on claim and on every progress report — so `try_begin`
+  **reclaims a slot that has shown no activity for `STALE_TRANSFER` (180 s)**: a hung peer, a
+  half-closed socket, or a crash between claim and the transfer loop self-heals within that
+  window instead of blocking forever. A live transfer touches the clock constantly, so only a
+  genuinely stalled one is ever reclaimed; the window is longer than the accept-prompt wait so
+  a pending offer is not mistaken for dead.
 
-So whoever holds the radio keeps it; the newcomer waits briefly, then shows busy. Same-network
-Quick Share (Wi-Fi LAN) never contends and is unaffected.
+So exactly one transfer runs at a time; any new request or accept while one is in flight is
+turned away busy, and the slot is guaranteed to free even if a transfer dies uncleanly.
 
 ## Graceful signalling
 
