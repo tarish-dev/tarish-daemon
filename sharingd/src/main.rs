@@ -2296,6 +2296,13 @@ fn start_discovery(
         // and tarishd recreates mosey0 with a new one every time it re-acquires the
         // radio, so this is the identity that matters -- not the name.
         let mut bound_idx = mdns::ifindex_of(ifc).unwrap_or(0);
+        // The address we bound the responder against. The index is not enough: tarishd
+        // re-acquires the radio and tlink0's link-local is reassigned (every off-network
+        // Quick Share teardown/restore does this), and the address often lands a moment
+        // AFTER the index appears. Either way the responder ends up receiving queries but
+        // answering into a socket bound to an address that is gone — rx is logged, no
+        // "answered" — which reads as invisible on the sender. Track it and rebind on change.
+        let mut bound_addr = mdns::link_local_of(ifc);
         let mut waiting_logged = false;
         let mut failures = 0u32;
         let mut since_query = Duration::from_secs(99);
@@ -2334,6 +2341,7 @@ fn start_discovery(
                         log::info!("{ifc} is up as index {now_idx} — bound");
                         browser = b;
                         bound_idx = now_idx;
+                        bound_addr = mdns::link_local_of(ifc);
                         failures = 0;
                         was_advertising = false;      // re-assert on the new socket
                         since_query = Duration::from_secs(99);
@@ -2351,6 +2359,25 @@ fn start_discovery(
                     }
                 }
             }
+            // Rebind when the link-local changed but the index did not — the address
+            // arriving after the index, a reassignment on radio re-acquire, or a socket
+            // gone deaf after a Wi-Fi reset. Without this the responder keeps a socket bound
+            // to an address that is gone: it still receives queries (rx logged) but its
+            // answers go nowhere, so the device is invisible until something else forces a
+            // rebind. Re-asserting advertising on the fresh socket restores visibility.
+            let now_addr = mdns::link_local_of(ifc);
+            if now_addr.is_some() && now_addr != bound_addr {
+                match mdns::Browser::new(ifc) {
+                    Ok(b) => {
+                        log::info!("{ifc} link-local changed to {now_addr:?} — rebound");
+                        browser = b;
+                        bound_addr = now_addr;
+                        was_advertising = false; // re-advertise + re-announce on the new socket
+                    }
+                    Err(e) => log::debug!("{ifc} address changed but rebind not ready ({e})"),
+                }
+            }
+
             // Advertising follows the flag, so a client turning discoverability
             // on or off takes effect without restarting anything.
             // Any peer that has become reachable but is still nameless gets asked
