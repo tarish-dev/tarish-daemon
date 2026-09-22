@@ -548,16 +548,12 @@ where
         &result.server_init_msg,
     )
     .map_err(|_| bad("could not derive session keys"))?;
-    // The confirmation PIN, through the REAL derivation -- tarish_protocol::pin::derive,
-    // the same call the send side uses (outbound.rs). It MUST match: the receiver shows
-    // this via onTransferPinDisplay and the sender checks what the person types against
-    // its own derive() of the same auth_string. This used to be the first two bytes as a
-    // big-endian u16 mod 10000 -- a stable four-digit number that was simply NOT the value
-    // the sender expects, so a correct-looking PIN did nothing and the transfer stalled.
-    let session_pin = tarish_protocol::pin::derive(&secrets.auth_string);
-    // Not logged: on a userdebug build logcat is readable by anything in the log group,
-    // and a PIN in the log is one nobody had to read off the other device.
-    debug!("quickshare: session pin derived");
+    // PIN VERIFICATION INTENTIONALLY DISABLED — see docs/PIN-DISABLED.md. The confirmation
+    // PIN is no longer derived or shown: it only ever applied to Quick Share (never AirDrop)
+    // and cannot work against a stock Quick Share peer, so requiring it was inconsistent for
+    // no security gain. The derivation is kept commented for revival:
+    //   let session_pin = tarish_protocol::pin::derive(&secrets.auth_string);
+    //   debug!("quickshare: session pin derived");
     let mut channel = SecureChannel::new(keys, Role::Server);
     info!("quickshare: encrypted channel up with {peer_name:?}");
 
@@ -626,11 +622,9 @@ where
                             1,
                         )
                     });
-                    // Show the session PIN on THIS (receiving) device so the person can
-                    // read it to the sender, who types it when Require PIN is on.
-                    notify(callbacks, |cb| {
-                        cb.onTransferPinDisplay(transfer_id, &session_pin)
-                    });
+                    // PIN VERIFICATION INTENTIONALLY DISABLED — see docs/PIN-DISABLED.md.
+                    // No PIN is shown on the receiver any more (it is not derived above):
+                    //   notify(callbacks, |cb| cb.onTransferPinDisplay(transfer_id, &session_pin));
 
                     let accepted = host.ask(transfer_id, &peer_name, &intro.files);
                     // Fed back as an EVENT. The machine will not accept on its own under

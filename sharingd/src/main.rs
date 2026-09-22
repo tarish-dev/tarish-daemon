@@ -1183,29 +1183,35 @@ impl quickshare::outbound::Progress for TransferProgress {
         self.transfers.is_cancelled(self.id)
     }
 
-    fn confirm_pin(&self, pin: &str) -> bool {
-        if !self.require_pin {
-            // Turned off deliberately, by the person or by their organisation. Nothing to
-            // ask, and nothing to park -- the PIN is never handed out, so there is no
-            // value to clear either.
-            log::debug!("quickshare: PIN confirmation is off; sending without it");
-            return true;
-        }
-        self.transfers.set_pin(self.id, pin);
-        {
-            let cbs = match self.callbacks.lock() {
-                Ok(c) => c,
-                Err(_) => return false,
-            };
-            for cb in cbs.iter() {
-                let _ = cb.onTransferPinRequired(self.id);
-            }
-        }
-        // Long, because the person has to pick up the other device and read it. Shorter
-        // than the receiver's own accept window would make us the reason it failed.
-        let ok = self.transfers.await_pin(self.id, Duration::from_secs(120));
-        self.transfers.clear_pin(self.id);
-        ok
+    fn confirm_pin(&self, _pin: &str) -> bool {
+        // PIN VERIFICATION INTENTIONALLY DISABLED — see docs/PIN-DISABLED.md.
+        //
+        // A typed PIN only ever applied to Quick Share, never to AirDrop, and it cannot work
+        // against a stock Quick Share peer at all (there is no field to type it into), so it
+        // made the two protocols inconsistent for no security we could point at: AirDrop is
+        // safe with a plain accept prompt, and Quick Share should be too. Disabled until a
+        // real purpose for it appears. The ask/park/await machinery below is kept, commented,
+        // so it can be revived without reconstructing it.
+        let _ = &self.require_pin; // field retained; see docs/PIN-DISABLED.md
+        true
+        // -- disabled --
+        // if !self.require_pin {
+        //     log::debug!("quickshare: PIN confirmation is off; sending without it");
+        //     return true;
+        // }
+        // self.transfers.set_pin(self.id, pin);
+        // {
+        //     let cbs = match self.callbacks.lock() {
+        //         Ok(c) => c,
+        //         Err(_) => return false,
+        //     };
+        //     for cb in cbs.iter() {
+        //         let _ = cb.onTransferPinRequired(self.id);
+        //     }
+        // }
+        // let ok = self.transfers.await_pin(self.id, Duration::from_secs(120));
+        // self.transfers.clear_pin(self.id);
+        // ok
     }
 
     fn join_wifi(
@@ -1707,14 +1713,14 @@ impl ITarishService for TarishService {
         self.send_common(peer_id, socket, files, names, true)
     }
 
-    fn confirmTransferPin(&self, transfer_id: i64, pin: &str) -> BinderResult<bool> {
-        // No logging of the value, right or wrong. A rejected guess in a log is still a
-        // guess someone can read, and the near-misses narrow it down.
-        let ok = self.transfers.confirm_pin(transfer_id, pin.trim());
-        if !ok {
-            log::info!("quickshare: PIN rejected for transfer {transfer_id}");
-        }
-        Ok(ok)
+    fn confirmTransferPin(&self, _transfer_id: i64, _pin: &str) -> BinderResult<bool> {
+        // PIN VERIFICATION INTENTIONALLY DISABLED — see docs/PIN-DISABLED.md. No PIN is ever
+        // parked now, so there is nothing to check; accept unconditionally. The AIDL method
+        // stays (it is part of the interface) and the app no longer calls it. Original check:
+        //   let ok = self.transfers.confirm_pin(transfer_id, pin.trim());
+        //   if !ok { log::info!("quickshare: PIN rejected for transfer {transfer_id}"); }
+        //   Ok(ok)
+        Ok(true)
     }
 
     fn sendFilesOnLan(
