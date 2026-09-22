@@ -199,9 +199,16 @@ pub(crate) struct TransferState {
     next: std::sync::atomic::AtomicI64,
     /// The real confirmation PIN for the transfer being set up, and the transfer it
     /// belongs to. Never leaves this process.
+    ///
+    /// PIN VERIFICATION INTENTIONALLY DISABLED — see docs/PIN-DISABLED.md. These fields and
+    /// the set/confirm/await/clear methods below are retained (behind allow(dead_code)) so the
+    /// feature can be revived without reconstructing it.
+    #[allow(dead_code)]
     pin: Mutex<Option<(i64, String)>>,
     /// Set to a transfer id once someone typed its PIN correctly.
+    #[allow(dead_code)]
     pin_ok: Mutex<Option<i64>>,
+    #[allow(dead_code)]
     pin_confirmed: std::sync::Condvar,
     /// The socket a client has provided for a bandwidth upgrade, and which transfer
     /// asked for it.
@@ -477,6 +484,7 @@ impl TransferState {
     /// It lives here and nowhere else: not in the app, not in a callback argument, not
     /// in a log at info level. A sender that can see its own copy can confirm a transfer
     /// without looking at the other device, which is the whole thing the PIN prevents.
+    #[allow(dead_code)] // PIN disabled; retained for revival — docs/PIN-DISABLED.md
     pub(crate) fn set_pin(&self, id: i64, pin: &str) {
         if let Ok(mut p) = self.pin.lock() {
             *p = Some((id, pin.to_string()));
@@ -488,6 +496,7 @@ impl TransferState {
     /// A mismatch is NOT fatal and does not clear anything: mistyping four digits is the
     /// ordinary case, and tearing the connection down would make the person start the
     /// whole transfer again.
+    #[allow(dead_code)] // PIN disabled; retained for revival — docs/PIN-DISABLED.md
     pub(crate) fn confirm_pin(&self, id: i64, typed: &str) -> bool {
         let matched = match self.pin.lock() {
             Ok(p) => match p.as_ref() {
@@ -506,6 +515,7 @@ impl TransferState {
     }
 
     /// Block until the right digits arrive, the transfer is cancelled, or we give up.
+    #[allow(dead_code)] // PIN disabled; retained for revival — docs/PIN-DISABLED.md
     pub(crate) fn await_pin(&self, id: i64, timeout: Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         let mut guard = match self.pin_ok.lock() {
@@ -534,6 +544,7 @@ impl TransferState {
     }
 
     /// Forget the parked PIN. Called when a transfer ends, however it ended.
+    #[allow(dead_code)] // PIN disabled; retained for revival — docs/PIN-DISABLED.md
     pub(crate) fn clear_pin(&self, id: i64) {
         if let Ok(mut p) = self.pin.lock() {
             if p.as_ref().map(|(parked, _)| *parked == id).unwrap_or(false) {

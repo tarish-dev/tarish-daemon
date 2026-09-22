@@ -542,7 +542,9 @@ where
     }
 
     // --- 6. keys. SERVER, because we answered the handshake -------------------
-    let (secrets, keys) = d2d::derive_all(
+    // `_secrets` is unused while PIN verification is disabled (it fed the PIN derivation —
+    // see docs/PIN-DISABLED.md); un-underscore it to revive.
+    let (_secrets, keys) = d2d::derive_all(
         &result.dhs,
         &result.client_init_msg,
         &result.server_init_msg,
