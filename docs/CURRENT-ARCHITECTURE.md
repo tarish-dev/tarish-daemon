@@ -60,6 +60,10 @@ that path is now tlink's shim. The **app README's** "current AWDL layer = libmos
   Same-Wi-Fi transfers use the LAN (fast) automatically.
 - **AWDL is single-channel (ch149) in prod**, which misses peers on other social channels
   (e.g. some iPhones). Multi-channel scheduling (like stock mosey) is in progress.
+- **tlink AirDrop is proven for the core path (bring-up, election, sync, discovery, receive);
+  send throughput is still being hardened.** tlink ships as the AWDL userspace (the shim
+  replaces libmosey), but it is not yet at full libmosey parity — Google's `libmosey` remains
+  the same-ABI drop-in fallback. Do not describe tlink AirDrop *send* as finished.
 - **The `platform_app` binder grant is being narrowed** to a signature-scoped app domain.
 - **tarishd's SELinux policy** is being re-derived from tlink's actual syscalls (it was
   inherited from Google's `mosey_server`).
