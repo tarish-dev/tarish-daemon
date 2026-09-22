@@ -34,6 +34,14 @@ use std::fmt;
 /// below anything that matters to this process.
 pub const MAX_BYTES_PAYLOAD: usize = 1024 * 1024;
 
+/// How many payloads may be part-way through at once (security review, finding #6).
+///
+/// Each BYTES payload buffers up to `MAX_BYTES_PAYLOAD`, and the UKEY2 handshake completes
+/// automatically, so without a cap a peer could open unlimited payload ids before consent and
+/// pin `count * 1 MiB` of memory. A real transfer has a handful in flight; 32 is generous for
+/// that and bounds the worst case (~32 MiB) well below anything that pressures the device.
+pub const MAX_IN_FLIGHT: usize = 32;
+
 /// What came out of a chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -66,6 +74,8 @@ pub enum Error {
     TooLarge { id: i64, limit: usize },
     /// Negative offset or size. A peer sending one is not confused, it is probing.
     Negative { id: i64 },
+    /// Too many payloads part-way through at once. A peer opening more than we will hold.
+    TooManyInFlight { id: i64, limit: usize },
 }
 
 impl fmt::Display for Error {
@@ -81,6 +91,9 @@ impl fmt::Display for Error {
                 write!(f, "payload {id}: buffered payload exceeds {limit} bytes")
             }
             Error::Negative { id } => write!(f, "payload {id}: negative offset or size"),
+            Error::TooManyInFlight { id, limit } => {
+                write!(f, "payload {id}: more than {limit} payloads in flight — refusing")
+            }
         }
     }
 }
@@ -133,6 +146,13 @@ impl Assembler {
 
         if chunk.offset < 0 || pt.header.total_size < 0 {
             return Err(Error::Negative { id });
+        }
+
+        // Cap concurrent payloads (security review, finding #6): a NEW id is refused once too
+        // many are already part-way through, so a peer cannot open unlimited buffers before
+        // consent. An id already in flight keeps going.
+        if !self.in_flight.contains_key(&id) && self.in_flight.len() >= MAX_IN_FLIGHT {
+            return Err(Error::TooManyInFlight { id, limit: MAX_IN_FLIGHT });
         }
 
         let entry = self.in_flight.entry(id).or_insert_with(|| InFlight {

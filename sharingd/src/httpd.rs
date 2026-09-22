@@ -1272,8 +1272,23 @@ pub fn safe_leaf(entry_name: &str) -> Option<String> {
     if leaf.is_empty() || leaf == "." || leaf == ".." {
         return None;
     }
-    // NUL cannot appear in a path, and a leading dot would hide the file.
-    if leaf.contains('\0') {
+    // Refuse a hostile name rather than sanitise it, so what is stored, shown and logged all
+    // match (security review, finding #8). NUL cannot appear in a path. Control characters
+    // (C0/C1) can corrupt or spoof a name in a log or the share sheet. Unicode bidirectional
+    // and directional-format overrides are the real trick: a right-to-left override in
+    // "photo\u{202E}gpj.exe" DISPLAYS as "photo_exe.jpg" while the bytes on disk are the
+    // executable. (The `._` AppleDouble skip in extract() runs before this, so leading-dot
+    // hidden-file handling stays there, keyed on the raw name.)
+    if leaf.chars().any(|c| {
+        c == '\0'
+            || c.is_control()
+            || matches!(c,
+                '\u{202A}'..='\u{202E}'   // LRE RLE PDF LRO RLO
+                | '\u{2066}'..='\u{2069}' // LRI RLI FSI PDI
+                | '\u{200E}' | '\u{200F}' // LRM RLM
+                | '\u{061C}'              // Arabic letter mark
+            )
+    }) {
         return None;
     }
     Some(leaf)
