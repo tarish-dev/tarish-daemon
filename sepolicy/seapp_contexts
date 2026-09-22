@@ -1,0 +1,6 @@
+# Map the Tarish app (dev.tarish.app, platform-signed, seinfo=platform) to its own domain
+# `tarish_app` instead of the shared `platform_app`. Security review finding #28: only this
+# app should be able to reach ITarishService. Keyed on package name AND seinfo so it is a
+# more-specific match than the generic `seinfo=platform -> platform_app` line and wins for
+# this package alone. See tarish_app.te.
+user=_app seinfo=platform name=dev.tarish.app domain=tarish_app type=app_data_file levelFrom=all

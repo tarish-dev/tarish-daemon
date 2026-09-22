@@ -1,0 +1,26 @@
+# Dedicated SELinux domain for the Tarish app (dev.tarish.app).
+#
+# WHY (security review, finding #28). The app currently runs as `platform_app` — a class every
+# platform-signed app with its own uid lands in — so ANY such app can drive ITarishService:
+# enumerate peers, send files, and setPolicy to switch on auto-accept. Giving the app its own
+# domain lets the service's `find`/`call` be scoped to ONLY this app (see tarishsharingd.te),
+# closing that hole.
+#
+# PERMISSIVE FOR NOW — this is being derived, not shipped. A custom domain does not inherit
+# platform_app's broad grants, so the full rule set is collected from real denials on a
+# permissive build (gos-selinux --collect while exercising the app: BLE scan/advertise, Wi-Fi
+# Direct, notifications, file access, the share sheet, binding the daemon) and folded in below.
+# The domain stays `permissive` until that set is complete and verified, and it must NOT ship
+# enforcing (and never in a release build, which forbids permissive domains) until then.
+type tarish_app, domain;
+app_domain(tarish_app)
+permissive tarish_app;
+
+# The whole point of the domain: reach the Tarish daemon's binder service, both ways
+# (the daemon calls back through ITarishCallback).
+allow tarish_app tarish_service:service_manager find;
+binder_call(tarish_app, tarishsharingd)
+binder_call(tarishsharingd, tarish_app)
+
+# --- derived from AVCs on the permissive build (added as collected) ---
+# (nothing yet — first cycle establishes the domain assignment, then collect)
