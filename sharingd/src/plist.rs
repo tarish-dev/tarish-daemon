@@ -231,6 +231,19 @@ const MAX_DEPTH: usize = 16;
 /// How many objects a single container may hold.
 const MAX_ELEMENTS: usize = 4096;
 
+/// Total objects we will MATERIALIZE across the whole parse.
+///
+/// `MAX_DEPTH` and `MAX_ELEMENTS` bound one container and one path, but not the tree: a
+/// reference may point at an object that has already been visited, and a bplist may do this
+/// legitimately (identical strings are deduped to one object). A hostile body abuses it —
+/// object 0 is an array of N references to object 1, which is an array of N references to
+/// object 2, and so on — so the materialized node count is N^depth even though every limit
+/// above is satisfied. A 406-byte body reached 2.1 GB this way (external review, verified).
+/// A shared counter over the recursion caps the total work regardless of fan-out or reuse,
+/// without rejecting the legitimate shared references that rejecting-reuse would break.
+/// AirDrop bodies materialize a few dozen nodes, so this is orders of magnitude of headroom.
+const MAX_TOTAL_OBJECTS: usize = 100_000;
+
 pub fn parse(buf: &[u8]) -> Option<Val> {
     if buf.len() < 40 || &buf[..8] != b"bplist00" {
         return None;
@@ -254,7 +267,14 @@ pub fn parse(buf: &[u8]) -> Option<Val> {
         return None;
     }
 
-    let p = Parser { buf, table_start, offset_size, ref_size, num_objects };
+    let p = Parser {
+        buf,
+        table_start,
+        offset_size,
+        ref_size,
+        num_objects,
+        budget: std::cell::Cell::new(MAX_TOTAL_OBJECTS),
+    };
     p.object(root, 0)
 }
 
@@ -264,6 +284,10 @@ struct Parser<'a> {
     offset_size: usize,
     ref_size: usize,
     num_objects: usize,
+    /// Remaining objects we will materialize; see `MAX_TOTAL_OBJECTS`. Decremented on every
+    /// `object()` entry, so exponential fan-out through repeated references runs out of budget
+    /// and the parse fails closed instead of exhausting memory.
+    budget: std::cell::Cell<usize>,
 }
 
 impl<'a> Parser<'a> {
@@ -280,6 +304,14 @@ impl<'a> Parser<'a> {
         if depth > MAX_DEPTH {
             return None;
         }
+        // Spend one from the total materialization budget. Repeated references (a hostile
+        // body pointing many refs at the same child, level after level) burn through this and
+        // the parse fails closed rather than blowing up memory. See MAX_TOTAL_OBJECTS.
+        let left = self.budget.get();
+        if left == 0 {
+            return None;
+        }
+        self.budget.set(left - 1);
         let at = self.offset_of(index)?;
         let marker = *self.buf.get(at)?;
         let kind = marker >> 4;
