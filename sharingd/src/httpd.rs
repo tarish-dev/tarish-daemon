@@ -45,6 +45,18 @@ const MAX_HEAD: usize = 16 * 1024;
 /// are buffered, and both are answered and closed before any file data moves.
 const MAX_BODY: usize = 8 * 1024 * 1024;
 
+// Caps for an inbound AirDrop /Upload (security review, finding #2). /Upload streams to disk
+// and is deliberately NOT bounded by MAX_BODY, so without these a zip/gzip bomb or a runaway
+// upload could fill /data before consent ever means anything. Bound the compressed upload, the
+// decompressed total, and the member count. Generous: a real transfer of several large videos
+// is well under these.
+const MAX_UPLOAD_BYTES: u64 = 8 * 1024 * 1024 * 1024; // compressed, on the wire
+const MAX_EXTRACTED_BYTES: u64 = 8 * 1024 * 1024 * 1024; // decompressed, summed over members
+const MAX_MEMBERS: usize = 1024; // files per archive
+// A failed archive above this is deleted rather than kept for debugging: a small truncated one
+// is useful evidence, a multi-GiB one is just storage a hostile peer can pile up.
+const FAILED_ARCHIVE_KEEP_MAX: u64 = 64 * 1024 * 1024;
+
 /// Where received archives land. Private to this daemon, which cannot reach shared
 /// storage: the app moves them to Downloads/Tarish, where Quick Share puts its own.
 /// Where received files land, whichever protocol brought them.
@@ -863,6 +875,12 @@ impl Httpd {
         };
         let mut r = cpio_archive::odc::OdcReader::new(std::io::BufReader::new(inner));
         let mut names = Vec::new();
+        // Zip/gzip-bomb and flood guards (security review, finding #2). A gzip container can
+        // declare an enormous decompressed size in a few bytes on the wire, and an archive can
+        // hold unlimited members; cap the running decompressed total and the member count so a
+        // hostile archive is refused before it fills /data.
+        let mut total_extracted: u64 = 0;
+        let mut members: usize = 0;
 
         loop {
             let header = match r.read_next().map_err(cpio_err)? {
@@ -897,6 +915,26 @@ impl Httpd {
             }
             let leaf = leaf.expect("checked above");
 
+            // Flood + bomb guards, before opening the file. A member that would push the
+            // running decompressed total past the budget (a gzip bomb declares a huge size in
+            // a few wire bytes), or one member too many, is refused rather than written.
+            members += 1;
+            if members > MAX_MEMBERS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("archive has more than {MAX_MEMBERS} members — refusing"),
+                ));
+            }
+            if size > MAX_EXTRACTED_BYTES.saturating_sub(total_extracted) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "extracted size would exceed {MAX_EXTRACTED_BYTES} bytes at {leaf:?} \
+                         ({size} more) — refusing (possible decompression bomb)"
+                    ),
+                ));
+            }
+
             let dest = non_clobbering(INBOX, &leaf);
             let mut out = std::fs::OpenOptions::new()
                 .write(true)
@@ -928,6 +966,7 @@ impl Httpd {
                     format!("{leaf}: truncated at {copied} of {size} bytes"),
                 ));
             }
+            total_extracted += copied;
             info!("extracted {dest} ({copied} bytes)");
             r.finish().map_err(cpio_err)?;
             if let Some(leaf) = std::path::Path::new(&dest).file_name() {
@@ -961,6 +1000,23 @@ impl Httpd {
         let total = header(head, "totalbytes")
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(0);
+
+        // Refuse an over-large upload before streaming a byte of it (security review, finding
+        // #2). Both the peer-declared total and Content-Length are attacker-controlled; the
+        // chunked path (no declared length) is bounded live inside stream_chunked.
+        let declared_len = header(head, "content-length")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        if total > MAX_UPLOAD_BYTES || declared_len > MAX_UPLOAD_BYTES {
+            warn!(
+                "/Upload refused — declared size ({} / {}) exceeds {MAX_UPLOAD_BYTES}",
+                total, declared_len
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "upload exceeds the maximum size",
+            ));
+        }
 
         let mut sniff = Vec::new();
         let mut last_report = 0u64;
@@ -1019,7 +1075,19 @@ impl Httpd {
             // handler tell the app the transfer failed (onTransferFinished), instead of
             // leaving the receiver stuck on the progress screen forever.
             Err(e) => {
-                error!("/Upload: extraction failed ({e}) — archive kept at {path}");
+                // A small truncated archive is useful evidence and is kept; a large one is
+                // just storage a hostile peer can pile up (security review, finding #2), so it
+                // is deleted. Bounds the failed-archive accumulation while keeping the debug
+                // value for the common cancelled-mid-upload case.
+                let big = std::fs::metadata(&path)
+                    .map(|m| m.len() > FAILED_ARCHIVE_KEEP_MAX)
+                    .unwrap_or(false);
+                if big {
+                    let _ = std::fs::remove_file(&path);
+                    error!("/Upload: extraction failed ({e}) — large archive removed");
+                } else {
+                    error!("/Upload: extraction failed ({e}) — archive kept at {path}");
+                }
                 return Err(e);
             }
         }
@@ -1321,6 +1389,14 @@ fn stream_chunked<S: Read, W: std::io::Write>(
             out.write_all(&buf[..n])?;
             total += n as u64;
             left -= n;
+            // A chunked upload declares no length up front, so bound it live: refuse once it
+            // passes the cap rather than streaming to disk without limit (security review).
+            if total > MAX_UPLOAD_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("chunked upload exceeds {MAX_UPLOAD_BYTES} bytes — refusing"),
+                ));
+            }
             on_progress(total);
             if cancelled() {
                 return Ok(total);
