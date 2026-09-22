@@ -64,10 +64,29 @@ peers whose master is on ch6 (e.g. an iPhone mini). tlink must parse the master'
 + `sync_params` and hop to match. Evidence:
 `../grapheneos/awdl/captures/stock-mosey-channel-seq-2026092201.txt`.
 
+## What is implemented (2026-09-22)
+
+The AWDL teardown/restore around an off-network Quick Share Wi-Fi Direct transfer is in place:
+
+- **tlink** (`tlink-shim` `mosey_stop`): after the session thread joins, downs `wondertap0`
+  then `wonder0` over rtnetlink (`tlink-hal::wonder::set_iface_down`). The driver `del_iface`s
+  the ART monitor and `dhd_monitor_stop`s, releasing the P2P slot. `mosey_start_5` recreates
+  both, so restore is the daemon's normal start path.
+- **sharingd** (`TransferState`): a `wifi_direct_active` override. The radio gate forces
+  `WANT_PROP=0` while it is set — overriding a foregrounded app's `active` input, immediately,
+  no linger — so tarishd `mosey_stop`s and frees the slot. `arm_wifi_direct()` sets it and
+  blocks until the slot is actually free (confirms the gate wrote `WANT_PROP=0`, then a settle
+  for the teardown) before the client forms/joins the group. Armed in `host_group`
+  (receive/`P2P_GO`) and `join_wifi` for `WifiDirect` (send/`P2P_CLIENT`); released centrally
+  in `finish()` so AWDL returns however the transfer ended. AirDrop and Wi-Fi LAN Quick Share
+  never arm it.
+
 ## Open code items
 
 1. **tlink multi-channel scheduling** — follow the peer `channel_seq`; keep the ch6 rendezvous
    slot. (task #20; the highest functional win — fixes iPhone-mini interop.)
-2. **wonder.ko teardown/restore** around an off-network Quick Share Wi-Fi Direct transfer, with
-   the goodbye + targeted-scan recovery above.
+2. **Resume niceties** — on AWDL restore after a Wi-Fi Direct transfer, send an mDNS goodbye
+   for the previous AWDL identity (the MAC rotates each session, so a peer can briefly show two
+   of the device) and kick a targeted STA-channel scan. The identity name is already kept
+   stable across restarts.
 3. **Busy/unavailable signalling** to the idle protocol while the radio is owned.
