@@ -133,9 +133,16 @@ pub struct Httpd {
 /// body that will not parse yields empty strings rather than a refusal. The prompt is
 /// still shown -- "something wants to send you a file" with no name is a worse prompt
 /// but a far better outcome than accepting silently because the plist was odd.
-fn describe_offer(body: &[u8]) -> (String, Vec<String>) {
+/// Pull the sender's name and the file names out of an /Ask body, for the consent prompt.
+///
+/// Returns `None` if ANY of them is not display-safe. Refusing the whole offer is the same
+/// choice `safe_leaf` already makes for storage, and for the same reason: what is stored,
+/// shown and logged must all match. Dropping or rewriting the bad name instead would put a
+/// prompt on screen that does not describe what is about to arrive, which is precisely the
+/// attack. A legitimate sender never puts a bidi override in a filename.
+fn describe_offer(body: &[u8]) -> Option<(String, Vec<String>)> {
     let Some(v) = plist::parse(body) else {
-        return (String::new(), Vec::new());
+        return Some((String::new(), Vec::new()));
     };
     let from = v
         .get("SenderComputerName")
@@ -155,11 +162,20 @@ fn describe_offer(body: &[u8]) -> (String, Vec<String>) {
                 .unwrap_or_default();
             let leaf = n.rsplit('/').next().unwrap_or(n);
             if !leaf.is_empty() {
+                if !display_safe(leaf) {
+                    return None;
+                }
                 names.push(leaf.to_string());
             }
         }
     }
-    (from, names)
+    // The sender's own name is shown in the same prompt and gets the same rule. It is the
+    // easier target of the two: nothing downstream ever writes it to disk, so it had no
+    // check at all.
+    if !display_safe(&from) {
+        return None;
+    }
+    Some((from, names))
 }
 
 /// What the /Ask wait resolved to. Distinguishes a sender cancel (the connection closed
@@ -530,7 +546,14 @@ impl Httpd {
                     respond(tls, 401, None, false)?;
                     return Ok(Disposition::Close);
                 };
-                let (from, names) = describe_offer(&body);
+                let Some((from, names)) = describe_offer(&body) else {
+                    // Refused BEFORE anyone is asked, so nobody can approve a name that
+                    // does not say what it is.
+                    warn!("offer {id} carried a name that is not display-safe — refusing");
+                    self.transfers.finish(id);
+                    respond(tls, 401, None, false)?;
+                    return Ok(Disposition::Close);
+                };
                 info!("offer {id} from {from:?}: {} file(s) {names:?}", names.len());
 
                 // ASK ONLY IF THERE IS A QUESTION.
@@ -1298,7 +1321,25 @@ pub fn safe_leaf(entry_name: &str) -> Option<String> {
     // "photo\u{202E}gpj.exe" DISPLAYS as "photo_exe.jpg" while the bytes on disk are the
     // executable. (The `._` AppleDouble skip in extract() runs before this, so leading-dot
     // hidden-file handling stays there, keyed on the raw name.)
-    if leaf.chars().any(|c| {
+    if !display_safe(&leaf) {
+        return None;
+    }
+    Some(leaf)
+}
+
+/// Is this text safe to STORE, SHOW and LOG as itself?
+///
+/// Factored out of `safe_leaf` so the identical rule can be applied at the consent
+/// boundary. It was only ever enforced on the storage path, which left the prompt showing
+/// a name the filesystem would later refuse: a right-to-left override in
+/// "photo\u{202E}gpj.exe" DISPLAYS as "photo_exe.jpg", so a person could approve one
+/// thing and have another arrive — and then the write failed confusingly, after consent.
+///
+/// NUL cannot appear in a path. Control characters (C0/C1) corrupt or spoof a name in a
+/// log or the share sheet. The bidirectional and directional-format overrides are the real
+/// trick.
+pub fn display_safe(s: &str) -> bool {
+    !s.chars().any(|c| {
         c == '\0'
             || c.is_control()
             || matches!(c,
@@ -1307,10 +1348,7 @@ pub fn safe_leaf(entry_name: &str) -> Option<String> {
                 | '\u{200E}' | '\u{200F}' // LRM RLM
                 | '\u{061C}'              // Arabic letter mark
             )
-    }) {
-        return None;
-    }
-    Some(leaf)
+    })
 }
 
 /// A destination path that never overwrites an existing file.
@@ -1608,4 +1646,69 @@ fn build_acceptor() -> Result<SslAcceptor, openssl::error::ErrorStack> {
     acc.set_certificate(&cert)?;
     acc.check_private_key()?;
     Ok(acc.build())
+}
+
+#[cfg(test)]
+mod offer_display_tests {
+    use super::{describe_offer, display_safe};
+    use crate::plist::{encode, Value};
+
+    /// Build an /Ask body the way a sender would.
+    fn ask(sender: &str, files: &[&str]) -> Vec<u8> {
+        let items: Vec<Value> = files
+            .iter()
+            .map(|n| Value::Dict(vec![("FileName".into(), Value::Str((*n).into()))]))
+            .collect();
+        encode(&Value::Dict(vec![
+            ("SenderComputerName".into(), Value::Str(sender.into())),
+            ("Files".into(), Value::Array(items)),
+        ]))
+    }
+
+    #[test]
+    fn an_ordinary_offer_is_described() {
+        let (from, names) = describe_offer(&ask("Ali's iPhone", &["IMG_0001.jpg"])).unwrap();
+        assert_eq!(from, "Ali's iPhone");
+        assert_eq!(names, vec!["IMG_0001.jpg"]);
+    }
+
+    /// Non-ASCII is not hostile. Refusing it would break most of the world's filenames.
+    #[test]
+    fn non_ascii_names_are_fine() {
+        let (from, names) = describe_offer(&ask("هاتف", &["صورة.jpg", "写真.png"])).unwrap();
+        assert_eq!(from, "هاتف");
+        assert_eq!(names.len(), 2);
+    }
+
+    /// The attack: RLO makes "photo<RLO>gpj.exe" read as "photo_exe.jpg" on screen.
+    #[test]
+    fn a_bidi_override_in_a_filename_refuses_the_whole_offer() {
+        assert!(describe_offer(&ask("Mac", &["photo\u{202E}gpj.exe"])).is_none());
+    }
+
+    /// One bad name poisons the offer even if the others are clean — otherwise the prompt
+    /// would describe a subset of what is about to arrive.
+    #[test]
+    fn one_bad_name_among_good_ones_still_refuses() {
+        assert!(describe_offer(&ask("Mac", &["a.jpg", "b\u{202E}gpj.exe", "c.jpg"])).is_none());
+    }
+
+    /// The sender name had no check at all before: nothing downstream writes it to disk.
+    #[test]
+    fn a_hostile_sender_name_refuses_the_offer() {
+        assert!(describe_offer(&ask("Ali\u{202E}xxx", &["a.jpg"])).is_none());
+        assert!(describe_offer(&ask("line\nbreak", &["a.jpg"])).is_none());
+    }
+
+    #[test]
+    fn display_safe_covers_the_classes_that_matter() {
+        assert!(display_safe("IMG_0001.jpg"));
+        assert!(display_safe("صورة.jpg"));
+        assert!(!display_safe("a\u{202E}b")); // RLO
+        assert!(!display_safe("a\u{2066}b")); // LRI
+        assert!(!display_safe("a\u{200F}b")); // RLM
+        assert!(!display_safe("a\u{061C}b")); // Arabic letter mark
+        assert!(!display_safe("a\u{0}b"));    // NUL
+        assert!(!display_safe("a\tb"));       // control
+    }
 }
