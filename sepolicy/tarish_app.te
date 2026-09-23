@@ -71,6 +71,21 @@ app_domain(tarish_app)
 allow tarish_app self:tcp_socket { create connect getopt };
 allow tarish_app port_type:tcp_socket name_connect;
 
+# Enumerate this device's own interfaces, for one question: is the Wi-Fi Direct group we
+# are about to advertise still real? java.net.NetworkInterface does that over a netlink
+# route socket, and without it the lookup does not fail soft -- it throws, the check reads
+# "no interface has this address", and the app tears down a LIVE group and rebuilds it once
+# a second. Seen exactly so on 2026092319:
+#
+#   avc: denied { create } for comm="tarish-group-ho" scontext=u:r:tarish_app
+#        tcontext=u:r:tarish_app tclass=netlink_route_socket permissive=0
+#
+# Reading only: NLM_F_REQUEST dumps. nlmsg_read is the separate check that gates which
+# netlink MESSAGE types may be issued, and is what confines this to queries -- there is no
+# nlmsg_write here, so the app cannot change a route, an address or a link. That is the
+# distinction worth keeping: the app may ask the kernel what exists, and may not alter it.
+allow tarish_app self:netlink_route_socket { create bind read write getattr nlmsg_read };
+
 # The whole point of the domain: reach the Tarish daemon's binder service, both ways
 # (the daemon calls back through ITarishCallback).
 allow tarish_app tarish_service:service_manager find;
