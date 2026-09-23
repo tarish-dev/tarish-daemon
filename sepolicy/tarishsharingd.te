@@ -52,15 +52,22 @@ add_service(tarishsharingd, tarish_service)
 # binder_call both ways, because the daemon calls BACK into the app through
 # ITarishCallback to say files have arrived.
 #
-# STILL TOO BROAD. platform_app is a class, not this app -- any platform-signed app with
-# its own uid lands in it, and every one of them can then drive the whole interface:
-# enumerate peers, send files, watch transfers, and setPolicy to switch off the PIN
-# requirement. Narrowing it needs a dedicated domain via seapp_contexts keyed on package
-# and signature, which means re-granting everything a platform app gets and cannot be
-# written blind. See ARCHITECTURE-TARGET.md.
-binder_call(platform_app, tarishsharingd)
-binder_call(tarishsharingd, platform_app)
-allow platform_app tarish_service:service_manager find;
+# CLOSED (security review #28). This used to read:
+#
+#   binder_call(platform_app, tarishsharingd)
+#   binder_call(tarishsharingd, platform_app)
+#   allow platform_app tarish_service:service_manager find;
+#
+# platform_app is a class, not this app -- every platform-signed app with its own uid
+# lands in it, and each one could then drive the whole interface: enumerate peers, send
+# files, watch transfers, setPolicy. The note here said narrowing it "cannot be written
+# blind", and that was right: the rule set was not guessed, it was derived from real
+# denials on a permissive build (tarish_app.te records which, and why each is needed).
+#
+# The app now has its own domain and the grants live in tarish_app.te, keyed by package
+# name in seapp_contexts. Nothing else calls this service: tarishctl runs in `shell` and
+# is deliberately NOT granted -- under enforcing it is refused, which is the proof that
+# the lock holds.
 
 # /proc/net/if_inet6, to find our own link-local address for the AAAA record we
 # advertise. The alternative is getifaddrs(), which would mean ~30 lines of
@@ -92,13 +99,18 @@ allow tarishsharingd tarish_data_file:file { create write open getattr };
 allow tarishsharingd tarish_data_file:dir { read open };
 allow tarishsharingd tarish_data_file:file read;
 
-# The client reads received files through a descriptor this daemon opens and passes
-# over binder. Handing over an already-open fd does NOT exempt the receiver from
-# needing permission on the file itself, which is what an earlier version of this
-# assumed: collection to Downloads/Tarish failed silently and the transfer looked like it
-# arrived and vanished.
-allow platform_app tarish_data_file:file read;
-allow platform_app tarish_data_file:dir search;
+# MOVED to tarish_app.te (security review #28). This used to read:
+#
+#   allow platform_app tarish_data_file:file read;
+#   allow platform_app tarish_data_file:dir search;
+#
+# which let ANY platform-signed app read the contents of every received file. That is a
+# worse grant than the binder one above it, and easier to miss, because it does not
+# mention the service at all.
+#
+# The `file read` half is real and now belongs to tarish_app alone. The `dir search` half
+# was dropped: a permissive run of a whole AirDrop receive logged only the file read, so
+# nothing walks the inbox by path any more, and the app should not be able to.
 
 # And the reverse, for sending: the client passes descriptors for files it opened from
 # MediaStore, so this daemon has to be allowed to use an fd that mediaprovider owns.
@@ -166,12 +178,16 @@ set_prop(tarishsharingd, tarish_name_prop)
 #
 # The denial went to LOGCAT and not to dmesg -- `dmesg | grep -c avc` was 0 while logcat
 # had it -- so a dmesg-only look says the transaction failed for no reason at all.
-allow tarishsharingd platform_app:unix_stream_socket { read write getattr };
+#
+# These name tarish_app, not platform_app (security review #28) -- the sockets come from
+# OUR app and no other, so the daemon should only be able to work a descriptor that app
+# passed it.
+allow tarishsharingd tarish_app:unix_stream_socket { read write getattr };
 # The Wi-Fi Direct / hotspot upgrade: the app joins the group, connects to the group owner
 # and passes this across. setopt because the protocol sets TCP_NODELAY and a read timeout
 # on it; shutdown so the transfer can end the connection rather than only closing its own
 # descriptor.
-allow tarishsharingd platform_app:tcp_socket { read write getattr getopt setopt shutdown };
+allow tarishsharingd tarish_app:tcp_socket { read write getattr getopt setopt shutdown };
 
 # set_prop() alone is NOT enough on this release. The macro grants
 # `tarish_awdl_prop:property_service set` and `init:unix_stream_socket connectto`, but

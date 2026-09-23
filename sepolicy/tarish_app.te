@@ -1,22 +1,25 @@
 # Dedicated SELinux domain for the Tarish app (dev.tarish.app).
 #
-# WHY (security review, finding #28). The app currently runs as `platform_app` — a class every
-# platform-signed app with its own uid lands in — so ANY such app can drive ITarishService:
-# enumerate peers, send files, and setPolicy to switch on auto-accept. Giving the app its own
-# domain lets the service's `find`/`call` be scoped to ONLY this app (see tarishsharingd.te),
-# closing that hole.
+# WHY (security review, finding #28). The app used to run as `platform_app` — a class every
+# platform-signed app with its own uid lands in — so ANY such app could drive ITarishService:
+# enumerate peers, send files, and setPolicy to switch on auto-accept. Its own domain scopes
+# the service's `find`/`call` to ONLY this app; tarishsharingd.te no longer grants platform_app
+# anything, which is what actually closes the hole.
 #
-# PERMISSIVE FOR NOW — this is being derived, not shipped. A custom domain does not inherit
-# platform_app's broad grants, so the full rule set is collected from real denials on a
-# permissive build (gos-selinux --collect while exercising the app: BLE scan/advertise, Wi-Fi
-# Direct, notifications, file access, the share sheet, binding the daemon) and folded in below.
-# The domain stays `permissive` until that set is complete and verified, and it must NOT ship
-# enforcing (and never in a release build, which forbids permissive domains) until then.
+# ENFORCING. The rule set below was derived, not guessed: the domain shipped `permissive` for
+# one build (2026092313) and every rule here comes from a denial actually logged on hardware
+# while the app was driven through launch, all four screens, the settings toggles, the
+# document picker, BLE scan/advertise, discovery, and a send.
+#
+# Permissive collection can only ever be half the answer -- `dontaudit` suppresses denials in
+# permissive mode too, so a silent log does not prove a complete policy (BUILD-NOTES 28). The
+# other half is this: run enforcing and exercise the app for real. A missing rule then shows
+# up as a feature that does not work, which is the test that actually matters.
+#
 # coredomain: the app ships on a core partition (system_ext/priv-app), and Treble requires
 # every platform app's domain to be a coredomain type.
 type tarish_app, domain, coredomain;
 app_domain(tarish_app)
-permissive tarish_app;
 
 # The whole point of the domain: reach the Tarish daemon's binder service, both ways
 # (the daemon calls back through ITarishCallback).
@@ -33,3 +36,29 @@ allow tarish_app app_api_service:service_manager find;
 
 # The GPU RenderThread reads /sys/.../uevent while rendering the UI.
 allow tarish_app sysfs:file r_file_perms;
+
+# --- derived from AVCs (cycle 2: a real AirDrop receive from an iPhone) ---
+# Read a received file through the fd the daemon hands us:
+#
+#   avc: denied { read } for comm="tarishsharingd" path="/data/misc/tarish/inbox/IMG_0017.MOV"
+#        scontext=u:r:tarish_app tcontext=u:object_r:tarish_data_file tclass=file
+#
+# Note whose names those are: `comm` is the DAEMON, `scontext` is the APP. That is binder's
+# security_binder_transfer_file() -- when a service passes a file descriptor, the kernel checks
+# the RECEIVING domain against the file's type, and logs it against the sending process. So
+# this is not the app opening anything; it is the app being handed an fd the daemon already
+# opened, and the check is whether it may read what arrived.
+#
+# `read` alone, deliberately, and it is worth seeing why that is tight rather than lax:
+#
+#   - no `open`, and no `dir search` on tarish_data_file, so the app CANNOT open the inbox or
+#     walk it. It can only read fds the daemon chose to give it, which keeps the daemon the
+#     gatekeeper of which received file the app ever sees.
+#   - no `write`: the app copies the bytes out to MediaStore and never writes back. The fd is
+#     opened O_RDONLY, and file_to_av() maps that to FILE__READ only, so `write` would be an
+#     unused grant.
+#   - `fd use` is already covered by binder_call(tarish_app, tarishsharingd) above.
+#
+# Without this the receive still completes -- the daemon writes the file -- but the app's read
+# of the fd fails, so nothing is copied to MediaStore and the file never reaches the gallery.
+allow tarish_app tarish_data_file:file read;
