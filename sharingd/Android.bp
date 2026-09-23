@@ -27,3 +27,38 @@ rust_binary {
     init_rc: ["tarishsharingd.rc"],
     system_ext_specific: true,
 }
+
+// The tests in this crate, as something that actually runs.
+//
+// Until now there was no test target at all, so every `#[cfg(test)]` block here was dead
+// code: `rust_binary` does not compile them. That included the plist memory-bomb test the
+// September security review contributed — written to prove a fix, never once executed.
+//
+// A DEVICE test, not a host one: this crate depends on libbinder_rs and the generated AIDL,
+// neither of which builds for the host. libtarish_protocol is the Android-free half and has
+// its own rust_test_host; this is the other half and cannot be.
+//
+//     m tarishsharingd_test
+//     adb push $OUT/data/nativetest64/tarishsharingd_test/tarishsharingd_test /data/local/tmp/
+//     adb shell /data/local/tmp/tarishsharingd_test
+//
+// Run it unrooted if what you are checking is reachable by the daemon's own domain; `adb
+// root` makes the shell unconfined and hides exactly the failures worth seeing.
+rust_test {
+    name: "tarishsharingd_test",
+    crate_name: "tarishsharingd",
+    srcs: ["src/main.rs"],
+    edition: "2021",
+    rustlibs: [
+        "libandroid_logger",
+        "libbinder_rs",
+        "liblibc",
+        "liblog_rust",
+        "libopenssl",
+        "libcpio_archive_tarish",
+        "libflate2",
+        "dev.tarish-rust",
+        "libtarish_protocol",
+    ],
+    test_suites: ["general-tests"],
+}
