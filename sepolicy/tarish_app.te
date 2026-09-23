@@ -37,37 +37,39 @@ app_domain(tarish_app)
 # group even formed and then collapsed (IPC_PROVISIONING_FAILURE), which reads like a peer
 # problem rather than a policy one.
 #
-# net_domain() IS A PLACEHOLDER AND MUST NOT SHIP. It is a blanket macro: TCP, UDP and
-# rawip sockets, name_connect to any port, node_bind to any node. The app needs one TCP
-# socket to a Wi-Fi Direct group owner, and on the receive side to accept on one. Granting
-# the macro is the same shortcut that left this app in platform_app for months.
+# NETWORK ACCESS, MEASURED. This is deliberately NOT net_domain().
 #
-# So it is here only to make the app work while the auditallow rules below record what it
-# ACTUALLY uses. auditallow logs permitted accesses, which is the right instrument for this
-# question -- a permissive build only ever tells you what was missing, never what was
-# excessive, and excessive is the problem we have.
+# net_domain() is the easy answer and it is far too wide: TCP, UDP and rawip sockets,
+# listen, accept, bind, name_connect to any port, node_bind to any node. Reaching for it
+# is the same shortcut that left this app sitting in platform_app until an audit found it,
+# so it was used for exactly one build (2026092317) with auditallow attached, and then
+# replaced by what the app was OBSERVED to use.
 #
-# METHOD (one pass, on hardware):
-#   1. this build: net_domain + auditallow, domain enforcing so nothing else drifts
-#   2. exercise every network path: AirDrop send and receive, Quick Share on a LAN, and
-#      Quick Share off-network through the Bluetooth bootstrap and the Wi-Fi Direct upgrade
-#   3. `logcat | grep "granted.*tarish_app"` is then the exact set, measured not guessed
-#   4. replace net_domain with those rules, drop the auditallow, verify nothing regresses
+# auditallow rather than a permissive build, on purpose: a permissive build tells you what
+# was MISSING and can never tell you what was EXCESSIVE, and excessive was the problem.
+# auditallow logs what is actually exercised.
 #
-# read/write/ioctl are deliberately NOT audited: they fire per buffer and would bury the
-# handful of lines that actually matter. They are implied by a working transfer anyway.
-net_domain(tarish_app)
-
-auditallow tarish_app self:tcp_socket
-    { create bind connect listen accept getattr setattr getopt setopt shutdown };
-auditallow tarish_app self:udp_socket
-    { create bind connect getattr setattr getopt setopt shutdown };
-auditallow tarish_app self:rawip_socket
-    { create bind connect getattr setattr getopt setopt shutdown };
-auditallow tarish_app port_type:tcp_socket name_connect;
-auditallow tarish_app port_type:udp_socket name_bind;
-auditallow tarish_app node_type:tcp_socket node_bind;
-auditallow tarish_app node_type:udp_socket node_bind;
+# Measured over three runs on blazer, off-network, against a stock Pixel peer:
+#   - Quick Share send, upgraded to Wi-Fi Direct (app JOINS the peer's group) x2
+#   - Quick Share receive, where this device HOSTS the group and offers the upgrade
+# Union of every `avc: granted` line for tarish_app across all three: the four below.
+# Nothing else appeared -- no UDP, no rawip, no listen/accept/bind, no node_bind.
+#
+# That shape makes sense once you see where the work happens: the app creates or joins the
+# P2P GROUP through WifiP2pManager, which is framework API and not a socket at all, and the
+# daemon owns any listening socket. The app only ever CONNECTS -- to the group owner on
+# send, and to the daemon's socketpair otherwise.
+#
+# getopt is the high-count one (24 of 39 lines) because the protocol reads socket options
+# per transfer; read/write/ioctl are implied by a completed transfer and were left
+# unaudited on purpose, since they fire per buffer and would have buried everything else.
+#
+# IF THIS IS EVER SHORT, IT FAILS LOUDLY. A missing permission here is a denial with the
+# feature visibly broken, not the silent degradation that a too-wide grant hides -- which
+# is precisely how the earlier `app_domain() without net_domain` gap presented: Wi-Fi
+# Direct quietly fell back to Bluetooth at 150 KB/s with no error anywhere.
+allow tarish_app self:tcp_socket { create connect getopt };
+allow tarish_app port_type:tcp_socket name_connect;
 
 # The whole point of the domain: reach the Tarish daemon's binder service, both ways
 # (the daemon calls back through ITarishCallback).
