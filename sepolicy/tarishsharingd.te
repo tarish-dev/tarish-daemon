@@ -64,6 +64,36 @@ allow tarishsharingd port_type:udp_socket name_bind;
 allow tarishsharingd node_type:tcp_socket node_bind;
 allow tarishsharingd node_type:udp_socket node_bind;
 
+# netd's fwmark socket. MISSED ON THE FIRST NARROWING PASS, and the way it was missed is
+# worth recording: net_domain's grants were enumerated by grepping for `allow ... netdomain`,
+# but two of them are MACRO INVOCATIONS --
+#     private/net.te:39  unix_socket_connect(netdomain, dnsproxyd, netd)
+#     private/net.te:42  unix_socket_connect(netdomain, fwmarkd, netd)
+# -- and a macro call contains no `allow`, so no such grep can see it. Enumerate a macro by
+# what it EXPANDS to, not by what its rules look like.
+#
+# fwmark is how Android tags a socket with the network it should use; libc asks netd over
+# this socket on connect() and bind(). Denied, the request fails and the socket stays
+# unmarked.
+#
+# That is why it did not show up as a broken transfer. Quick Share over Wi-Fi Direct talks
+# to 192.168.49.x on a directly-connected interface, where exactly one route matches and no
+# network selection is needed -- both directions ran at full speed with this denied. It
+# bites where a destination is reachable by more than one network, which means the LAN path,
+# and it interacts with VPN lockdown, whose rules test fwmark 0x0/0x20000.
+#
+# NB an unmarked socket can never SET that bit, so the failure mode is closed, not open.
+# This is a correctness fix, not a security one.
+allow tarishsharingd fwmarkd_socket:sock_file write;
+allow tarishsharingd netd:unix_stream_socket connectto;
+
+# NOT granted, though net_domain did: unix_socket_connect(netdomain, dnsproxyd, netd), the
+# DNS resolver socket. This daemon finds peers over mDNS and connects to addresses, never
+# names, and no denial for it has appeared across AirDrop both ways and Quick Share both
+# ways. A process that parses hostile input and cannot make a DNS query is a better shape,
+# so this stays out until something proves it necessary -- at which point it will say so
+# with an AVC naming dnsproxyd_socket.
+
 # KEPT WITHOUT HAVING BEEN OBSERVED, and deliberately:
 #   read, write, ioctl  -- not instrumented at all. They fire per buffer and would have
 #                          buried the rest; a completed transfer proves them.
