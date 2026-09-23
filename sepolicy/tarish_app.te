@@ -24,5 +24,12 @@ allow tarish_app tarish_service:service_manager find;
 binder_call(tarish_app, tarishsharingd)
 binder_call(tarishsharingd, tarish_app)
 
-# --- derived from AVCs on the permissive build (added as collected) ---
-# (nothing yet — first cycle establishes the domain assignment, then collect)
+# --- derived from AVCs on the permissive build (2026-09-23, cycle 1) ---
+# The standard app-accessible framework services (activity, activity_task, wifi,
+# bluetooth_manager, autofill, uimode, netstats, gpu, textservices, voiceinteraction,
+# content_capture, ...). Each app domain must be granted this EXPLICITLY — it is not inherited
+# via appdomain (priv_app_all, gmscore_app, mediaprovider_app all grant it the same way).
+allow tarish_app app_api_service:service_manager find;
+
+# The GPU RenderThread reads /sys/.../uevent while rendering the UI.
+allow tarish_app sysfs:file r_file_perms;
