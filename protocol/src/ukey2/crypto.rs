@@ -8,11 +8,16 @@
 //!
 //! TWO ENCODING SUBTLETIES, BOTH OF WHICH FAIL RARELY RATHER THAN LOUDLY.
 //!
-//! **The shared secret is a magnitude, not a fixed-width field.** ECDH gives a 32-byte
-//! big-endian X coordinate. UKEY2 hashes it with any leading zero bytes STRIPPED. A
-//! coordinate starts with a zero byte roughly one time in 256, so an implementation
-//! that hashes the padded form interoperates with about 255 of every 256 peers and
-//! fails the rest — which reads as a flaky peer, not as a bug in us.
+//! **The shared secret is a FIXED-WIDTH field, not a magnitude.** ECDH gives a 32-byte
+//! big-endian X coordinate and UKEY2 hashes all 32 bytes, leading zeros included. A
+//! coordinate starts with a zero byte roughly one time in 256, so an implementation that
+//! strips them interoperates with about 255 of every 256 peers and fails the rest — which
+//! reads as a flaky peer, not as a bug in us.
+//!
+//! This file used to assert the exact opposite, and stripped. See `shared_secret` for the
+//! evidence that Google hashes the padded form on both its C++ and Java paths, and for why
+//! the mistake is an easy one: the two's-complement rule below is real, but it governs the
+//! PUBLIC KEY coordinates, not the ECDH output.
 //!
 //! **x and y travel as big-endian two's complement**, per securemessage.proto's own
 //! comment ("slightly wasteful"). That means a leading 0x00 IS PRESENT when the high
@@ -83,23 +88,56 @@ pub fn generate_keypair() -> Result<EcKey<Private>, Error> {
     Ok(EcKey::generate(&group)?)
 }
 
-/// Strip leading zero bytes. The "magnitude" form UKEY2 hashes.
+/// Strip leading zero bytes. The two's-complement magnitude form that securemessage.proto
+/// uses for the PUBLIC KEY coordinates. NOT for the ECDH output -- see `shared_secret`.
 fn magnitude(v: &[u8]) -> &[u8] {
     let first = v.iter().position(|&b| b != 0).unwrap_or(v.len());
     &v[first..]
 }
 
-/// `dhs = SHA-256(ECDH(peer, ours).x_magnitude)`.
+/// `dhs = SHA-256(ECDH(peer, ours).x)`, over the FIXED-WIDTH 32 bytes.
 ///
 /// This is the value `d2d::ukey2_secrets` takes as `dhs`.
+///
+/// THIS USED TO STRIP LEADING ZEROS, AND THAT WAS WRONG. The module header argued the
+/// opposite -- that UKEY2 hashes a magnitude -- and the reasoning looks like it came from
+/// securemessage.proto's comment about x and y travelling as big-endian two's complement.
+/// That comment is real, and it is still honoured below in the public-key codec, but it
+/// describes the PUBLIC KEY FIELDS. The ECDH output is not one of them.
+///
+/// Both of Google's implementations hash the padded form:
+///
+///   C++ (what Nearby links)  securemessage crypto_ops_openssl.cc -> EVP_PKEY_derive,
+///                            which yields the X coordinate zero-padded to the field
+///                            size: 32 bytes for P-256
+///   Java                     KeyAgreement("ECDH").generateSecret(), likewise fixed width
+///
+/// Neither converts through a big integer, so neither strips anything.
+///
+/// WHY IT SURVIVED TESTING, AND WHY THE FIX IS SAFE. When the X coordinate has no leading
+/// zero byte -- 255 times in 256 -- magnitude(x) and x ARE THE SAME BYTES, so both
+/// derivations agree and every ordinary handshake interoperates. Only the 1-in-256 case
+/// diverged, and a rare handshake failure reads as a flaky peer rather than a bug. That
+/// also bounds this change: on the common path it is a no-op, so it cannot break what
+/// works. It can only affect the case that was already failing.
+///
+/// Bada strips too (`Ukey2Crypto.computeDhs` -> `toMagnitude`) and this code was ported
+/// from it, so "Bada interoperates" was never independent evidence. Same bug, same rate,
+/// same reasoning.
+///
+/// NOT YET CONFIRMED AGAINST A REAL PEER. Settling it empirically needs a captured
+/// handshake whose shared X actually begins with 0x00, which is a 1-in-256 capture. Until
+/// such a vector is in docs/QUICKSHARE-VECTORS.md this rests on Google's source rather
+/// than on an observed exchange.
 pub fn shared_secret(ours: &EcKey<Private>, peer: &EcKey<Public>) -> Result<Vec<u8>, Error> {
     let ours = PKey::from_ec_key(ours.clone())?;
     let peer = PKey::from_ec_key(peer.clone())?;
     let mut deriver = Deriver::new(&ours)?;
     deriver.set_peer(&peer)?;
-    // For ECDH this is the X coordinate of the shared point, fixed width (32 bytes).
+    // The X coordinate of the shared point, already zero-padded to 32 bytes by OpenSSL.
+    // Hashed as-is: no magnitude conversion.
     let x = deriver.derive_to_vec()?;
-    Ok(hash(MessageDigest::sha256(), magnitude(&x))?.to_vec())
+    Ok(hash(MessageDigest::sha256(), &x)?.to_vec())
 }
 
 /// SHA-512, used for the cipher commitment over a serialized Ukey2Message.
@@ -298,7 +336,57 @@ mod tests {
         }
     }
 
-    /// The magnitude helper is where the one-in-256 interop bug lives.
+    /// dhs is SHA-256 over the FULL 32 bytes, including a leading zero.
+    ///
+    /// The 1-in-256 case cannot be reached by generating one keypair and hoping, so this
+    /// searches for a pair whose shared X actually starts with 0x00 and then checks that
+    /// what we hash is the padded coordinate rather than the stripped one. Without the
+    /// search the test passes on a stripped implementation 255 runs out of 256, which is
+    /// exactly how the bug lived here for so long.
+    ///
+    /// Both sides must also agree, which is the property that actually matters.
+    #[test]
+    fn dhs_hashes_the_padded_x_including_a_leading_zero() {
+        let group = p256().unwrap();
+        let mut ctx = BigNumContext::new().unwrap();
+
+        for _ in 0..4000 {
+            let a = generate_keypair().unwrap();
+            let b = generate_keypair().unwrap();
+
+            let ours = PKey::from_ec_key(a.clone()).unwrap();
+            let theirs = EcKey::from_public_key(&group, b.public_key()).unwrap();
+            let mut d = Deriver::new(&ours).unwrap();
+            d.set_peer(&PKey::from_ec_key(theirs.clone()).unwrap()).unwrap();
+            let x = d.derive_to_vec().unwrap();
+
+            // OpenSSL always hands back the field width for P-256.
+            assert_eq!(x.len(), 32, "ECDH output must be zero-padded to the field size");
+            if x[0] != 0 {
+                continue;
+            }
+
+            // Found one. The whole point: hashing the magnitude would differ here.
+            let want = hash(MessageDigest::sha256(), &x).unwrap().to_vec();
+            let stripped = hash(MessageDigest::sha256(), magnitude(&x)).unwrap().to_vec();
+            assert_ne!(want, stripped, "the case is only interesting if the two differ");
+
+            let got = shared_secret(&a, &theirs).unwrap();
+            assert_eq!(got, want, "dhs must hash the padded 32 bytes, not the magnitude");
+
+            // And the peer, deriving from the other side, must land on the same value.
+            let ours_pub = EcKey::from_public_key(&group, a.public_key()).unwrap();
+            assert_eq!(shared_secret(&b, &ours_pub).unwrap(), want);
+
+            let _ = &mut ctx;
+            return;
+        }
+        // ~4000 tries against a 1-in-256 event: missing it means something is very wrong.
+        panic!("no shared X with a leading zero byte in 4000 attempts");
+    }
+
+    /// The magnitude helper now serves ONLY the public-key codec, where two's-complement
+    /// really is the wire form. It must no longer be reachable from dhs derivation.
     #[test]
     fn magnitude_strips_only_leading_zeros() {
         assert_eq!(magnitude(&[0x00, 0x00, 0x01, 0x02]), &[0x01, 0x02]);
