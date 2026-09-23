@@ -872,6 +872,18 @@ where
         debug!("quickshare: upgrade offered port {}, out of range", lan.port);
         return Ok(None);
     };
+    // THE PEER CHOOSES THIS ADDRESS, SO IT HAS TO BE CHECKED.
+    //
+    // Until now anything that parsed as 4 or 16 bytes was connected to. A hostile peer
+    // could therefore aim this daemon at a public host, at another machine on the LAN, or
+    // at 127.0.0.1 — turning a share into a request generator pointed wherever it liked.
+    // It costs nothing to refuse: a bandwidth upgrade only ever addresses a peer that is
+    // already link-adjacent.
+    if !is_plausible_peer(ip) {
+        warn!("quickshare: upgrade offered {ip}, which is not a local address — refusing");
+        return Ok(None);
+    }
+
     let addr = std::net::SocketAddr::new(ip, port);
     info!("quickshare: upgrading to Wi-Fi LAN at {addr}");
     // Bounded: an address we cannot reach must cost seconds, not the transfer. The peer
@@ -880,6 +892,67 @@ where
         &addr,
         Duration::from_secs(5),
     )?))
+}
+
+/// Could this plausibly be a peer on a network we are attached to?
+///
+/// A bandwidth upgrade points at a device that is already link-adjacent: a Wi-Fi Direct
+/// group owner on 192.168.49.0/24, or a peer on the same private LAN. Nothing else is ever
+/// a legitimate answer, so everything else is refused.
+///
+/// REFUSED, and each for its own reason:
+///   loopback      127.0.0.0/8, ::1 — would aim the daemon at services on THIS device,
+///                 which is the most valuable target a remote peer could pick
+///   unspecified   0.0.0.0, :: — connect() treats these as localhost
+///   multicast     not a unicast peer
+///   broadcast     255.255.255.255
+///   link-local    169.254.0.0/16 and fe80::/10 — a v6 link-local needs a scope id to be
+///                 meaningful and this path has none, so it can only misroute. AirDrop's
+///                 own link-local traffic does NOT come through here; it is bound to
+///                 tlink0 on a different path entirely.
+///   anything else globally routable — a public address is never a peer
+///
+/// This is deliberately a SCOPE test rather than a subnet test. Checking membership of a
+/// live interface's prefix would be a little stronger, but it needs SIOCGIFNETMASK, and
+/// this domain's ioctl allowlist was just narrowed by measurement — adding a syscall that
+/// turns out to be denied would trade a real hole for a silent failure. The protection is
+/// near-identical in practice: a prefix test also permits any other host on the same LAN,
+/// which is the one case this does not exclude either. Tighten it to a prefix test only
+/// with a measured run proving the ioctl is allowed.
+fn is_plausible_peer(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            if v4.is_loopback()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || v4.is_link_local()
+                || v4.is_documentation()
+            {
+                return false;
+            }
+            // RFC1918 only: 10/8, 172.16/12, 192.168/16. Covers Wi-Fi Direct's
+            // 192.168.49.0/24 and every ordinary home or office LAN.
+            v4.is_private()
+        }
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+                return false;
+            }
+            let o = v6.octets();
+            // fe80::/10 link-local — unusable without a scope id, which we do not carry.
+            if o[0] == 0xfe && (o[1] & 0xc0) == 0x80 {
+                return false;
+            }
+            // An IPv4-mapped address would otherwise smuggle a public v4 target through
+            // the v6 branch, so re-check it as v4.
+            if let Some(m) = v6.to_ipv4_mapped() {
+                return is_plausible_peer(std::net::IpAddr::V4(m));
+            }
+            // fc00::/7 unique-local. Anything else is globally routable, so not a peer.
+            (o[0] & 0xfe) == 0xfc
+        }
+    }
 }
 
 fn adopt<P>(
@@ -1031,4 +1104,62 @@ where
     *input = new_in;
     *out = new_out;
     Ok(true)
+}
+
+#[cfg(test)]
+mod upgrade_address_tests {
+    use super::is_plausible_peer;
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn accepts_a_wifi_direct_group_owner_and_ordinary_lans() {
+        // The single most common real answer: Android's Wi-Fi Direct group owner.
+        assert!(is_plausible_peer(ip("192.168.49.1")));
+        assert!(is_plausible_peer(ip("192.168.1.42")));
+        assert!(is_plausible_peer(ip("10.0.0.7")));
+        assert!(is_plausible_peer(ip("172.16.5.5")));
+        assert!(is_plausible_peer(ip("fd00::1"))); // unique-local v6
+    }
+
+    #[test]
+    fn refuses_pointing_the_daemon_at_this_device() {
+        assert!(!is_plausible_peer(ip("127.0.0.1")));
+        assert!(!is_plausible_peer(ip("127.0.0.53")));
+        assert!(!is_plausible_peer(ip("::1")));
+        assert!(!is_plausible_peer(ip("0.0.0.0")));
+        assert!(!is_plausible_peer(ip("::")));
+    }
+
+    #[test]
+    fn refuses_the_public_internet() {
+        assert!(!is_plausible_peer(ip("8.8.8.8")));
+        assert!(!is_plausible_peer(ip("1.1.1.1")));
+        assert!(!is_plausible_peer(ip("2001:4860:4860::8888")));
+        // 172.32/16 is OUTSIDE the 172.16/12 private block — an easy off-by-one.
+        assert!(!is_plausible_peer(ip("172.32.0.1")));
+        // Carrier-grade NAT is not our LAN either.
+        assert!(!is_plausible_peer(ip("100.64.0.1")));
+    }
+
+    #[test]
+    fn refuses_multicast_broadcast_and_link_local() {
+        assert!(!is_plausible_peer(ip("224.0.0.251")));
+        assert!(!is_plausible_peer(ip("255.255.255.255")));
+        assert!(!is_plausible_peer(ip("169.254.1.1")));
+        assert!(!is_plausible_peer(ip("ff02::fb")));
+        assert!(!is_plausible_peer(ip("fe80::1")));
+    }
+
+    /// The v6 branch must not become a way to smuggle a public v4 target.
+    #[test]
+    fn refuses_ipv4_mapped_public_addresses() {
+        assert!(!is_plausible_peer(ip("::ffff:8.8.8.8")));
+        assert!(!is_plausible_peer(ip("::ffff:127.0.0.1")));
+        // ...but a mapped private address is still a plausible peer.
+        assert!(is_plausible_peer(ip("::ffff:192.168.49.1")));
+    }
 }
