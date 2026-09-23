@@ -31,6 +31,8 @@ Numbering follows the review so the two can be read side by side.
 | **19** | tarishd's inherited mosey_server policy | **DONE 2026-09-24.** Lost `listen`/`accept` on `packet_socket` and `netlink_generic_socket` (operations that do not exist for those classes), `watch`/`watch_reads` on `/dev/tun`, `nlmsg_readpriv`, `nlmsg_getneigh`, and `netlink_netfilter_socket` entirely |
 | **17** | ECDH secret normalization | **DONE 2026-09-24.** `shared_secret` now hashes the padded 32 bytes. Google hashes the padded form on both its C++ (`EVP_PKEY_derive`) and Java (`KeyAgreement.generateSecret`) paths. See below |
 | **16** | LAN upgrade connects to any address a peer supplies | **DONE 2026-09-24.** Scope check: RFC1918 and unique-local only; loopback, unspecified, multicast, broadcast, link-local, documentation and global all refused, with v4-mapped v6 re-checked |
+| **11** | The plist budget counts objects, not bytes | **DONE 2026-09-24.** Leaf bytes now charged, with the allowance proportional to the input (8x `buf.len()`, floor 256 KiB) rather than flat, so a small hostile body gets a small allowance |
+| **15** | Consent shows unsanitized names | **DONE 2026-09-24.** The char rule is factored out of `safe_leaf` as `display_safe()` and applied at the offer boundary, to the file names **and** the sender name. An offer carrying an unsafe name is refused before anyone is asked |
 
 ### On 18 and 19 — how the trim was derived
 
@@ -78,7 +80,6 @@ this rests on Google's source rather than an observed exchange.
 
 | # | Finding | Next step |
 |---|---|---|
-| 11 | **The plist budget counts objects, not bytes.** A large `Data` leaf referenced many times still explodes: an 82 KB `/Ask` body reached 3.5 GB, a 256 KB one 3.87 GB | add a byte budget alongside the object budget, or intern repeated references. Reproducer delivered |
 | 12 | **The regulatory fix rests on an unverified assumption.** `Wonder::capabilities()` returns a hardcoded `[44, 149]` regardless of domain, and `bring_up` never consults it, so nothing in tlink refuses a forbidden channel on the shipping path | one on-device experiment: set a domain where 149 is no-IR and see whether bring-up fails |
 | 13 | **Offer-versus-delivery integrity (AirDrop).** Extraction does not check delivered names, count or sizes against the accepted offer | deferred deliberately. The Quick Share path already refuses unannounced payloads and is the model to copy |
 
@@ -87,7 +88,6 @@ this rests on Google's source rather than an observed exchange.
 | # | Finding | Note |
 |---|---|---|
 | 14 | **Disabling the PIN removed the only MITM check on UKEY2.** The handshake is otherwise unauthenticated Diffie-Hellman | the problem was typed entry, not the mechanism. Display-and-compare should interoperate, since the derivation matches Apple's and Bada's vectors. **Needs an operator decision** |
-| 15 | **Consent shows unsanitized names.** `safe_leaf` protects the filesystem, but the prompt takes raw names from the plist and from `intro.files[].name` | a bidi override spoofs what the person approves, and the write then fails confusingly. Apply the rule at the offer boundary, and to the sender name too |
 
 ## Open — low and housekeeping
 
@@ -95,7 +95,7 @@ this rests on Google's source rather than an observed exchange.
 |---|---|
 | 20 | Upload caps of 8 GiB exceed most phones' free space — cap against `statvfs` free space minus a reserve |
 | 21 | Orphaned files on a tripped extraction guard — earlier members stay in the inbox with no announce |
-| 22 | The VPN routing exemption's safety is entirely the contents of tlink0's table — assert that at insert time rather than maintaining it by care |
+| 22 | The VPN routing exemption's safety is entirely the contents of tlink0's table — assert that at insert time rather than maintaining it by care. **Blocked on a design decision:** asserting it means parsing an `RTM_GETROUTE` dump, which needs `nlmsg_read` — a permission removed from tarishd on 2026-09-24 because nothing used it. So the choice is a netlink dump parser in the privileged daemon plus a re-grant, versus the status quo. `gos-lockdown.sh` already asserts the same invariant continuously; what is missing is runtime enforcement, not detection |
 | 23 | Two clock-tracking tests in `follow.rs` still red — deferred knowingly |
 | 24 | Check the published pcaps for third-party device names before launch |
 | 25 | Wi-Fi Direct join is protocol-inherent; confirm teardown on every error path |
