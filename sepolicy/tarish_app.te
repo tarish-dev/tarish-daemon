@@ -37,13 +37,37 @@ app_domain(tarish_app)
 # group even formed and then collapsed (IPC_PROVISIONING_FAILURE), which reads like a peer
 # problem rather than a policy one.
 #
-# net_domain() rather than `allow tarish_app self:tcp_socket create_stream_socket_perms`:
-# the app does real networking (connect to a group owner, and accept on the receive side
-# where it hosts the group), and picking socket permissions one denial at a time here buys
-# nothing. This grants no more network reach than the app already had as platform_app --
-# what #28 narrowed is WHO MAY DRIVE THE DAEMON, which is the service access above, not
-# whether the app may open a socket.
+# net_domain() IS A PLACEHOLDER AND MUST NOT SHIP. It is a blanket macro: TCP, UDP and
+# rawip sockets, name_connect to any port, node_bind to any node. The app needs one TCP
+# socket to a Wi-Fi Direct group owner, and on the receive side to accept on one. Granting
+# the macro is the same shortcut that left this app in platform_app for months.
+#
+# So it is here only to make the app work while the auditallow rules below record what it
+# ACTUALLY uses. auditallow logs permitted accesses, which is the right instrument for this
+# question -- a permissive build only ever tells you what was missing, never what was
+# excessive, and excessive is the problem we have.
+#
+# METHOD (one pass, on hardware):
+#   1. this build: net_domain + auditallow, domain enforcing so nothing else drifts
+#   2. exercise every network path: AirDrop send and receive, Quick Share on a LAN, and
+#      Quick Share off-network through the Bluetooth bootstrap and the Wi-Fi Direct upgrade
+#   3. `logcat | grep "granted.*tarish_app"` is then the exact set, measured not guessed
+#   4. replace net_domain with those rules, drop the auditallow, verify nothing regresses
+#
+# read/write/ioctl are deliberately NOT audited: they fire per buffer and would bury the
+# handful of lines that actually matter. They are implied by a working transfer anyway.
 net_domain(tarish_app)
+
+auditallow tarish_app self:tcp_socket
+    { create bind connect listen accept getattr setattr getopt setopt shutdown };
+auditallow tarish_app self:udp_socket
+    { create bind connect getattr setattr getopt setopt shutdown };
+auditallow tarish_app self:rawip_socket
+    { create bind connect getattr setattr getopt setopt shutdown };
+auditallow tarish_app port_type:tcp_socket name_connect;
+auditallow tarish_app port_type:udp_socket name_bind;
+auditallow tarish_app node_type:tcp_socket node_bind;
+auditallow tarish_app node_type:udp_socket node_bind;
 
 # The whole point of the domain: reach the Tarish daemon's binder service, both ways
 # (the daemon calls back through ITarishCallback).
