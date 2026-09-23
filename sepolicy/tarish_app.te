@@ -21,7 +21,7 @@
 type tarish_app, domain, coredomain;
 app_domain(tarish_app)
 
-# NETWORK ACCESS -- and the reason this is a macro and not a hand-picked list.
+# NETWORK ACCESS, MEASURED. This is deliberately NOT net_domain().
 #
 # app_domain() grants what an app needs to BE an app; it says nothing about sockets. Under
 # platform_app that did not matter, because platform_app carries net_domain() and the app
@@ -36,8 +36,6 @@ app_domain(tarish_app)
 # of ~10 MB/s, with no error anywhere. Nothing looked broken, it was just slow. The P2P
 # group even formed and then collapsed (IPC_PROVISIONING_FAILURE), which reads like a peer
 # problem rather than a policy one.
-#
-# NETWORK ACCESS, MEASURED. This is deliberately NOT net_domain().
 #
 # net_domain() is the easy answer and it is far too wide: TCP, UDP and rawip sockets,
 # listen, accept, bind, name_connect to any port, node_bind to any node. Reaching for it
