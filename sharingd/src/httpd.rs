@@ -314,9 +314,28 @@ impl Httpd {
         // care how the connection came to be attempted. Discovery deciding correctly
         // and the server refusing anyway are two independent answers to the same
         // question, which is what you want for the one that ends in a prompt.
+        // REFUSE ANYTHING THAT IS NOT ON THE LINK.
+        //
+        // Behind this door is the plist parser, which reads attacker-controlled bytes
+        // BEFORE the person has consented to anything (/Discover and /Ask both parse a
+        // body first). It is bounded now -- see plist.rs -- but the other half of that
+        // answer is keeping the set of peers who can reach it as small as the medium
+        // allows: an AWDL neighbour, one hop away, on this interface.
+        //
+        // The bind already gives that: a link-local address is not routable off-link, so
+        // nothing distant can arrive here. This says it out loud instead of relying on
+        // it, because the bind address is chosen elsewhere (mdns::link_local_of) and a
+        // future change there -- binding :: for a second medium, say -- would widen who
+        // can feed the parser with no sign at this end.
+        //
+        // fe80::/10 by hand: Ipv6Addr::is_unicast_link_local is still unstable.
         if let Ok(std::net::SocketAddr::V6(a)) = stream.peer_addr() {
             if *a.ip() == self.addr {
                 debug!("refused a connection from our own address {}", self.addr);
+                return;
+            }
+            if a.ip().segments()[0] & 0xffc0 != 0xfe80 {
+                warn!("refused a non-link-local connection from {}", a.ip());
                 return;
             }
         }
