@@ -25,72 +25,46 @@ init_daemon_domain(tarishd)
 
 allow tarishd self:capability { net_admin net_raw };
 
-# nl80211 to wonder.ko, and the route/neighbour work libmosey does itself.
-# These sets are Google's, verbatim from mosey_server's rules in the device's own
-# sepolicy_ext.cil. An earlier version of this file trimmed them to what looked
-# necessary and dropped `map` from packet_socket -- libpcap uses PACKET_MMAP for
-# its rx ring, so mosey_start_5 failed with
-#     PcapError("can't mmap rx ring: Permission denied")
-# and the AVC was  denied { map } ... tclass=packet_socket.
+# nl80211 to wonder.ko, and the route work our AWDL shim does itself.
 #
-# Each omission costs a full build-and-flash cycle to discover, and the reference
-# implementation does the same work through the same library, so its set is the
-# evidence. Trimming is only worth doing with a denial log proving a rule unused.
-allow tarishd self:netlink_generic_socket { ioctl read write create getattr setattr lock append map bind connect getopt setopt shutdown };
-allow tarishd self:netlink_route_socket { read write create nlmsg_read nlmsg_write nlmsg_readpriv nlmsg_getneigh };
-allow tarishd self:packet_socket { ioctl read write create getattr setattr lock append map bind connect listen accept getopt setopt shutdown };
-allow tarishd self:netlink_netfilter_socket create;
+# MEASURED, 2026-09-24, build 2026092401 on blazer. These sets used to be Google's,
+# verbatim from mosey_server's rules in the device's own sepolicy_ext.cil, on the argument
+# that the reference implementation does the same job through the same library so its set
+# IS the evidence. That was a fair argument while denials were the only instrument -- a
+# permissive build reports what is MISSING and is structurally blind to what is EXCESSIVE.
+#
+# auditallow is the other direction. Every rule below appeared in
+#   scripts/gos-selinux.sh --granted
+# across four AWDL bring-up/teardown cycles, two of them from tarishd's first syscall after
+# a restart, plus AirDrop send and receive. Everything that did NOT appear is gone:
+#
+#   packet_socket           listen accept map connect getattr setattr lock append
+#                           getopt shutdown
+#   netlink_generic_socket  everything except setopt
+#   netlink_route_socket    nlmsg_read nlmsg_readpriv nlmsg_getneigh
+#   netlink_netfilter_socket  create   -- the whole rule; it never appeared at all
+#   tun_device:chr_file     getattr lock append map watch watch_reads
+#
+# `map` is the one to understand before putting it back. The old note here said libpcap
+# needs PACKET_MMAP for its rx ring, and that dropping `map` produced
+#     PcapError("can't mmap rx ring: Permission denied")
+# That was true OF GOOGLE'S libmosey. This domain now runs tlink, our own shim, and `map`
+# never fired once across those cycles. We were carrying a permission set for a binary we
+# had already replaced -- which is the general risk with inheriting a reference policy, and
+# the reason to measure rather than inherit.
+#
+# read/write/ioctl were deliberately NOT instrumented: they fire per frame on the pcap path
+# and would have buried everything else. They are proven by the daemon working at all.
+#
+# If a rule is genuinely needed on a path none of that exercised, it comes back as a real
+# denial with a real AVC -- which is a better failure than the silent over-grant it replaces.
+allow tarishd self:netlink_generic_socket { ioctl read write create setopt };
+allow tarishd self:netlink_route_socket { read write create nlmsg_write };
+allow tarishd self:packet_socket { ioctl read write create bind setopt };
 allow tarishd self:udp_socket { create ioctl };
 allow tarishd self:unix_dgram_socket { ioctl };
 allow tarishd self:tun_socket create;
-allow tarishd tun_device:chr_file { ioctl read write getattr lock append map open watch watch_reads };
-
-# MEASURING WHICH OF THE ABOVE ARE REAL (policy audit, 2026-09-23).
-#
-# The note above argues that Google's set IS the evidence, because the reference
-# implementation does the same job through the same library. That was a fair argument while
-# the only available evidence was denials -- a permissive build shows what is MISSING and is
-# blind to what is EXCESSIVE, so there was no way to prove a rule unused.
-#
-# auditallow is that way. It logs every PERMITTED access, so a rule that never appears in the
-# log after every path has been exercised is a rule nothing uses. It is the same instrument
-# that cut tarish_app from net_domain down to four rules.
-#
-# Three of these are not merely unproven, they are unreachable, and the audit should confirm
-# rather than assume:
-#
-#   packet_socket          listen, accept  -- AF_PACKET is SOCK_RAW/SOCK_DGRAM; neither
-#                                             operation exists for it
-#   netlink_generic_socket listen, accept  -- likewise; netlink is connectionless
-#   tun_device:chr_file    watch, watch_reads -- inotify/fanotify perms on a char device
-#                                             nothing sets a watch on
-#
-# and two are plausible but unjustified anywhere:
-#
-#   netlink_route_socket   nlmsg_readpriv  -- privileged netlink reads. Adding a route needs
-#                                             nlmsg_write, not this
-#   netlink_netfilter_socket create        -- created and then never read or written, which
-#                                             means either something opens it and gives up,
-#                                             or the rule is vestigial
-#
-# read/write/ioctl are deliberately NOT audited: they fire per frame on the pcap path and
-# would bury everything else. That tarishd works at all proves them.
-#
-# METHOD: ship one build with these, bring AWDL up and down at least twice (the interface
-# re-indexes, and teardown uses different calls from setup), run an AirDrop send and a
-# receive, then
-#   logcat -b all | grep "granted.*tarishd"
-# Everything that never appears comes out of the rules above, and these lines come out too.
-auditallow tarishd self:netlink_generic_socket
-    { getattr setattr lock append map bind connect listen accept getopt setopt shutdown };
-auditallow tarishd self:netlink_route_socket
-    { create nlmsg_read nlmsg_write nlmsg_readpriv nlmsg_getneigh };
-auditallow tarishd self:packet_socket
-    { getattr setattr lock append map bind connect listen accept getopt setopt shutdown };
-auditallow tarishd self:netlink_netfilter_socket create;
-auditallow tarishd self:udp_socket create;
-auditallow tarishd self:tun_socket create;
-auditallow tarishd tun_device:chr_file { getattr lock append map open watch watch_reads };
+allow tarishd tun_device:chr_file { ioctl read write open };
 
 # IOCTL COMMAND WHITELISTING. Granting `ioctl` on a class is not enough on
 # Android: the specific command numbers must also be allowed with allowxperm, or
