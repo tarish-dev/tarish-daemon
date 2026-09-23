@@ -244,6 +244,30 @@ const MAX_ELEMENTS: usize = 4096;
 /// AirDrop bodies materialize a few dozen nodes, so this is orders of magnitude of headroom.
 const MAX_TOTAL_OBJECTS: usize = 100_000;
 
+/// Total LEAF BYTES we will materialize across the whole parse.
+///
+/// `MAX_TOTAL_OBJECTS` counts nodes, and a node is not a unit of memory. One `Data` leaf of
+/// 256 KB costs exactly one object however many references point at it, so the object budget
+/// alone still permits ~100_000 x 256 KB. Measured by the external review on the fixed code:
+/// an 82 KB `/Ask` body reached 3.5 GB and a 256 KB one reached 3.87 GB, with every existing
+/// limit satisfied.
+///
+/// So bytes are counted too, and the budget is PROPORTIONAL TO THE INPUT rather than flat. A
+/// well-formed plist materializes roughly its own size; legitimate deduplication (identical
+/// strings sharing one object) multiplies that by a small factor. Tying the allowance to
+/// `buf.len()` means a tiny hostile body gets a tiny allowance and dies almost immediately,
+/// instead of being free to expand to whatever a flat ceiling happened to be.
+///
+/// The floor exists because a small body may still legitimately hold one sizeable leaf — an
+/// AirDrop `/Ask` carries a file icon — and 8x of a few hundred bytes would refuse it.
+///
+/// Worked through: a 726-byte bomb gets max(5.8 KB, 256 KB) = 256 KB and is refused almost at
+/// once. An 82 KB `/Ask` gets 656 KB, comfortably above anything it really contains. The
+/// 8 MiB `MAX_BODY` ceiling in httpd.rs caps the input, so the allowance can never exceed
+/// 64 MiB however it is reached.
+const BYTE_AMPLIFICATION: usize = 8;
+const MIN_BYTE_BUDGET: usize = 256 * 1024;
+
 pub fn parse(buf: &[u8]) -> Option<Val> {
     if buf.len() < 40 || &buf[..8] != b"bplist00" {
         return None;
@@ -274,6 +298,9 @@ pub fn parse(buf: &[u8]) -> Option<Val> {
         ref_size,
         num_objects,
         budget: std::cell::Cell::new(MAX_TOTAL_OBJECTS),
+        bytes: std::cell::Cell::new(
+            buf.len().saturating_mul(BYTE_AMPLIFICATION).max(MIN_BYTE_BUDGET),
+        ),
     };
     p.object(root, 0)
 }
@@ -288,9 +315,26 @@ struct Parser<'a> {
     /// `object()` entry, so exponential fan-out through repeated references runs out of budget
     /// and the parse fails closed instead of exhausting memory.
     budget: std::cell::Cell<usize>,
+    /// Remaining LEAF BYTES we will materialize; see `BYTE_AMPLIFICATION`. The object budget
+    /// counts nodes, and one big `Data` leaf is a single node however often it is referenced,
+    /// so nodes alone do not bound memory. Charged the exact allocated length of every string
+    /// and data leaf as it is built.
+    bytes: std::cell::Cell<usize>,
 }
 
 impl<'a> Parser<'a> {
+    /// Charge `n` materialized bytes, or refuse. Exact: callers pass the length of what they
+    /// actually allocated, so a lossy UTF-8 or UTF-16 expansion is counted at its real cost
+    /// rather than at the on-wire size.
+    fn spend_bytes(&self, n: usize) -> Option<()> {
+        let left = self.bytes.get();
+        if n > left {
+            return None;
+        }
+        self.bytes.set(left - n);
+        Some(())
+    }
+
     fn offset_of(&self, index: usize) -> Option<usize> {
         if index >= self.num_objects {
             return None;
@@ -331,12 +375,16 @@ impl<'a> Parser<'a> {
             }
             0x4 => {
                 let (len, body) = self.sized(at, low, depth)?;
-                Some(Val::Data(self.buf.get(body..body + len)?.to_vec()))
+                let v = self.buf.get(body..body + len)?.to_vec();
+                self.spend_bytes(v.len())?;
+                Some(Val::Data(v))
             }
             0x5 => {
                 let (len, body) = self.sized(at, low, depth)?;
                 let raw = self.buf.get(body..body + len)?;
-                Some(Val::Str(String::from_utf8_lossy(raw).into_owned()))
+                let s = String::from_utf8_lossy(raw).into_owned();
+                self.spend_bytes(s.len())?;
+                Some(Val::Str(s))
             }
             0x6 => {
                 // UTF-16BE: the length is in code units, not bytes.
@@ -347,7 +395,9 @@ impl<'a> Parser<'a> {
                     .chunks_exact(2)
                     .map(|c| u16::from_be_bytes([c[0], c[1]]))
                     .collect();
-                Some(Val::Str(String::from_utf16_lossy(&u16s)))
+                let s = String::from_utf16_lossy(&u16s);
+                self.spend_bytes(s.len())?;
+                Some(Val::Str(s))
             }
             0xA => {
                 let (count, body) = self.sized(at, low, depth)?;

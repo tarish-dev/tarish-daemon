@@ -356,8 +356,11 @@ mod tests {
 
             let ours = PKey::from_ec_key(a.clone()).unwrap();
             let theirs = EcKey::from_public_key(&group, b.public_key()).unwrap();
+            // Bound to a local: an inline `&PKey::from_ec_key(..)` is a reference to a
+            // temporary that set_peer outlives. Same trap `p256()` is commented for above.
+            let theirs_pkey = PKey::from_ec_key(theirs.clone()).unwrap();
             let mut d = Deriver::new(&ours).unwrap();
-            d.set_peer(&PKey::from_ec_key(theirs.clone()).unwrap()).unwrap();
+            d.set_peer(&theirs_pkey).unwrap();
             let x = d.derive_to_vec().unwrap();
 
             // OpenSSL always hands back the field width for P-256.
