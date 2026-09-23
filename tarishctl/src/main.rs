@@ -31,7 +31,7 @@ fn usage() -> ! {
   send-lan <peer-id> <file>.. force the Wi-Fi LAN path
   accept <transfer-id>        accept an incoming offer
   decline <transfer-id>       decline one
-  pin <transfer-id> <code>    answer a PIN challenge
+  pin <transfer-id> <code>    DISABLED -- accepted and ignored; see docs/PIN-DISABLED.md
   cancel <transfer-id>        cancel a transfer in flight
   received                    list files this device has received
   refresh                     re-run discovery
@@ -39,7 +39,7 @@ fn usage() -> ! {
   app peers                   peers as the APP sees them (psm, BLE address)
   app send <peer-id> <file>   send VIA THE APP: Bluetooth, and Wi-Fi Direct upgrade
   policy                      print the current policy
-  policy pin <on|off>         require the sender to type the receiver's PIN
+  policy pin <on|off>         DISABLED -- stored but not enforced (docs/PIN-DISABLED.md)
   policy confirm <on|off>     ask before accepting an incoming transfer
   policy mode <0|1|2|3>       both protocols: 0 off, 1 receive, 2 send, 3 both
   policy airdrop <0|1|2|3>    AirDrop only, leaving Quick Share alone
@@ -150,9 +150,10 @@ fn run() -> Result<(), String> {
             }
             println!("{}", app_command(&args[1..].join(" "))?);
         }
-        // Testing a transfer end to end means answering the PIN, and a harness that
-        // scrapes it out of logcat races the log, so `policy pin off` exists to make the
-        // transport testable on its own; leaving it on is what a person gets.
+        // `policy pin` is a NO-OP now: PIN verification is disabled on purpose, and the
+        // daemon's confirm_pin always answers true. The subcommand is kept so existing
+        // harnesses and scripts do not fail, and so the field survives the read-modify-write
+        // below rather than being silently dropped. See docs/PIN-DISABLED.md.
         "policy" => {
             // READ, MODIFY, WRITE -- never build a policy from defaults.
             //
