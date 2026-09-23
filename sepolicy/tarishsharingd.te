@@ -27,6 +27,44 @@ init_daemon_domain(tarishsharingd)
 # audit2allow rather than guessed at in advance.
 net_domain(tarishsharingd)
 
+# MEASURING WHAT THIS ACTUALLY NEEDS (policy audit, 2026-09-23).
+#
+# net_domain() is a blanket grant: TCP, UDP and rawip sockets, listen, accept, bind,
+# name_connect to any port, node_bind to any node. tarish_app carried the same macro until it
+# was replaced by FOUR measured rules, and this domain deserves the same treatment -- more so,
+# because it is the privileged one and it parses untrusted peer input.
+#
+# It genuinely needs more than the app: mDNS multicast, the AirDrop httpd listening on
+# tlink0, TCP out to peers, and the Quick Share LAN path. What it almost certainly does NOT
+# need is rawip. So the set is measured rather than argued.
+#
+# METHOD, same as tarish_app: ship these auditallow lines for one build, exercise every
+# network path (AirDrop send+receive, Quick Share LAN, Quick Share off-network through the
+# Bluetooth bootstrap and the Wi-Fi Direct upgrade), then
+#   logcat | grep "granted.*tarishsharingd"
+# is the exact set. Replace net_domain with it and delete these lines.
+#
+# read/write/ioctl are deliberately unaudited: they fire per buffer and would bury everything
+# that matters. A completed transfer implies them.
+auditallow tarishsharingd self:tcp_socket
+    { create bind connect listen accept getattr setattr getopt setopt shutdown };
+auditallow tarishsharingd self:udp_socket
+    { create bind connect getattr setattr getopt setopt shutdown };
+auditallow tarishsharingd self:rawip_socket
+    { create bind connect getattr setattr getopt setopt shutdown };
+auditallow tarishsharingd port_type:tcp_socket { name_connect name_bind };
+auditallow tarishsharingd port_type:udp_socket name_bind;
+auditallow tarishsharingd node_type:tcp_socket node_bind;
+auditallow tarishsharingd node_type:udp_socket node_bind;
+# Two more the macro hands over quietly, and both would be easy to drop and regret:
+#   icmp_socket -- ping. Nothing should need it, so it should never appear.
+#   netlink_route_socket nlmsg_read -- reading the routing table. This one is the trap: a
+#     stale-group liveness check once needed exactly this, did NOT throw when denied, and
+#     silently tore down live Wi-Fi Direct groups. If anything still reads routes here, the
+#     narrowed rule set must keep it, and the only way to know is to watch for it.
+auditallow tarishsharingd self:icmp_socket { create bind connect getopt setopt };
+auditallow tarishsharingd self:netlink_route_socket { create nlmsg_read };
+
 # Publish ITarishService, and talk binder to the clients that bind it.
 binder_use(tarishsharingd)
 add_service(tarishsharingd, tarish_service)

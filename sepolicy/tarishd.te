@@ -45,6 +45,53 @@ allow tarishd self:unix_dgram_socket { ioctl };
 allow tarishd self:tun_socket create;
 allow tarishd tun_device:chr_file { ioctl read write getattr lock append map open watch watch_reads };
 
+# MEASURING WHICH OF THE ABOVE ARE REAL (policy audit, 2026-09-23).
+#
+# The note above argues that Google's set IS the evidence, because the reference
+# implementation does the same job through the same library. That was a fair argument while
+# the only available evidence was denials -- a permissive build shows what is MISSING and is
+# blind to what is EXCESSIVE, so there was no way to prove a rule unused.
+#
+# auditallow is that way. It logs every PERMITTED access, so a rule that never appears in the
+# log after every path has been exercised is a rule nothing uses. It is the same instrument
+# that cut tarish_app from net_domain down to four rules.
+#
+# Three of these are not merely unproven, they are unreachable, and the audit should confirm
+# rather than assume:
+#
+#   packet_socket          listen, accept  -- AF_PACKET is SOCK_RAW/SOCK_DGRAM; neither
+#                                             operation exists for it
+#   netlink_generic_socket listen, accept  -- likewise; netlink is connectionless
+#   tun_device:chr_file    watch, watch_reads -- inotify/fanotify perms on a char device
+#                                             nothing sets a watch on
+#
+# and two are plausible but unjustified anywhere:
+#
+#   netlink_route_socket   nlmsg_readpriv  -- privileged netlink reads. Adding a route needs
+#                                             nlmsg_write, not this
+#   netlink_netfilter_socket create        -- created and then never read or written, which
+#                                             means either something opens it and gives up,
+#                                             or the rule is vestigial
+#
+# read/write/ioctl are deliberately NOT audited: they fire per frame on the pcap path and
+# would bury everything else. That tarishd works at all proves them.
+#
+# METHOD: ship one build with these, bring AWDL up and down at least twice (the interface
+# re-indexes, and teardown uses different calls from setup), run an AirDrop send and a
+# receive, then
+#   logcat -b all | grep "granted.*tarishd"
+# Everything that never appears comes out of the rules above, and these lines come out too.
+auditallow tarishd self:netlink_generic_socket
+    { getattr setattr lock append map bind connect listen accept getopt setopt shutdown };
+auditallow tarishd self:netlink_route_socket
+    { create nlmsg_read nlmsg_write nlmsg_readpriv nlmsg_getneigh };
+auditallow tarishd self:packet_socket
+    { getattr setattr lock append map bind connect listen accept getopt setopt shutdown };
+auditallow tarishd self:netlink_netfilter_socket create;
+auditallow tarishd self:udp_socket create;
+auditallow tarishd self:tun_socket create;
+auditallow tarishd tun_device:chr_file { getattr lock append map open watch watch_reads };
+
 # IOCTL COMMAND WHITELISTING. Granting `ioctl` on a class is not enough on
 # Android: the specific command numbers must also be allowed with allowxperm, or
 # the call is denied with the command in the AVC (ioctlcmd=0x...). This was
