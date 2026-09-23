@@ -47,10 +47,47 @@ const FRA_OIFNAME: u16 = 17;
 const FRA_UID_RANGE: u16 = 20;
 const FR_ACT_TO_TBL: u8 = 1;
 
-/// Rule priority. Must sit above Android's own rules and below the catch-all
-/// `32000: from all unreachable`, which is what every lookup fell through to
-/// while no rule pointed at our table.
-const RULE_PRIORITY: u32 = 15000;
+/// Rule priority. Must sit below the catch-all `32000: from all unreachable`, which is
+/// what every lookup fell through to while no rule pointed at our table -- AND below
+/// Android's VPN lockdown block, which is the part that took a measurement to find.
+///
+/// This was 15000, which looks harmless and is not. Android's own priorities are:
+///
+///   10000  VPN_OVERRIDE_SYSTEM
+///   11000  VPN_OVERRIDE_OIF
+///   12000  VPN_OUTPUT_TO_LOCAL     <- Android's own "local traffic escapes the VPN"
+///   13000  SECURE_VPN
+///   14000  PROHIBIT_NON_VPN        <- the kill-switch
+///   16000  EXPLICIT_NETWORK
+///   17000  OUTPUT_INTERFACE
+///
+/// 15000 falls in the gap between the kill-switch and EXPLICIT_NETWORK, so with "block
+/// connections without VPN" on and the VPN DOWN, the prohibit matched first and our rule
+/// was never reached. Measured on blazer:
+///
+///   14000: from all fwmark 0x0/0x20000 iif lo uidrange 1-10206 prohibit   <- uid 7500 is here
+///   15000: from all oif tlink0 uidrange 7500-7500 lookup 52               <- never consulted
+///
+///   $ ip -6 route get fe80::1 oif tlink0 uid 7500  -> Permission denied
+///   $ ip -6 route get fe80::1 oif tlink0 uid 0     -> Network is unreachable
+///
+/// The daemon could still BIND and answer mDNS -- inbound is unaffected -- so AirDrop looked
+/// half alive: "AirDrop server up", "answered 8 record(s)", and then every outbound attempt
+/// failing with `/Discover failed: Permission denied (os error 13)`.
+///
+/// 13500: after SECURE_VPN, so a VPN that is actually up still claims traffic first, and
+/// before PROHIBIT_NON_VPN so link-local AWDL survives the kill-switch.
+///
+/// WHY THIS IS NOT A LOCKDOWN BYPASS. The exemption is scoped three ways at once, and the
+/// third is the one that matters: the rule matches only uid 7500, only when the output
+/// interface is tlink0, and it resolves in table 52 -- which contains exactly one route:
+///
+///   fe80::/64 dev tlink0
+///
+/// So it cannot reach the internet, the LAN, or the VPN's subnet. It is a link-local escape
+/// by construction, not by trust, which is the property to preserve if this is ever changed.
+/// A uid-keyed exemption would be strictly worse: under lockdown it could reach anything.
+const RULE_PRIORITY: u32 = 13500;
 
 #[repr(C)]
 #[derive(Default)]
