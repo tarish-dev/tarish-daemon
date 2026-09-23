@@ -21,6 +21,30 @@
 type tarish_app, domain, coredomain;
 app_domain(tarish_app)
 
+# NETWORK ACCESS -- and the reason this is a macro and not a hand-picked list.
+#
+# app_domain() grants what an app needs to BE an app; it says nothing about sockets. Under
+# platform_app that did not matter, because platform_app carries net_domain() and the app
+# inherited it. Moving to our own domain took it away, and the failure was silent in the
+# worst way:
+#
+#   avc: denied { create } for comm="tarish-wifi-dir" scontext=u:r:tarish_app
+#        tcontext=u:r:tarish_app tclass=tcp_socket permissive=0
+#
+# The app could not create the TCP socket it connects to the Wi-Fi Direct group owner with,
+# so the bandwidth upgrade failed and Quick Share fell back to Bluetooth: ~150 KB/s instead
+# of ~10 MB/s, with no error anywhere. Nothing looked broken, it was just slow. The P2P
+# group even formed and then collapsed (IPC_PROVISIONING_FAILURE), which reads like a peer
+# problem rather than a policy one.
+#
+# net_domain() rather than `allow tarish_app self:tcp_socket create_stream_socket_perms`:
+# the app does real networking (connect to a group owner, and accept on the receive side
+# where it hosts the group), and picking socket permissions one denial at a time here buys
+# nothing. This grants no more network reach than the app already had as platform_app --
+# what #28 narrowed is WHO MAY DRIVE THE DAEMON, which is the service access above, not
+# whether the app may open a socket.
+net_domain(tarish_app)
+
 # The whole point of the domain: reach the Tarish daemon's binder service, both ways
 # (the daemon calls back through ITarishCallback).
 allow tarish_app tarish_service:service_manager find;
