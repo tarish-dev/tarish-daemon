@@ -87,6 +87,32 @@ allow tarishsharingd node_type:udp_socket node_bind;
 allow tarishsharingd fwmarkd_socket:sock_file write;
 allow tarishsharingd netd:unix_stream_socket connectto;
 
+# ...and netd's half of the same exchange, which is a rule pointing the OTHER WAY.
+#
+# The fwmark protocol hands netd the socket itself over that unix socket, so netd needs
+# `use` on our fd and access to the socket behind it. Without this the write above
+# succeeds and the transaction still fails one step later:
+#
+#   avc: denied { use } for comm="netd" path="socket:[104093]" dev="sockfs"
+#     scontext=u:r:netd:s0 tcontext=u:r:tarishsharingd:s0 tclass=fd permissive=0
+#
+# THIS IS THE THIRD PIECE OF net_domain THAT WAS MISSED, AND THE REASON IS WORTH KEEPING:
+# the macro grants rules in BOTH DIRECTIONS. Enumerating it by looking for rules with
+# netdomain as the SOURCE finds the socket grants and misses these, which have netdomain as
+# the TARGET (private/netd.te:134-141). The earlier miss, fwmarkd, was invisible for a
+# different reason again -- it is a macro invocation with no `allow` in it at all. Three
+# separate greps, three separate blind spots; the only reliable way to replace a macro is
+# to enumerate everything it expands to, in both directions.
+#
+# Narrowed to the classes this domain actually has. Upstream also names icmp_socket,
+# rawip_socket and tun_socket, and those stay out for the same reason they are absent above.
+# The permission set is upstream's, unmeasured: netd is on the other side of this and its
+# own use of our sockets was never instrumented, so trimming it would be guessing. Doing it
+# properly means auditallow on the netd side, which is a separate exercise.
+allow netd tarishsharingd:fd use;
+allow netd tarishsharingd:{ tcp_socket udp_socket }
+    { read write getattr setattr getopt setopt };
+
 # NOT granted, though net_domain did: unix_socket_connect(netdomain, dnsproxyd, netd), the
 # DNS resolver socket. This daemon finds peers over mDNS and connects to addresses, never
 # names, and no denial for it has appeared across AirDrop both ways and Quick Share both
