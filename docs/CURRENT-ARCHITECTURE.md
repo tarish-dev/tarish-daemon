@@ -1,6 +1,6 @@
 # Tarish — current architecture
 
-**Authoritative as of 2026-09-22.** If any other document disagrees with this one about what
+**Authoritative as of 2026-09-24.** If any other document disagrees with this one about what
 ships, this one is right; the other is historical. Supersedes the scattered `libmosey`-era
 descriptions across the repos.
 
@@ -53,20 +53,56 @@ that path is now tlink's shim. The **app README's** "current AWDL layer = libmos
 - **Consent is enforced in the daemon**, not the UI: an offer must be *accepted* before any
   upload is allowed, so a compromised UI cannot bypass the receive prompt.
 
+## VPN kill-switch and the authenticated window — PARTIALLY SHIPPED
+
+Sharing works under an always-on VPN in lockdown mode, which stock Quick Share does not do.
+That is a deliberate exemption in a control enterprises rely on, so it is scoped and
+measured rather than argued. **Authoritative account, including the threat model:**
+grapheneos `docs/VPN-LOCKDOWN.md`.
+
+What ships and is verified on hardware: an `ip rule` for `tlink0` above Android's
+`PROHIBIT_NON_VPN`, scoped to uid 7500, to a table holding exactly `fe80::/64 dev tlink0`
+and no IPv4. It cannot reach the internet, the LAN or the VPN's subnet.
+
+What is built and compiles but is **NOT verified on hardware**: binding that exemption to an
+authenticated window — the app locking in its own right, a keep-unlocked heartbeat where
+silence closes the window, binder-death withdrawal, and an independent ceiling in tarishd.
+Do not describe the authenticated window as working.
+
+Two platform patches exist and their status is easy to get backwards: `0001` (local-network
+access for uid 7500) is **required**; `0002` (BPF lockdown exemption) is a **no-op**, because
+uid 7500 never carries `LOCKDOWN_VPN_MATCH`.
+
 ## Known-open items (do not describe these as finished)
 
-- **Off-network Quick Share stays on Bluetooth** when AirDrop/AWDL is active: `wonder.ko`'s
-  interface holds the chip's single P2P slot, so a Wi-Fi Direct group can't form alongside it.
-  Same-Wi-Fi transfers use the LAN (fast) automatically.
+- **Off-network Quick Share now upgrades to Wi-Fi Direct** — this used to say it stayed on
+  Bluetooth. `wonder.ko`'s interface does hold the chip's single P2P slot, but tlink takes
+  the AWDL interface down for the Wi-Fi Direct leg and puts it back, which frees the slot.
+  Observed on hardware 2026-09-24: `taking AWDL down for a Wi-Fi Direct transfer (freeing
+  the P2P slot)`, followed by `upgraded the inbound transfer to Wi-Fi Direct`. Same-Wi-Fi
+  transfers still use the LAN automatically.
 - **AWDL is single-channel (ch149) in prod**, which misses peers on other social channels
   (e.g. some iPhones). Multi-channel scheduling (like stock mosey) is in progress.
 - **tlink AirDrop is proven for the core path (bring-up, election, sync, discovery, receive);
   send throughput is still being hardened.** tlink ships as the AWDL userspace (the shim
   replaces libmosey), but it is not yet at full libmosey parity — Google's `libmosey` remains
   the same-ABI drop-in fallback. Do not describe tlink AirDrop *send* as finished.
-- **The `platform_app` binder grant is being narrowed** to a signature-scoped app domain.
-- **tarishd's SELinux policy** is being re-derived from tlink's actual syscalls (it was
-  inherited from Google's `mosey_server`).
+- ~~**The `platform_app` binder grant is being narrowed**~~ — **DONE 2026-09-24**, security
+  review #28. The app has its own `tarish_app` domain, keyed in `seapp_contexts` on package
+  name AND platform signature. The five grants that named `platform_app` moved onto it.
+  Verified enforcing on hardware, with `tarishctl` refused from an unprivileged shell as the
+  proof the lock holds.
+- ~~**tarishd's SELinux policy is being re-derived**~~ — **DONE 2026-09-24**, and by
+  measurement rather than reasoning. `auditallow` was placed on every questionable grant, one
+  build shipped, and `gos-selinux.sh --granted` read back what was actually exercised.
+  `tarishsharingd` lost `rawip_socket`, `icmp_socket` and `netlink_route_socket` — entire
+  classes — and `tarishd` lost `listen`/`accept` on classes where those operations do not
+  exist, plus `map`, `watch`/`watch_reads`, `nlmsg_readpriv` and all of
+  `netlink_netfilter_socket`. Zero denials under enforcing.
+
+  `map` is the instructive one for anyone auditing inherited policy: the rule carried a
+  comment citing a real failure when it was removed, and that failure belonged to **Google's
+  libmosey**. We run tlink. The permission set had outlived the binary it was written for.
 
 ## Repositories
 
