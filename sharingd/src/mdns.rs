@@ -74,6 +74,9 @@ pub struct Browser {
     /// look wrong to something we cannot test against.
     instance: String,
     advertising: bool,
+    /// How many browse queries we have sent. Drives the QU/QM mix in `query` — the first few
+    /// of a session must not be suppressible, the rest can be the cheaper multicast form.
+    queries_sent: u32,
     /// Whether we hold port 5353. A responder MUST: a peer sends its query to
     /// :5353 and will not see an answer from anywhere else.
     can_respond: bool,
@@ -111,6 +114,7 @@ impl Browser {
             iface: iface.to_string(),
             instance: stable_instance(iface),
             advertising: false,
+            queries_sent: 0,
             can_respond,
         })
     }
@@ -366,11 +370,34 @@ impl Browser {
     }
 
     /// Send a PTR query for AirDrop.
-    pub fn query(&self) -> io::Result<()> {
-        let pkt = dns::query(AIRDROP_SERVICE);
+    ///
+    /// MOSTLY QM, PERIODICALLY QU, and the mix is the point. A QM query is answered by
+    /// multicast so every listener learns — but a responder that recently multicast the same
+    /// record will not repeat it (Apple's does this), so a browser that only ever asks QM can
+    /// sit in silence next to a peer that is plainly there. That is what made both a MacBook
+    /// and an iPhone invisible until the operator switched to the receive screen and back:
+    /// receiving makes us announce, the peers react, and their reaction was the only thing we
+    /// ever heard.
+    ///
+    /// A QU question (RFC 6762 §5.4) must be answered directly and is not suppressed by a
+    /// recent multicast. Sending every query as QU would work and would also make us the
+    /// noisiest device on the link, and it throws away the shared-learning property for the
+    /// common case of simply refreshing a peer we already know. So: QU for the first few
+    /// queries of a browse, when we know nothing and need an answer we cannot be denied, and
+    /// then one in every five to recover from a peer we have somehow missed.
+    pub fn query(&mut self) -> io::Result<()> {
+        self.queries_sent = self.queries_sent.saturating_add(1);
+        let unicast = self.queries_sent <= 3 || self.queries_sent % 5 == 0;
+        let pkt = dns::query_with(AIRDROP_SERVICE, unicast);
         let dst = SocketAddrV6::new(MDNS_GROUP, MDNS_PORT, 0, self.ifindex);
         self.sock.send_to(&pkt, dst)?;
         Ok(())
+    }
+
+    /// Restart the QU burst — call when a browse begins, so the first queries of a new
+    /// session are the ones that cannot be suppressed.
+    pub fn restart_query_burst(&mut self) {
+        self.queries_sent = 0;
     }
 
     /// Read whatever has arrived and fold it into the peer table. Returns the

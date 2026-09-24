@@ -2839,6 +2839,14 @@ fn start_discovery(
             // Re-query periodically; peers answer, and new ones announce anyway.
             // Query on our own timer, or immediately when a client is looking.
             let asked = query_now.swap(false, Ordering::SeqCst);
+            // A client just opened the picker: restart the QU burst, so the first queries of
+            // this browse are ones a peer cannot suppress. Without it we inherit the QM
+            // cadence of whatever was running before and can sit silent next to a peer that
+            // is plainly there — which is what made the operator toggle to receive and back
+            // to see a MacBook that had never gone anywhere.
+            if asked {
+                browser.restart_query_burst();
+            }
             if asked || since_query >= Duration::from_secs(4) {
                 match browser.query() {
                     Ok(()) => failures = 0,

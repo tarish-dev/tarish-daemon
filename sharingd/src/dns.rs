@@ -268,7 +268,23 @@ pub fn txt_rdata(entries: &[&str]) -> Vec<u8> {
 }
 
 /// Build a PTR query for a service type, e.g. `_airdrop._tcp.local`.
-pub fn query(service: &str) -> Vec<u8> {
+///
+/// `unicast` sets the QU bit (RFC 6762 §5.4), asking the responder to answer us DIRECTLY.
+///
+/// WHY THAT MATTERS, because the obvious choice is the wrong one. A QM (multicast-response)
+/// query is more efficient — every listener learns from one answer — but a responder that has
+/// recently multicast the same record will NOT repeat it. Apple's does exactly this. So we
+/// queried every 4s and drew silence, and only saw a peer when it happened to announce
+/// unsolicited.
+///
+/// That is the whole of "I need to go to receive and come back to send to see it", reported
+/// on hardware for BOTH a MacBook and an iPhone: switching to receive makes US announce, the
+/// peers react to a new device, and their reaction is what we finally hear. Passive browsing
+/// never worked; the toggle was doing the work.
+///
+/// A QU question is answered directly and is not suppressed by a recent multicast, which is
+/// precisely the "new participant wants an immediate answer" case §5.4 describes.
+pub fn query_with(service: &str, unicast: bool) -> Vec<u8> {
     let mut p = Vec::with_capacity(64);
     p.extend_from_slice(&[0, 0]); // id: 0 for mDNS
     p.extend_from_slice(&[0, 0]); // flags: standard query
@@ -280,7 +296,14 @@ pub fn query(service: &str) -> Vec<u8> {
     }
     p.push(0);
     p.extend_from_slice(&TYPE_PTR.to_be_bytes());
-    // QU bit clear: ask for a multicast response so every listener learns.
-    p.extend_from_slice(&1u16.to_be_bytes());
+    // qclass IN, with the top bit as QU when we need an answer we cannot be denied.
+    const QU: u16 = 0x8000;
+    p.extend_from_slice(&(if unicast { QU | 1 } else { 1 }).to_be_bytes());
     p
+}
+
+/// A QM query — multicast response, so every listener learns. Cheaper, and correct when we
+/// are merely refreshing something we already know about.
+pub fn query(service: &str) -> Vec<u8> {
+    query_with(service, false)
 }
