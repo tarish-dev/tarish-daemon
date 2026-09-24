@@ -21,7 +21,7 @@ Numbering follows the review so the two can be read side by side.
 | 7 | Filenames with bidi/control characters | refused, not sanitized; Quick Share shares the check. **Storage side only — see 15** |
 | 8 | Regulatory default no longer assumes Qatar | falls back to "00". **Enforcement unverified — see 12** |
 | 9 | `forbid(unsafe_code)` on tlink and tlink-session | |
-| 10 | Three stale beacon tests | 20M mutated frames, zero panics; 203 protocol tests pass |
+| 10 | Three stale beacon tests | 20M mutated frames, zero panics; 203 protocol tests passed at the time |
 
 ## Fixed after the review was written
 
