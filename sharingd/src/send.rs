@@ -22,11 +22,37 @@ use crate::plist::{self, Value};
 use cpio_archive::odc::{OdcBuilder, OdcHeader};
 use log::{debug, info, warn};
 use openssl::ssl::{SslConnector, SslMethod, SslStream, SslVerifyMode};
+// POLLIN-with-a-deadline, already implemented for TcpStream for the Quick Share upgrade
+// wait. Same need here: wait for a peer without going deaf to a cancel.
+use crate::quickshare::connection::ReadReady;
 use std::io::{self, Read, Write};
 use std::net::{Ipv6Addr, SocketAddrV6, TcpStream};
 use std::time::Duration;
 
+/// Bulk I/O on the socket. A peer that goes silent this long during a payload is gone.
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long to wait for `/Ask` to be answered.
+///
+/// THIS ONE IS A PERSON, NOT A SOCKET, and that is the whole reason it is separate.
+/// `/Ask` puts a prompt on the peer's screen and then waits for someone to pick the phone
+/// up and tap Accept. `IO_TIMEOUT` used to cover this read too, so any offer not answered
+/// within 30s died with EAGAIN — while the prompt was still sitting there, unanswered. The
+/// send was reported as failed and the person had done nothing wrong.
+///
+/// Measured on blazer 2026-09-25, to the tenth of a second:
+/// ```text
+/// 02:48:23.499  -> POST /Ask ... Content-Length: 396
+/// 02:48:53.924  send 7 failed: Try again (os error 11)
+/// ```
+/// 30.4s — the timeout, not the link. iOS keeps an AirDrop prompt up for around a minute,
+/// so this has to outlast the prompt rather than race it. It is not a liveness check: the
+/// TCP connection is already established and the peer is demonstrably there.
+const ASK_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// How often to surface from the `/Ask` wait to check whether the send was cancelled.
+/// Short enough that Cancel feels immediate, long enough not to spin on poll().
+const ASK_POLL: Duration = Duration::from_millis(250);
 
 /// Where a peer lives, resolved from its mDNS records.
 pub struct Target {
@@ -84,6 +110,32 @@ pub fn send(
     // --- /Ask -------------------------------------------------------------
     let ask = ask_body(&items, sender_name, sender_model);
     request(&mut tls, "/Ask", &ask, true)?;
+    // WAIT IN SLICES, AND DO NOT TOUCH THE SOCKET TIMEOUT.
+    //
+    // Widening SO_RCVTIMEO to ASK_TIMEOUT would work but buys a long window in which a
+    // cancel does nothing: the thread is parked inside one blocking read, and `cancelled`
+    // is not consulted until it returns. Polling for readability instead keeps Cancel live
+    // the whole time the prompt is up, and leaves IO_TIMEOUT in place for the payload — so
+    // there is no timeout to restore and no path that can leak the wide one.
+    //
+    // `pending()` first: OpenSSL buffers whole records, so bytes it has already decrypted
+    // are invisible to poll() on the fd, and waiting on the descriptor for data we are
+    // holding would stall until the deadline.
+    let deadline = std::time::Instant::now() + ASK_TIMEOUT;
+    while tls.ssl().pending() == 0 && !tls.get_ref().ready_within(ASK_POLL)? {
+        if cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "cancelled while waiting for the peer to accept",
+            ));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the peer never answered the offer — it was neither accepted nor declined",
+            ));
+        }
+    }
     let (status, _) = read_response(&mut tls)?;
     if status != 200 {
         // 401 is the peer declining, which is a normal outcome and not a fault.
