@@ -27,6 +27,33 @@ use std::time::Duration;
 /// (tlink-shim `data_iface()` also defaults to `tlink0`), or on a clean device with
 /// the property unset the shim brings up `tlink0` while this waits for a different name
 /// forever. It was `mosey0` back when we ran over Google's libmosey; tlink replaced it.
+/// Has the AWDL link died underneath us?
+///
+/// THE DAEMON MUST NOT TRUST ITS OWN `link` VARIABLE. Turning Wi-Fi off and on reloads the
+/// wonder driver, which takes `wondertap0` down and leaves `tlink0` behind as a stale
+/// interface. `link` is still `Some`, so the poll loop's `(want, link.is_some())` match reads
+/// `(true, true)` and does nothing — forever. Observed 2026-09-24 on blazer: wondertap0 DOWN,
+/// tarish.awdl.wanted=1 ignored, and `ctl.restart tarishd` fixing it instantly, which is what
+/// proved the radio was never the problem.
+///
+/// CHECKS wondertap0, NOT tlink0. tlink0 survives the teardown looking perfectly healthy —
+/// it is the interface whose presence means least. wondertap0 is the one the driver owns.
+///
+/// Reads /sys/class/net, which this domain can already read (see the radiotap0 survey) and
+/// which needs no netlink socket, so a wedged netlink path cannot hide a dead link.
+///
+/// ABSENT AND DOWN ARE BOTH DEAD. A missing file means the driver removed the interface; a
+/// down operstate means it is there and not running. Neither can carry AWDL.
+fn awdl_link_is_dead() -> bool {
+    match std::fs::read_to_string("/sys/class/net/wondertap0/operstate") {
+        Ok(v) => {
+            let v = v.trim();
+            v == "down" || v == "notpresent"
+        }
+        Err(_) => true, // gone entirely
+    }
+}
+
 fn iface() -> &'static str {
     use std::sync::OnceLock;
     static IFACE: OnceLock<String> = OnceLock::new();
@@ -842,6 +869,23 @@ fn main() {
                 }
             }
             (false, true) => link = None,   // Drop does the work
+            // WE BELIEVE WE HAVE A LINK AND THE INTERFACE SAYS OTHERWISE.
+            //
+            // Drop it so the arm above re-acquires on the next tick. Dropping calls
+            // mosey_stop, which is the right thing even for an interface that is already
+            // gone: it releases the handle so the next start gets a fresh one, and the
+            // interface index changes on every restart anyway (BUILD-NOTES 35), so reusing
+            // any of the old state would be wrong.
+            //
+            // Not rate-limited by retry_at: acquire() failing sets that itself, so a radio
+            // that is genuinely unavailable still backs off to 5s rather than spinning.
+            (true, true) if awdl_link_is_dead() => {
+                log::warn!(
+                    "AWDL link died underneath us — wondertap0 is down or gone, most likely a \
+                     Wi-Fi association change reloading the driver. Releasing and re-acquiring."
+                );
+                link = None;
+            }
             _ => {}
         }
 
