@@ -21,7 +21,7 @@ account.
 |---|---|
 | `src/`, `tarishd` | holds the AWDL link up. Needs `CAP_NET_ADMIN`; runs from boot so the link outlives any UI |
 | `sharingd/` | `tarishsharingd`: mDNS, TLS, the AirDrop protocol, the Quick Share transports. Runs as its own unprivileged uid and parses input from strangers, so it holds nothing else |
-| `protocol/` | `libtarish_protocol`: UKEY2, D2D keys, SecureMessage, the secure channel, offline frames and the sharing state machines. **Android-free on purpose**, so it is testable on a build host — 202 tests |
+| `protocol/` | `libtarish_protocol`: UKEY2, D2D keys, SecureMessage, the secure channel, offline frames and the sharing state machines. **Android-free on purpose**, so it is testable on a build host — 204 tests |
 | `tarishctl/` | a shell client for the daemon, **userdebug and eng only**. Two devices driven from a script, no screen taps |
 | `aidl/` | the IPC contract. It lives with the daemon because the daemon is the server; the app consumes these files rather than copying them |
 | `sepolicy/` | the SELinux domains, and the four context files that each fail differently and none loudly |
