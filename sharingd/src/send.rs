@@ -149,6 +149,7 @@ pub fn send(
                         last: done,
                         step,
                         report: &mut progress,
+                        cancelled: &cancelled,
                     };
                     cpio.append_header_with_reader(header, &mut counting)
                         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -416,10 +417,26 @@ struct Counting<'a, R: Read> {
     last: u64,
     step: u64,
     report: &'a mut dyn FnMut(u64, u64),
+    /// Checked on EVERY read, which is the only place a cancel can land mid-file.
+    cancelled: &'a dyn Fn() -> bool,
 }
 
 impl<R: Read> Read for Counting<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // CANCEL IS CHECKED HERE, NOT ONLY BETWEEN FILES.
+        //
+        // The loop in send() checks `cancelled()` once per item, before the item starts. A
+        // whole file then streams inside a single append_header_with_reader call, so for a
+        // one-file send the flag was read exactly once -- at the beginning -- and never again.
+        // Pressing cancel did nothing and the transfer ran to completion. Reported on
+        // hardware: "multiple time trying to cancel it continue", on a 20 MB single-file send.
+        //
+        // This reader is already the per-chunk hook (it is how progress is reported), so it is
+        // where the check belongs. Interrupted is the same error the between-files check
+        // raises, so the caller's handling is unchanged.
+        if (self.cancelled)() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+        }
         let n = self.inner.read(buf)?;
         self.seen += n as u64;
         // Report on ~1% steps (`step`) so a large file does not spam the binder callback.
