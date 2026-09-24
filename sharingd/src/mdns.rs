@@ -483,7 +483,10 @@ impl Browser {
                             p.port = port;
                             p.host = host;
                             p.last_seen = Instant::now();
-                            p.expires_at = p.expires_at.max(Instant::now() + Self::ttl_of(rec));
+                            // `max` everywhere EXCEPT a withdrawal: a goodbye must shorten
+                            // the lease, which is the one thing `max` cannot do.
+                            let t = Instant::now() + Self::ttl_of(rec);
+                            p.expires_at = if rec.ttl == 0 { t } else { p.expires_at.max(t) };
                         }
                     }
                 }
@@ -506,7 +509,8 @@ impl Browser {
                         if !p.host.is_empty() && p.host == rec.name {
                             p.addr = Some(addr);
                             p.last_seen = Instant::now();
-                            p.expires_at = p.expires_at.max(Instant::now() + Self::ttl_of(rec));
+                            let t = Instant::now() + Self::ttl_of(rec);
+                            p.expires_at = if rec.ttl == 0 { t } else { p.expires_at.max(t) };
                         }
                     }
                 }
@@ -521,6 +525,18 @@ impl Browser {
 /// one choosing zero (a goodbye, or a bug) must not make the entry vanish before the floor
 /// in `expire` can apply. Bonjour uses 120s for these records, which sits inside this range.
 fn ttl_of(rec: &dns::Record) -> Duration {
+    // A GOODBYE IS NOT A SHORT LEASE. RFC 6762 §10.1: ttl=0 means the record is no longer
+    // valid, and a receiver should delete it — recording one second rather than zero, so a
+    // reordered packet still in flight cannot resurrect it.
+    //
+    // This used to clamp 0 up to MIN, and the callers apply it with `.max(...)`, so a peer
+    // saying "I am leaving now" was read as "keep me another 30s" and usually as nothing at
+    // all. The comment below was guarding against a BUGGY zero and threw away the legitimate
+    // withdrawal with it. Departing peers are supposed to linger on our list for no longer
+    // than anyone else's.
+    if rec.ttl == 0 {
+        return Duration::from_secs(1);
+    }
     const MIN: u64 = 30;
     const MAX: u64 = 300;
     Duration::from_secs((rec.ttl as u64).clamp(MIN, MAX))
