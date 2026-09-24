@@ -64,10 +64,19 @@ What ships and is verified on hardware: an `ip rule` for `tlink0` above Android'
 `PROHIBIT_NON_VPN`, scoped to uid 7500, to a table holding exactly `fe80::/64 dev tlink0`
 and no IPv4. It cannot reach the internet, the LAN or the VPN's subnet.
 
-What is built and compiles but is **NOT verified on hardware**: binding that exemption to an
-authenticated window — the app locking in its own right, a keep-unlocked heartbeat where
-silence closes the window, binder-death withdrawal, and an independent ceiling in tarishd.
-Do not describe the authenticated window as working.
+**The authenticated window is now verified on hardware** (blazer, build `2026092412`,
+2026-09-24): the app locks in its own right, the rule moves 15500 -> 13500 while a window is
+open, the keep-unlocked heartbeat runs, and the lock appears and disappears with a real VPN
+kill-switch — tested off→on, on→off, and with the VPN uninstalled entirely.
+
+Whether a kill-switch is in force is decided by **tarishd**, not the app: an `RTM_GETRULE`
+netlink dump matching `FR_ACT_PROHIBIT`, published as `tarish.awdl.lockdown`. The app cannot
+determine it, and a settings read cannot be scoped by SELinux — see grapheneos
+`docs/VPN-LOCKDOWN.md` for why that matters.
+
+Still **not measured**, and should not be described as proven: the specific three-missed-beat
+boundary, binder-death withdrawal against a *stuck* rather than exited app, and tarishd's
+660s ceiling (it needs an 11-minute window to observe).
 
 Two platform patches exist and their status is easy to get backwards: `0001` (local-network
 access for uid 7500) is **required**; `0002` (BPF lockdown exemption) is a **no-op**, because
