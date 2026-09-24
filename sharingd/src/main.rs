@@ -147,6 +147,21 @@ const EXEMPT_PROP: &str = "tarish.awdl.exempt";
 /// in seconds rather than minutes.
 const CHALLENGE_EVERY: Duration = Duration::from_secs(5);
 const CHALLENGE_DEADLINE: Duration = Duration::from_secs(4);
+/// Consecutive missed beats before the window closes.
+///
+/// ONE MISS IS NOT ABSENCE, and shipping it that way was wrong. A beat gets missed for
+/// entirely ordinary reasons -- a GC pause, a busy main thread, binder congestion, the
+/// scheduler not running the app for a moment -- and none of them mean the person left.
+/// Locking on the first miss made the app lock itself at random, which trains someone to
+/// distrust the lock rather than rely on it.
+///
+/// Three strikes at a 5s cadence means sustained silence closes the window in ~15s. That is
+/// not the security bound and was never meant to be: the app closes the window itself when it
+/// leaves the foreground, binder death withdraws it the instant the process dies -- an event,
+/// not a timer -- and the daemon's own 600s ceiling and tarishd's independent 660s ceiling
+/// both still apply. The heartbeat only has to catch "alive but no longer answering", and for
+/// that, distinguishing a hiccup from silence is the whole job.
+const CHALLENGE_STRIKES: u32 = 3;
 
 /// Peers found by the discovery thread. Shared rather than owned by the service
 /// so discovery keeps running whether or not a client is bound — a device must
@@ -1101,6 +1116,9 @@ struct TarishService {
     /// `None` means nothing is outstanding, so any keepUnlocked() is stale by definition.
     /// Single-use: answering takes it, so a replayed nonce finds nothing to match.
     challenge: Arc<Mutex<Option<(i64, std::time::Instant)>>>,
+    /// Consecutive missed beats. Reset by ANY evidence the client is alive, including an
+    /// answer that arrived too late to satisfy its own round.
+    keepalive_strikes: Arc<std::sync::atomic::AtomicU32>,
     /// Set by a good answer, cleared when a challenge goes out. The keepalive thread reads
     /// it to decide whether the last round was answered.
     keepalive_ok: Arc<std::sync::atomic::AtomicBool>,
@@ -1428,6 +1446,7 @@ impl TarishService {
             death: Mutex::new(None),
             challenge: Arc::new(Mutex::new(None)),
             keepalive_ok: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            keepalive_strikes: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             discoverable,
             active: Arc::new(AtomicBool::new(false)),
             // NOT -1: that now MEANS something. -1 is the client saying the Wi-Fi
@@ -1487,7 +1506,9 @@ impl TarishService {
         let callbacks = self.callbacks.clone();
         let challenge = self.challenge.clone();
         let ok = self.keepalive_ok.clone();
+        let strikes = self.keepalive_strikes.clone();
         std::thread::spawn(move || {
+            strikes.store(0, Ordering::SeqCst);
             loop {
                 if generation.load(Ordering::SeqCst) != gen {
                     return;   // superseded, or the window was closed
@@ -1501,9 +1522,18 @@ impl TarishService {
                 // would be a needless coupling.
                 let targets: Vec<_> = callbacks.lock().unwrap().clone();
                 if targets.is_empty() {
-                    log::warn!("keep-unlocked: no client registered — withdrawing");
-                    shut(&generation, gen, &challenge);
-                    return;
+                    // Also a strike rather than immediate, for the same reason: the list can
+                    // be momentarily empty while a client re-registers. A client that is
+                    // really gone is caught by binder death, which does not wait for this.
+                    let n = strikes.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n >= CHALLENGE_STRIKES {
+                        log::warn!("keep-unlocked: no client registered for {n} rounds — withdrawing");
+                        shut(&generation, gen, &challenge);
+                        return;
+                    }
+                    log::info!("keep-unlocked: no client registered (strike {n}/{CHALLENGE_STRIKES})");
+                    std::thread::sleep(CHALLENGE_EVERY);
+                    continue;
                 }
                 for cb in &targets {
                     let _ = cb.onKeepUnlockedChallenge(nonce);
@@ -1513,15 +1543,27 @@ impl TarishService {
                 if generation.load(Ordering::SeqCst) != gen {
                     return;
                 }
-                if !ok.load(Ordering::SeqCst) {
-                    log::warn!(
-                        "keep-unlocked unanswered within {}s — withdrawing the lockdown \
-                         exemption. The client is gone, wedged, backgrounded, or past its \
-                         own window.",
-                        CHALLENGE_DEADLINE.as_secs()
+                if ok.load(Ordering::SeqCst) {
+                    strikes.store(0, Ordering::SeqCst);
+                } else {
+                    // A late answer to THIS round may have already cleared the counter --
+                    // keepUnlocked resets it on any answer, because an app that replies at all
+                    // is demonstrably alive even when it missed its own deadline.
+                    let n = strikes.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n >= CHALLENGE_STRIKES {
+                        log::warn!(
+                            "keep-unlocked unanswered for {n} consecutive rounds ({}s each) — \
+                             withdrawing the lockdown exemption. The client is gone, wedged, \
+                             backgrounded, or past its own window.",
+                            CHALLENGE_DEADLINE.as_secs()
+                        );
+                        shut(&generation, gen, &challenge);
+                        return;
+                    }
+                    log::info!(
+                        "keep-unlocked missed a beat (strike {n}/{CHALLENGE_STRIKES}) — \
+                         not withdrawing yet"
                     );
-                    shut(&generation, gen, &challenge);
-                    return;
                 }
                 std::thread::sleep(CHALLENGE_EVERY.saturating_sub(CHALLENGE_DEADLINE));
             }
@@ -1664,11 +1706,20 @@ impl ITarishService for TarishService {
         let taken = self.challenge.lock().unwrap().take();
         match taken {
             Some((want, sent)) if want == nonce => {
-                // Late is the same as absent: the deadline belongs to the daemon, and an
-                // answer that arrives after it has already cost the window.
+                // A late answer does not satisfy ITS OWN round -- the deadline belongs to the
+                // daemon and the nonce is consumed either way, so jitter can never be used to
+                // keep a window alive by always answering one round behind.
+                //
+                // But it does clear the strike counter, and that distinction is the fix for
+                // the app locking itself at random. An answer arriving at all -- even 4.5s
+                // late -- is positive evidence the client is running and still holding the
+                // window open. Treating that as indistinguishable from a dead process was
+                // wrong: it counted proof of life as proof of absence.
+                self.keepalive_strikes.store(0, Ordering::SeqCst);
                 if sent.elapsed() > CHALLENGE_DEADLINE {
-                    log::warn!(
-                        "keep-unlocked answered {}ms late — too late to count",
+                    log::info!(
+                        "keep-unlocked answered {}ms late — too late for this round, but the \
+                         client is alive, so the strike count is cleared",
                         sent.elapsed().as_millis()
                     );
                 } else {
