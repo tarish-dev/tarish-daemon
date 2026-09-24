@@ -436,4 +436,25 @@ interface ITarishService {
      * APPENDED LAST -- transaction codes are positional.
      */
     void keepUnlocked(long nonce);
+
+    /**
+     * Is a VPN kill-switch actually in force right now?
+     *
+     * THE APP CANNOT ANSWER THIS ITSELF, which is the whole reason the method exists.
+     * Settings.Global.always_on_vpn_lockdown reads **null** while lockdown is in force --
+     * measured on hardware -- because a VPN app can enter lockdown by another path. The only
+     * honest test is whether the kernel holds a `prohibit` routing rule, and reading that
+     * needs netlink, which an app does not get.
+     *
+     * Shipping without it was a real mistake that reached a device: the app locked itself and
+     * told the person it was because of a VPN kill-switch, on a phone where "Block
+     * connections without VPN" was switched off.
+     *
+     * Answered from a property that tarishd publishes, because tarishd is the process with
+     * the netlink socket. FAILS CLOSED: unknown means true, so the cost of being wrong is one
+     * authentication prompt rather than a missing exemption on a device that needs it.
+     *
+     * APPENDED LAST -- transaction codes are positional.
+     */
+    boolean isLockdownActive();
 }

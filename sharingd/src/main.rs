@@ -119,6 +119,9 @@ fn iface() -> &'static str {
 /// Its default when absent is ON, so a policy denial here degrades to the old
 /// battery cost rather than to a device that cannot share at all.
 const WANT_PROP: &str = "tarish.awdl.wanted";
+/// Published by tarishd: whether a VPN kill-switch is really in force. We cannot determine
+/// this ourselves -- no netlink_route_socket, by design -- so we relay tarishd's answer.
+const LOCKDOWN_PROP: &str = "tarish.awdl.lockdown";
 
 /// The Wi-Fi frequency, published for tarishd so it can choose the opposite band.
 const STA_FREQ_PROP: &str = "tarish.awdl.sta_freq";
@@ -1735,6 +1738,26 @@ impl ITarishService for TarishService {
             None => log::warn!("keep-unlocked answered with nothing outstanding — ignoring"),
         }
         Ok(())
+    }
+
+    /// Relay tarishd's answer on whether a VPN kill-switch is in force.
+    ///
+    /// FAILS CLOSED. An unset or unreadable property means "assume lockdown", so the app puts
+    /// up one authentication prompt it might not have needed. The other direction -- deciding
+    /// no kill-switch exists on a device where one does -- would skip the authenticated
+    /// window on exactly the device that depends on it.
+    ///
+    /// Unset is the normal state for the first few seconds after boot, before tarishd's first
+    /// netlink dump, so this is a real case and not a theoretical one.
+    fn isLockdownActive(&self) -> BinderResult<bool> {
+        match read_property(LOCKDOWN_PROP).as_deref() {
+            Some("1") => Ok(true),
+            Some("0") => Ok(false),
+            _ => {
+                log::debug!("{LOCKDOWN_PROP} not published yet — assuming a kill-switch");
+                Ok(true)
+            }
+        }
     }
 
     fn setActive(&self, active: bool, sta_frequency_mhz: i32) -> BinderResult<()> {

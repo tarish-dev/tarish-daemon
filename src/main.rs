@@ -292,6 +292,19 @@ const WANT_PROP: &str = "tarish.awdl.wanted";
 /// unreadable one, a crashed tarishsharingd or a stale value all mean NOT exempt. The
 /// failure mode of this feature is losing the exemption, never keeping it.
 const EXEMPT_PROP: &str = "tarish.awdl.exempt";
+/// Whether a VPN kill-switch is really in force. Published by tarishd because only tarishd
+/// can see it, and read by tarishsharingd to answer the app's isLockdownActive().
+///
+/// Under the `tarish.awdl.` prefix ON PURPOSE: that prefix is already labelled
+/// tarish_awdl_prop, so this key needs no new property_contexts entry. An exact rule for a
+/// new key would leave it on default_prop, where set_prop on our own type is still denied --
+/// and that failure is silent. See the property_contexts comment.
+const LOCKDOWN_PROP: &str = "tarish.awdl.lockdown";
+
+/// How often to re-check the kill-switch. A netlink dump is far heavier than a property read,
+/// so this is seconds rather than the 500ms poll -- and lockdown state changes when a person
+/// changes a setting, not on a timescale that needs watching closely.
+const LOCKDOWN_EVERY: Duration = Duration::from_secs(5);
 
 /// Is the exemption earned right now?
 fn exemption_earned() -> bool {
@@ -341,6 +354,25 @@ fn install_signal_handlers() {
 /// Read through libc rather than a helper crate: this process holds
 /// CAP_NET_ADMIN, so every dependency is part of its threat model, and one
 /// property read does not justify one.
+// Declared by hand rather than taken from libc: __system_property_get IS re-exported for
+// this target and __system_property_set is not, so relying on the crate would make the build
+// depend on which bionic symbols it happens to re-export. sharingd declares it the same way.
+extern "C" {
+    fn __system_property_set(name: *const libc::c_char, value: *const libc::c_char) -> libc::c_int;
+}
+
+/// Publish a property. tarishd only ever read them until it had to report lockdown state.
+fn write_property(name: &str, value: &str) -> bool {
+    let (Ok(n), Ok(v)) = (
+        std::ffi::CString::new(name),
+        std::ffi::CString::new(value),
+    ) else {
+        return false;
+    };
+    // SAFETY: both strings are NUL-terminated and outlive the call.
+    unsafe { __system_property_set(n.as_ptr(), v.as_ptr()) == 0 }
+}
+
 fn read_property(name: &str) -> Option<String> {
     let cname = std::ffi::CString::new(name).ok()?;
     // PROP_VALUE_MAX is 92; 128 is comfortably clear of it.
@@ -698,7 +730,31 @@ fn main() {
     let mut last_exempt: Option<bool> = None;
     let mut exempt_since: Option<std::time::Instant> = None;
     let mut exempt_capped = false;
+    let mut last_lockdown: Option<bool> = None;
+    let mut lockdown_checked_at: Option<std::time::Instant> = None;
     while RUNNING.load(Ordering::SeqCst) {
+        // Publish whether a kill-switch is actually in force. The app asks
+        // tarishsharingd, which reads this; neither of them can see it directly.
+        if lockdown_checked_at.map_or(true, |t| t.elapsed() >= LOCKDOWN_EVERY) {
+            lockdown_checked_at = Some(std::time::Instant::now());
+            let now_locked = route::lockdown_active();
+            if last_lockdown != Some(now_locked) {
+                if !write_property(LOCKDOWN_PROP, if now_locked { "1" } else { "0" }) {
+                    log::error!(
+                        "could not publish {LOCKDOWN_PROP} — the app cannot tell whether a \
+                         kill-switch is active and will assume one is. Check \
+                         set_prop(tarishd, tarish_awdl_prop)"
+                    );
+                }
+                log::info!(
+                    "{LOCKDOWN_PROP}={} — a VPN kill-switch is {}",
+                    if now_locked { 1 } else { 0 },
+                    if now_locked { "in force" } else { "NOT in force" }
+                );
+                last_lockdown = Some(now_locked);
+            }
+        }
+
         let want = wants_radio();
         if last_want != Some(want) {
             log::info!("{WANT_PROP}={}", if want { 1 } else { 0 });

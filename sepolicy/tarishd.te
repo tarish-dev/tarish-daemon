@@ -104,6 +104,12 @@ get_prop(tarishd, telephony_status_prop)
 # Read-only on purpose: tarishd never writes it, so a bug here cannot make the
 # privileged daemon assert a state the unprivileged one did not ask for.
 get_prop(tarishd, tarish_awdl_prop)
+# tarishd PUBLISHES tarish.awdl.lockdown -- whether a VPN kill-switch is really in force.
+# Only tarishd can know: it takes an RTM_GETRULE dump looking for a `prohibit` rule, and
+# tarishsharingd has no netlink_route_socket at all (removed in the auditallow narrowing,
+# and not worth restoring to the process that parses hostile input just to read a boolean).
+# Without this the write fails SILENTLY -- see the property_contexts comment.
+set_prop(tarishd, tarish_awdl_prop)
 
 allow tarishd sysfs_net:dir search;
 allow tarishd sysfs_net:file r_file_perms;

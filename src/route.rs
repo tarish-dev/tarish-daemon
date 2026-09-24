@@ -445,3 +445,142 @@ pub fn table_id(iface: &str) -> u32 {
         .map(|c| unsafe { libc::if_nametoindex(c.as_ptr()) })
         .unwrap_or(0)
 }
+
+// ---------------------------------------------------------------- lockdown detection ---
+
+const RTM_GETRULE: u16 = 34;
+const NLM_F_ROOT: u16 = 0x100;
+const NLM_F_MATCH: u16 = 0x200;
+const NLM_F_DUMP: u16 = NLM_F_ROOT | NLM_F_MATCH;
+const NLMSG_DONE: u16 = 3;
+/// `FR_ACT_PROHIBIT` from `linux/fib_rules.h`. This is the whole signal.
+const FR_ACT_PROHIBIT: u8 = 8;
+
+/// Is a VPN kill-switch actually in force right now?
+///
+/// WHY THIS LIVES IN THE DAEMON. The app cannot answer it. `always_on_vpn_lockdown` reads
+/// **null** while lockdown is in force -- measured on blazer -- because a VPN app can put the
+/// device in lockdown by another path, so the setting is not a reliable signal for anyone,
+/// platform-signed or not. The only honest test is whether the kernel is holding a `prohibit`
+/// routing rule, and reading that needs netlink, which an app does not get.
+///
+/// Shipping without this was a real mistake and it reached hardware: the app locked itself,
+/// demanded authentication, and told the person it was because of a VPN kill-switch -- on a
+/// device where "Block connections without VPN" was switched off. The lock was correct code
+/// resting on an assumption nothing had checked.
+///
+/// WHAT IT MATCHES. Android installs `PROHIBIT_NON_VPN` at priority 14000 with action
+/// `prohibit`. Matching on the ACTION rather than the priority is deliberate: the priority is
+/// an AOSP implementation detail that a ROM could renumber, while a rule that prohibits
+/// traffic outright is the thing that actually blocks us, whoever installed it and wherever
+/// they put it.
+///
+/// FAILS CLOSED. Any error -- socket, send, recv, a truncated dump -- returns `true`, meaning
+/// "assume lockdown". The cost of a false positive is one authentication prompt. The cost of a
+/// false negative is the exemption being treated as unnecessary on a device where it is
+/// load-bearing, which is the failure that matters.
+pub fn lockdown_active() -> bool {
+    match probe_prohibit_rule() {
+        Ok(found) => found,
+        Err(e) => {
+            log::warn!("could not read routing rules ({e}) — assuming a kill-switch is in force");
+            true
+        }
+    }
+}
+
+fn probe_prohibit_rule() -> io::Result<bool> {
+    // SAFETY: plain socket(2) with constant arguments.
+    let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_DGRAM, NETLINK_ROUTE) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    struct Fd(i32);
+    impl Drop for Fd {
+        fn drop(&mut self) {
+            // SAFETY: fd is owned and closed exactly once.
+            unsafe { libc::close(self.0) };
+        }
+    }
+    let fd = Fd(fd);
+
+    // A dump can outlive a wedged peer; without a timeout this would hang the caller.
+    let tv = libc::timeval { tv_sec: 2, tv_usec: 0 };
+    // SAFETY: tv is a live timeval of the stated size; SO_RCVTIMEO takes exactly that.
+    unsafe {
+        libc::setsockopt(
+            fd.0,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            &tv as *const libc::timeval as *const libc::c_void,
+            mem::size_of::<libc::timeval>() as u32,
+        );
+    }
+
+    // AF_UNSPEC dumps every family: a kill-switch installs rules for both v4 and v6, and
+    // asking for one of them would make the answer depend on which we guessed.
+    let body = [libc::AF_UNSPEC as u8, 0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let hdr = NlMsgHdr {
+        len: (mem::size_of::<NlMsgHdr>() + body.len()) as u32,
+        ty: RTM_GETRULE,
+        flags: NLM_F_REQUEST | NLM_F_DUMP,
+        seq: 1,
+        pid: 0,
+    };
+    let mut msg = Vec::with_capacity(hdr.len as usize);
+    // SAFETY: NlMsgHdr is repr(C) plain old data.
+    msg.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(&hdr as *const NlMsgHdr as *const u8, mem::size_of::<NlMsgHdr>())
+    });
+    msg.extend_from_slice(&body);
+
+    // SAFETY: sockaddr_nl is plain old data; all-zeros with the family set is how the
+    // kernel address is formed.
+    let mut kernel: libc::sockaddr_nl = unsafe { mem::zeroed() };
+    kernel.nl_family = libc::AF_NETLINK as u16;
+    // SAFETY: msg is a live buffer of the stated length; kernel is a valid sockaddr_nl.
+    let sent = unsafe {
+        libc::sendto(
+            fd.0,
+            msg.as_ptr() as *const libc::c_void,
+            msg.len(),
+            0,
+            &kernel as *const libc::sockaddr_nl as *const libc::sockaddr,
+            mem::size_of::<libc::sockaddr_nl>() as u32,
+        )
+    };
+    if sent < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut buf = vec![0u8; 32768];
+    loop {
+        // SAFETY: buf is a live, owned allocation of the stated length.
+        let n = unsafe { libc::recv(fd.0, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let n = n as usize;
+        let mut off = 0usize;
+        while off + mem::size_of::<NlMsgHdr>() <= n {
+            let len = u32::from_ne_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as usize;
+            let ty = u16::from_ne_bytes([buf[off + 4], buf[off + 5]]);
+            if len < mem::size_of::<NlMsgHdr>() || off + len > n {
+                return Ok(false);   // truncated: say nothing rather than guess
+            }
+            if ty == NLMSG_DONE {
+                return Ok(false);
+            }
+            if ty == NLMSG_ERROR {
+                return Err(io::Error::other("netlink error while dumping rules"));
+            }
+            // fib_rule_hdr: family, dst_len, src_len, tos, table, res1, res2, ACTION, flags.
+            // The action is byte 7 of the payload, straight after the header.
+            let payload = off + mem::size_of::<NlMsgHdr>();
+            if payload + 8 <= n && buf[payload + 7] == FR_ACT_PROHIBIT {
+                return Ok(true);
+            }
+            off += align4(len);
+        }
+    }
+}
