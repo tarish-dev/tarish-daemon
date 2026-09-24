@@ -439,11 +439,11 @@ impl Browser {
                                 port: 0,
                                 addr: None,
                                 last_seen: Instant::now(),
-                                expires_at: Instant::now() + ttl_of(rec),
+                                expires_at: Instant::now() + Self::ttl_of(rec),
                             }
                         });
                         e.last_seen = Instant::now();
-                        e.expires_at = Instant::now() + ttl_of(rec);
+                        e.expires_at = Instant::now() + Self::ttl_of(rec);
                     }
                 }
                 dns::TYPE_SRV => {
@@ -456,7 +456,7 @@ impl Browser {
                             p.port = port;
                             p.host = host;
                             p.last_seen = Instant::now();
-                            p.expires_at = p.expires_at.max(Instant::now() + ttl_of(rec));
+                            p.expires_at = p.expires_at.max(Instant::now() + Self::ttl_of(rec));
                         }
                     }
                 }
@@ -479,7 +479,7 @@ impl Browser {
                         if !p.host.is_empty() && p.host == rec.name {
                             p.addr = Some(addr);
                             p.last_seen = Instant::now();
-                            p.expires_at = p.expires_at.max(Instant::now() + ttl_of(rec));
+                            p.expires_at = p.expires_at.max(Instant::now() + Self::ttl_of(rec));
                         }
                     }
                 }
