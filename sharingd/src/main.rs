@@ -25,7 +25,7 @@ mod httpd;
 mod mdns;
 mod plist;
 
-use binder::{BinderFeatures, Interface, Result as BinderResult, Status, StatusCode, Strong};
+use binder::{BinderFeatures, DeathRecipient, IBinder, Interface, Result as BinderResult, Status, StatusCode, Strong};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1052,6 +1052,11 @@ struct TarishService {
     /// Supersedes a pending auth-window expiry, so re-authenticating cannot be closed by
     /// the previous window's timer. Same pattern as visibility_generation.
     auth_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Withdraws the exemption the instant the client's binder dies.
+    ///
+    /// Held here because libbinder unlinks a DeathRecipient when it is DROPPED, so a
+    /// recipient created on the stack would be unlinked before it could ever fire.
+    death: Mutex<Option<DeathRecipient>>,
     discoverable: Discoverable,
     /// Whether a client is in the foreground. Governs the radio, not visibility.
     active: Arc<AtomicBool>,
@@ -1368,6 +1373,7 @@ impl TarishService {
             reset_identity: Arc::new(AtomicBool::new(false)),
             visibility_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             auth_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            death: Mutex::new(None),
             discoverable,
             active: Arc::new(AtomicBool::new(false)),
             // NOT -1: that now MEANS something. -1 is the client saying the Wi-Fi
@@ -2317,6 +2323,41 @@ impl ITarishService for TarishService {
         // Refuse duplicates so a live client counts once. (A client that dies leaves a dead
         // proxy, which is harmless: a oneway to it just fails and it can never trigger work in
         // an app that is gone; unregisterCallback and the next matching register cover it.)
+        // WATCH THE CLIENT DIE, and close the window when it does.
+        //
+        // Swiping the app away from recents kills the process. onPause may not run, and even
+        // when it does the process can be gone before the call lands -- so "the app closes
+        // the window on its way out" is a best case, not a guarantee. Without this the
+        // exemption survived until the daemon's own ten-minute cap: ten minutes of a live
+        // hole in the kill-switch with nobody on the other end.
+        //
+        // Binder death is the real event rather than a poll or a timeout, and it covers
+        // every way the client can vanish at once: swiped away, crashed, force-stopped,
+        // killed for memory.
+        //
+        // A rebind also fires this, because the old proxy dies. That is the correct outcome
+        // and not a nuisance: the person re-authenticates, which is exactly what should
+        // happen when the thing holding the claim went away. Fail closed.
+        //
+        // Only the EXEMPTION is withdrawn, not visibility. Visibility is deliberately daemon
+        // state that survives a client merely rebinding (see setDiscoverable), and tying it
+        // to the binder here would undo that on every reconnect.
+        {
+            let mut b = cb.as_binder();
+            let mut recipient = DeathRecipient::new(|| {
+                log::warn!("client binder died — withdrawing the lockdown exemption");
+                set_exempt(false);
+            });
+            match b.link_to_death(&mut recipient) {
+                Ok(()) => *self.death.lock().unwrap() = Some(recipient),
+                // Loud: without the link the only bound left is the ten-minute cap, which is
+                // a weaker promise than the one the UI makes.
+                Err(e) => log::error!(
+                    "could not watch the client for death ({e}) — the lockdown exemption \
+                     will now outlive a swiped-away app until its timer expires"
+                ),
+            }
+        }
         if cbs.iter().any(|c| c.as_binder() == cb.as_binder()) {
             log::debug!("client already registered; not adding a duplicate");
         } else {

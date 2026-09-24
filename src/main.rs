@@ -298,6 +298,19 @@ fn exemption_earned() -> bool {
     read_property(EXEMPT_PROP).as_deref() == Some("1")
 }
 
+/// The longest this daemon will hold the exemption, whatever the property says.
+///
+/// A SECOND CAP, IN THE PROCESS THAT OWNS THE RULE, and the point is that it trusts nothing.
+/// tarishsharingd already caps the window and clears the property at its own startup, but
+/// both of those depend on tarishsharingd being alive to do them. Kill it mid-window — OOM,
+/// a panic, `kill -9` — and the property keeps saying "1" with nobody left to change it,
+/// while THIS process is the one actually holding the rule above the kill-switch.
+///
+/// So the rule is demoted after this long regardless, and re-promoted only if the property
+/// is still set AND has been re-asserted since. Slightly longer than the client's 600s so a
+/// healthy window is never cut short by clock skew between the two.
+const EXEMPT_MAX: Duration = Duration::from_secs(660);
+
 /// How often to look at it. This is a shared-memory read, not a syscall, so the
 /// cost is far below the noise floor -- the session itself was measured at 6.5%
 /// of a core, and this is not measurable next to it.
@@ -683,6 +696,8 @@ fn main() {
     let mut last_error = String::new();
 
     let mut last_exempt: Option<bool> = None;
+    let mut exempt_since: Option<std::time::Instant> = None;
+    let mut exempt_capped = false;
     while RUNNING.load(Ordering::SeqCst) {
         let want = wants_radio();
         if last_want != Some(want) {
@@ -700,7 +715,37 @@ fn main() {
         // Re-adding is how the priority changes: add_rule sweeps BOTH priorities first, so
         // this demotes as cleanly as it promotes and never leaves a rule at the old one.
         // Only while a link exists; with no interface there is nothing to point at.
-        let exempt = exemption_earned();
+        let mut exempt = exemption_earned();
+
+        // Enforce our own ceiling before acting on the property.
+        //
+        // `exempt_since` is reset only on a TRANSITION into the exempt state, so a property
+        // stuck at "1" cannot keep renewing it: the timer runs from when the window opened,
+        // not from when we last looked. Once expired we hold the demotion until the property
+        // goes false and true again, which is what re-authenticating does.
+        if exempt {
+            match exempt_since {
+                None => exempt_since = Some(std::time::Instant::now()),
+                Some(t) if t.elapsed() > EXEMPT_MAX => {
+                    if !exempt_capped {
+                        log::error!(
+                            "{EXEMPT_PROP} has been set for {}s — past our own {}s ceiling. \
+                             Demoting the rule and holding it down until the window is \
+                             re-opened. tarishsharingd may have died mid-window.",
+                            t.elapsed().as_secs(),
+                            EXEMPT_MAX.as_secs()
+                        );
+                        exempt_capped = true;
+                    }
+                    exempt = false;
+                }
+                Some(_) => {}
+            }
+        } else {
+            exempt_since = None;
+            exempt_capped = false;
+        }
+
         if last_exempt != Some(exempt) {
             if link.is_some() {
                 let ifc = iface();
