@@ -395,6 +395,17 @@ impl Browser {
     }
 
     fn absorb(&mut self, packet: &[u8], records: &[dns::Record]) {
+        // TEMPORARY DIAGNOSTIC (2026-09-24): peers are lost and rediscovered seconds apart,
+        // and nothing in this module logs an arriving record, so the log cannot distinguish
+        // "the announcement never came" from "it came and we dropped the peer anyway".
+        // Remove once that is settled.
+        if !records.is_empty() {
+            let seen: Vec<String> = records
+                .iter()
+                .map(|r| format!("{}/{}/ttl={}", short(&r.name), r.rtype, r.ttl))
+                .collect();
+            log::info!("rx {} record(s): {:?}", records.len(), seen);
+        }
         for rec in records {
             match rec.rtype {
                 dns::TYPE_PTR if rec.name == AIRDROP_SERVICE => {
