@@ -42,6 +42,17 @@ pub struct Peer {
     pub port: u16,
     pub addr: Option<Ipv6Addr>,
     pub last_seen: Instant,
+    /// When this peer stops being valid, from the TTL IT told us.
+    ///
+    /// Discovery used to expire on `last_seen` alone against a fixed 45s, while querying
+    /// every 4s. Apple's responder will not re-answer an identical question it has recently
+    /// multicast (RFC 6762 response suppression), so most of those queries draw silence --
+    /// and 45s later a peer that had advertised a 120s TTL was dropped as if it had walked
+    /// away. Measured on hardware: the same Mac discovered and lost four times in fifteen
+    /// minutes, which is what "AirDrop is not stable" looked like from the share sheet.
+    ///
+    /// The peer's own TTL is the right clock, so this holds it.
+    pub expires_at: Instant,
 }
 
 impl Peer {
@@ -428,9 +439,11 @@ impl Browser {
                                 port: 0,
                                 addr: None,
                                 last_seen: Instant::now(),
+                                expires_at: Instant::now() + ttl_of(rec),
                             }
                         });
                         e.last_seen = Instant::now();
+                        e.expires_at = Instant::now() + ttl_of(rec);
                     }
                 }
                 dns::TYPE_SRV => {
@@ -443,6 +456,7 @@ impl Browser {
                             p.port = port;
                             p.host = host;
                             p.last_seen = Instant::now();
+                            p.expires_at = p.expires_at.max(Instant::now() + ttl_of(rec));
                         }
                     }
                 }
@@ -465,6 +479,7 @@ impl Browser {
                         if !p.host.is_empty() && p.host == rec.name {
                             p.addr = Some(addr);
                             p.last_seen = Instant::now();
+                            p.expires_at = p.expires_at.max(Instant::now() + ttl_of(rec));
                         }
                     }
                 }
@@ -473,7 +488,18 @@ impl Browser {
         }
     }
 
-    /// Forget every peer, so the next query rebuilds the table from scratch.
+    /// How long a record is good for, clamped.
+///
+/// A peer choosing a huge TTL must not pin an entry forever once it has actually gone, and
+/// one choosing zero (a goodbye, or a bug) must not make the entry vanish before the floor
+/// in `expire` can apply. Bonjour uses 120s for these records, which sits inside this range.
+fn ttl_of(rec: &dns::Record) -> Duration {
+    const MIN: u64 = 30;
+    const MAX: u64 = 300;
+    Duration::from_secs((rec.ttl as u64).clamp(MIN, MAX))
+}
+
+/// Forget every peer, so the next query rebuilds the table from scratch.
     ///
     /// For an explicit user refresh. Expiry alone is not enough: a peer whose records
     /// we still hold but which has become unreachable stays listed until its TTL runs
@@ -484,12 +510,17 @@ impl Browser {
         self.peers.clear();
     }
 
-    /// Drop peers not heard from recently. mDNS TTLs are advisory; a peer that
-    /// walks away simply stops announcing.
-    pub fn expire(&mut self, older_than: Duration) {
+    /// Drop peers whose own TTL has run out.
+    ///
+    /// `min_grace` is a FLOOR, not the timeout: a peer is kept until the later of its
+    /// advertised expiry and `min_grace` after we last heard it. It used to be the whole
+    /// rule, which meant discarding peers that had explicitly said they were valid for
+    /// longer -- see `Peer::expires_at`. Keeping the floor still covers a peer that sends
+    /// an absurdly short TTL.
+    pub fn expire(&mut self, min_grace: Duration) {
         let now = Instant::now();
         self.peers.retain(|name, p| {
-            let keep = now.duration_since(p.last_seen) < older_than;
+            let keep = now < p.expires_at || now.duration_since(p.last_seen) < min_grace;
             if !keep {
                 log::info!("peer lost: {}", short(name));
             }

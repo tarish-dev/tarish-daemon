@@ -118,6 +118,12 @@ pub struct Question {
 pub struct Record {
     pub name: String,
     pub rtype: u16,
+    /// Seconds the peer says this record stays valid.
+    ///
+    /// Was parsed and thrown away. Discovery then had no idea how long a peer expected to
+    /// remain listed and fell back to a fixed timeout shorter than the TTLs real peers
+    /// send, so peers were dropped while still perfectly valid. See `Peer::expires_at`.
+    pub ttl: u32,
     pub rdata: Vec<u8>,
     /// Offset of rdata within the original packet, needed because names inside
     /// rdata may use compression pointers relative to the whole packet.
@@ -165,11 +171,11 @@ pub fn parse(buf: &[u8]) -> Option<Message> {
         let name = r.name()?;
         let rtype = r.u16()?;
         let _class = r.u16()?;
-        let _ttl = r.u32()?;
+        let ttl = r.u32()?;
         let rdlen = r.u16()? as usize;
         let at = r.pos;
         let rdata = r.bytes(rdlen)?.to_vec();
-        out.push(Record { name, rtype, rdata, rdata_at: at });
+        out.push(Record { name, rtype, ttl, rdata, rdata_at: at });
     }
     Some(Message { questions, records: out })
 }
