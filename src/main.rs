@@ -354,6 +354,22 @@ fn install_signal_handlers() {
 /// Read through libc rather than a helper crate: this process holds
 /// CAP_NET_ADMIN, so every dependency is part of its threat model, and one
 /// property read does not justify one.
+fn read_property(name: &str) -> Option<String> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    // PROP_VALUE_MAX is 92; 128 is comfortably clear of it.
+    let mut buf = [0u8; 128];
+    // SAFETY: cname is NUL-terminated and buf is PROP_VALUE_MAX-sized or larger,
+    // which is the contract __system_property_get requires.
+    let n = unsafe {
+        libc::__system_property_get(cname.as_ptr(), buf.as_mut_ptr() as *mut libc::c_char)
+    };
+    if n <= 0 {
+        return None;
+    }
+    let s = std::str::from_utf8(&buf[..n as usize]).ok()?;
+    Some(s.to_string())
+}
+
 // Declared by hand rather than taken from libc: __system_property_get IS re-exported for
 // this target and __system_property_set is not, so relying on the crate would make the build
 // depend on which bionic symbols it happens to re-export. sharingd declares it the same way.
@@ -371,22 +387,6 @@ fn write_property(name: &str, value: &str) -> bool {
     };
     // SAFETY: both strings are NUL-terminated and outlive the call.
     unsafe { __system_property_set(n.as_ptr(), v.as_ptr()) == 0 }
-}
-
-fn read_property(name: &str) -> Option<String> {
-    let cname = std::ffi::CString::new(name).ok()?;
-    // PROP_VALUE_MAX is 92; 128 is comfortably clear of it.
-    let mut buf = [0u8; 128];
-    // SAFETY: cname is NUL-terminated and buf is PROP_VALUE_MAX-sized or larger,
-    // which is the contract __system_property_get requires.
-    let n = unsafe {
-        libc::__system_property_get(cname.as_ptr(), buf.as_mut_ptr() as *mut libc::c_char)
-    };
-    if n <= 0 {
-        return None;
-    }
-    let s = std::str::from_utf8(&buf[..n as usize]).ok()?;
-    Some(s.to_string())
 }
 
 /// Regulatory country, in priority order.
