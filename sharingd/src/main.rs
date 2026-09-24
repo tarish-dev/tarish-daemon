@@ -2480,14 +2480,31 @@ impl ITarishService for TarishService {
                     } else {
                         STATUS_FAILED
                     };
-                    // A refused or reset connection means that peer is no longer there.
-                    // Forgetting it now is better than leaving the picker offering a
-                    // device that cannot be reached until the expiry timer notices.
+                    // REFUSED IS NOT ABSENT — it is the proof a peer IS there.
+                    //
+                    // This used to evict on ConnectionRefused, and the comment said "a refused
+                    // or reset connection means that peer is no longer there". ECONNREFUSED
+                    // means the opposite: our SYN reached the host and the host answered with
+                    // RST. The device is present and routable; nothing is listening on the
+                    // AirDrop port *at that instant*. iOS opens that listener only when it is
+                    // in a receptive state, so a healthy, discoverable iPhone refuses most
+                    // probes.
+                    //
+                    // Measured 2026-09-24 on blazer, and it is the whole of the "iPhone Mini
+                    // discovery is unreliable" report:
+                    //   23:20:58  peer discovered: c217cb857db9  (records fine, ttl=4500)
+                    //   23:21:00  /Discover failed: Connection refused (os error 111)
+                    //   23:21:43  peer lost
+                    // The Mini advertised, we probed, it refused, we deleted it — then it
+                    // re-announced and the cycle repeated. Hence "sometimes it pops up".
+                    //
+                    // TimedOut is kept: no answer at all is at least consistent with a peer
+                    // that has gone. ConnectionReset is kept for the same reason, though it is
+                    // weaker. Neither is definitive on AWDL, where a missed availability window
+                    // looks identical to absence -- if churn persists, suspect these next.
                     if matches!(
                         e.kind(),
-                        std::io::ErrorKind::ConnectionRefused
-                            | std::io::ErrorKind::ConnectionReset
-                            | std::io::ErrorKind::TimedOut
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::TimedOut
                     ) {
                         if let Ok(mut table) = peers_for_send.lock() {
                             table.retain(|p| p.instance != peer_instance);
