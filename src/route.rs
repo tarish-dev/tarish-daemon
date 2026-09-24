@@ -87,7 +87,31 @@ const FR_ACT_TO_TBL: u8 = 1;
 /// So it cannot reach the internet, the LAN, or the VPN's subnet. It is a link-local escape
 /// by construction, not by trust, which is the property to preserve if this is ever changed.
 /// A uid-keyed exemption would be strictly worse: under lockdown it could reach anything.
-const RULE_PRIORITY: u32 = 13500;
+///
+/// TWO PRIORITIES, AND WHICH ONE IS USED IS THE WHOLE AUTHENTICATION FEATURE.
+///
+/// Sitting above PROHIBIT_NON_VPN is the privileged part -- it is what lets this daemon's
+/// link-local traffic survive a kill-switch that the operator's enterprise policy says must
+/// hold. Being able to route over tlink0 AT ALL is not privileged: without a kill-switch,
+/// OUTPUT_INTERFACE at 17000 would carry it anyway.
+///
+/// So the rule is installed BELOW the block by default and promoted above it only while an
+/// authenticated window is open. That makes authentication buy exactly one thing -- the
+/// lockdown exemption -- rather than "sharing works now", and it degrades in the safe
+/// direction:
+///
+///   no kill-switch, not authenticated   PLAIN wins before 32000 unreachable -> works
+///   kill-switch,    not authenticated   PROHIBIT matches first -> blocked, fail-closed
+///   kill-switch,    authenticated       EXEMPT beats PROHIBIT -> works, for the window
+///
+/// PLAIN sits at 15500, in the same gap that made 15000 useless under lockdown -- which is
+/// the point: that gap is exactly "works normally, blocked by a kill-switch".
+const RULE_PRIORITY_EXEMPT: u32 = 13500;
+const RULE_PRIORITY_PLAIN: u32 = 15500;
+
+/// Both, for the sweeps. A rule left at either priority is a rule that outranks or shadows
+/// the one we are about to add, so teardown has to clear both and not just the current one.
+const RULE_PRIORITIES: [u32; 2] = [RULE_PRIORITY_EXEMPT, RULE_PRIORITY_PLAIN];
 
 #[repr(C)]
 #[derive(Default)]
@@ -203,8 +227,9 @@ struct FibRuleUidRange {
 ///
 /// The rule is scoped to a single uid, so this is also the only thing standing
 /// between any other process on the device and the AWDL link. See `sharing_uid`.
-pub fn add_rule(iface: &str) -> io::Result<()> {
+pub fn add_rule(iface: &str, exempt: bool) -> io::Result<()> {
     let idx = index_of(iface)?;
+    let priority = if exempt { RULE_PRIORITY_EXEMPT } else { RULE_PRIORITY_PLAIN };
 
     // Clear our own old rules first.
     //
@@ -217,9 +242,15 @@ pub fn add_rule(iface: &str) -> io::Result<()> {
     //
     // Deleting by priority rather than by table clears whatever we left behind
     // previously, without needing to know what index it had.
-    for _ in 0..8 {
-        if del_rule().is_err() {
-            break;   // nothing left at our priority
+    // BOTH priorities, not just the one being installed. Promoting or demoting leaves a
+    // rule at the other one, and the lower number always wins -- so a stale EXEMPT rule
+    // would keep the exemption alive after the window closed, which is the one failure this
+    // feature must not have.
+    for p in RULE_PRIORITIES {
+        for _ in 0..8 {
+            if del_rule_at(p).is_err() {
+                break;
+            }
         }
     }
 
@@ -246,7 +277,7 @@ pub fn add_rule(iface: &str) -> io::Result<()> {
     name.push(0);
     put_attr(&mut body, FRA_OIFNAME, &name);
     put_attr(&mut body, FRA_TABLE, &idx.to_ne_bytes());
-    put_attr(&mut body, FRA_PRIORITY, &RULE_PRIORITY.to_ne_bytes());
+    put_attr(&mut body, FRA_PRIORITY, &priority.to_ne_bytes());
 
     // SCOPE THE RULE TO ONE UID.
     //
@@ -282,11 +313,13 @@ pub fn add_rule(iface: &str) -> io::Result<()> {
 /// because rules match by priority the stale one wins over the next one added.
 pub fn remove_rule() -> io::Result<()> {
     let mut removed = 0;
-    for _ in 0..8 {
-        if del_rule().is_err() {
-            break;   // nothing left at our priority
+    for p in RULE_PRIORITIES {
+        for _ in 0..8 {
+            if del_rule_at(p).is_err() {
+                break;
+            }
+            removed += 1;
         }
-        removed += 1;
     }
     if removed == 0 {
         return Err(io::Error::new(io::ErrorKind::NotFound, "no rule at our priority"));
@@ -294,8 +327,8 @@ pub fn remove_rule() -> io::Result<()> {
     Ok(())
 }
 
-/// Delete one rule at our priority. Errors once none remain, which is the stop signal.
-fn del_rule() -> io::Result<()> {
+/// Delete one rule at `priority`. Errors once none remain, which is the stop signal.
+fn del_rule_at(priority: u32) -> io::Result<()> {
     let rt = RtMsg {
         family: libc::AF_INET6 as u8,
         table: RT_TABLE_UNSPEC,
@@ -308,7 +341,7 @@ fn del_rule() -> io::Result<()> {
         std::slice::from_raw_parts(&rt as *const RtMsg as *const u8, mem::size_of::<RtMsg>())
     });
     body.resize(align4(body.len()), 0);
-    put_attr(&mut body, FRA_PRIORITY, &RULE_PRIORITY.to_ne_bytes());
+    put_attr(&mut body, FRA_PRIORITY, &priority.to_ne_bytes());
     send_nl_flags(RTM_DELRULE, &body, NLM_F_REQUEST | NLM_F_ACK)
 }
 

@@ -275,6 +275,29 @@ const MAX_MDNS: u32 = 0x7fff_ffff;
 /// creating one. tarishd stays init-started, exactly once, at boot.
 const WANT_PROP: &str = "tarish.awdl.wanted";
 
+/// Whether the lockdown exemption is currently earned.
+///
+/// Set by tarishsharingd when the app reports an authenticated window, cleared when it
+/// closes. Read here, and the only thing it changes is the PRIORITY of the fib rule: above
+/// Android's kill-switch while true, below it while false. See route.rs for why that is the
+/// whole of the privilege.
+///
+/// Same reasoning as WANT_PROP for using a property: this daemon holds CAP_NET_ADMIN and a
+/// property read is a shared-memory load of one boolean, with no parser to attack. It lives
+/// under the `tarish.awdl.` prefix, which property_contexts already labels, so it needs no
+/// new SELinux type -- and tarishsharingd already has set_prop on that type while tarishd
+/// has only get_prop, which is the direction this needs.
+///
+/// FAIL-CLOSED BY CONSTRUCTION: anything other than "1" is false, so a missing property, an
+/// unreadable one, a crashed tarishsharingd or a stale value all mean NOT exempt. The
+/// failure mode of this feature is losing the exemption, never keeping it.
+const EXEMPT_PROP: &str = "tarish.awdl.exempt";
+
+/// Is the exemption earned right now?
+fn exemption_earned() -> bool {
+    read_property(EXEMPT_PROP).as_deref() == Some("1")
+}
+
 /// How often to look at it. This is a shared-memory read, not a syscall, so the
 /// cost is far below the noise floor -- the session itself was measured at 6.5%
 /// of a core, and this is not measurable next to it.
@@ -584,8 +607,14 @@ impl Link {
         // fib rules keyed on fwmark, and gets no rule for an interface it does not
         // manage -- so the route above sat in table N, was never looked up, and every
         // lookup fell through to "32000: from all unreachable".
-        match route::add_rule(ifc) {
-            Ok(()) => log::info!("rule: oif {ifc} lookup {}", route::table_id(ifc)),
+        let exempt = exemption_earned();
+        match route::add_rule(ifc, exempt) {
+            Ok(()) => log::info!(
+                "rule: oif {ifc} lookup {} ({})",
+                route::table_id(ifc),
+                if exempt { "ABOVE the VPN kill-switch — authenticated window open" }
+                else { "below the VPN kill-switch — no authenticated window" }
+            ),
             Err(e) => log::warn!(
                 "routing rule not added ({e}) — the route on {ifc} exists but nothing \
                  will consult it, so the device stays unreachable"
@@ -653,12 +682,44 @@ fn main() {
     let mut retry_at = std::time::Instant::now();
     let mut last_error = String::new();
 
+    let mut last_exempt: Option<bool> = None;
     while RUNNING.load(Ordering::SeqCst) {
         let want = wants_radio();
         if last_want != Some(want) {
             log::info!("{WANT_PROP}={}", if want { 1 } else { 0 });
             last_want = Some(want);
             retry_at = std::time::Instant::now();   // a fresh request retries at once
+        }
+
+        // THE AUTHENTICATED WINDOW CAN OPEN AND CLOSE WHILE THE LINK IS UP, so the rule has
+        // to follow it and not just be chosen once at acquire(). Without this the exemption
+        // would last as long as the AWDL session, which is the property the feature exists
+        // to remove -- and worse, it would be decided by whatever the state happened to be
+        // at the moment AirDrop was switched on.
+        //
+        // Re-adding is how the priority changes: add_rule sweeps BOTH priorities first, so
+        // this demotes as cleanly as it promotes and never leaves a rule at the old one.
+        // Only while a link exists; with no interface there is nothing to point at.
+        let exempt = exemption_earned();
+        if last_exempt != Some(exempt) {
+            if link.is_some() {
+                let ifc = iface();
+                match route::add_rule(ifc, exempt) {
+                    Ok(()) => log::info!(
+                        "{EXEMPT_PROP}={} — rule moved {} the VPN kill-switch",
+                        if exempt { 1 } else { 0 },
+                        if exempt { "ABOVE" } else { "below" }
+                    ),
+                    // Losing the promotion is safe; losing the demotion is not, so say so
+                    // loudly rather than leaving a stale exemption in place unremarked.
+                    Err(e) => log::error!(
+                        "could not move the routing rule for {EXEMPT_PROP}={} ({e}) — \
+                         the exemption may still be in force",
+                        if exempt { 1 } else { 0 }
+                    ),
+                }
+            }
+            last_exempt = Some(exempt);
         }
 
         match (want, link.is_some()) {
