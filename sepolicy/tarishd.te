@@ -59,7 +59,15 @@ allow tarishd self:capability { net_admin net_raw };
 # If a rule is genuinely needed on a path none of that exercised, it comes back as a real
 # denial with a real AVC -- which is a better failure than the silent over-grant it replaces.
 allow tarishd self:netlink_generic_socket { ioctl read write create setopt };
-allow tarishd self:netlink_route_socket { read write create nlmsg_write };
+# nlmsg_read is back, and ONLY because something now uses it. It was cut in the auditallow
+# narrowing (see the removed list above) when tarishd only ever WROTE rules and routes.
+# lockdown_active() dumps them with RTM_GETRULE, and a netlink dump is a read, so without
+# this the dump is denied.
+#
+# The denial would have been near-impossible to read from the symptom: lockdown_active()
+# fails CLOSED, so a denied dump reports "a kill-switch is in force", the app keeps locking
+# on every device, and the fix looks like it simply did not work.
+allow tarishd self:netlink_route_socket { read write create nlmsg_read nlmsg_write };
 allow tarishd self:packet_socket { ioctl read write create bind setopt };
 allow tarishd self:udp_socket { create ioctl };
 allow tarishd self:unix_dgram_socket { ioctl };
