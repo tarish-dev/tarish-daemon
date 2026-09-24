@@ -67,7 +67,11 @@ allow tarishd self:netlink_generic_socket { ioctl read write create setopt };
 # The denial would have been near-impossible to read from the symptom: lockdown_active()
 # fails CLOSED, so a denied dump reports "a kill-switch is in force", the app keeps locking
 # on every device, and the fix looks like it simply did not work.
-allow tarishd self:netlink_route_socket { read write create nlmsg_read nlmsg_write };
+# setopt is for SO_RCVTIMEO on the lockdown dump, and it is NOT cosmetic. Without it the
+# timeout is silently not applied — setsockopt fails, the code ignores the return (it is
+# best-effort), and a dump that never completes then blocks recv() FOREVER on tarishd's main
+# poll loop. Denied every 5s on 2026092412, which is how it was found.
+allow tarishd self:netlink_route_socket { read write create setopt nlmsg_read nlmsg_write };
 allow tarishd self:packet_socket { ioctl read write create bind setopt };
 allow tarishd self:udp_socket { create ioctl };
 allow tarishd self:unix_dgram_socket { ioctl };

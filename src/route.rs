@@ -507,14 +507,29 @@ fn probe_prohibit_rule() -> io::Result<bool> {
     // A dump can outlive a wedged peer; without a timeout this would hang the caller.
     let tv = libc::timeval { tv_sec: 2, tv_usec: 0 };
     // SAFETY: tv is a live timeval of the stated size; SO_RCVTIMEO takes exactly that.
-    unsafe {
+    let timeout_set = unsafe {
         libc::setsockopt(
             fd.0,
             libc::SOL_SOCKET,
             libc::SO_RCVTIMEO,
             &tv as *const libc::timeval as *const libc::c_void,
             mem::size_of::<libc::timeval>() as u32,
-        );
+        )
+    };
+    // DO NOT ignore this. Without the timeout, a dump that never completes blocks recv()
+    // forever on the caller's thread -- which is tarishd's main poll loop. Refusing to probe
+    // is strictly better than risking a wedged daemon, and lockdown_active() fails closed, so
+    // the cost of bailing out here is one authentication prompt.
+    if timeout_set != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "could not set a receive timeout on the netlink socket ({}) — refusing to \
+                 probe rather than risk blocking forever. Check \
+                 allow tarishd self:netlink_route_socket setopt",
+                io::Error::last_os_error()
+            ),
+        ));
     }
 
     // AF_UNSPEC dumps every family: a kill-switch installs rules for both v4 and v6, and
