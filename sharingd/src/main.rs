@@ -132,6 +132,22 @@ const STA_FREQ_PROP: &str = "tarish.awdl.sta_freq";
 /// required.
 const EXEMPT_PROP: &str = "tarish.awdl.exempt";
 
+/// How often the daemon asks the client to prove it is still unlocked, and how long it
+/// waits for the answer.
+///
+/// THE EXEMPTION IS HELD OPEN BY CONTINUOUS EFFORT, not closed by a final act. Every other
+/// bound in this feature is something that must HAPPEN to shut the hole — the app calling
+/// close, a binder dying, a timer firing, a daemon restarting. Each of those can fail. This
+/// one inverts it: the hole stays open only while the client keeps answering, so every
+/// failure mode — a killed app, a wedged one, one swiped away, one past its own window —
+/// converges on the same safe state without anything having to be delivered.
+///
+/// The deadline is generous next to the interval so an ordinary GC pause or a busy main
+/// thread never costs a window, and short enough that a swiped-away app loses the exemption
+/// in seconds rather than minutes.
+const CHALLENGE_EVERY: Duration = Duration::from_secs(5);
+const CHALLENGE_DEADLINE: Duration = Duration::from_secs(4);
+
 /// Peers found by the discovery thread. Shared rather than owned by the service
 /// so discovery keeps running whether or not a client is bound — a device must
 /// stay discoverable with the app closed.
@@ -857,6 +873,34 @@ fn write_property(name: &str, value: &str) -> bool {
     unsafe { __system_property_set(n.as_ptr(), v.as_ptr()) == 0 }
 }
 
+/// Close the window from the keepalive thread.
+///
+/// Bumps the generation so any other thread believing in this window retires too, and drops
+/// the outstanding challenge so a late answer cannot resurrect anything.
+fn shut(
+    generation: &Arc<std::sync::atomic::AtomicU64>,
+    gen: u64,
+    challenge: &Arc<Mutex<Option<(i64, std::time::Instant)>>>,
+) {
+    let _ = generation.compare_exchange(gen, gen + 1, Ordering::SeqCst, Ordering::SeqCst);
+    *challenge.lock().unwrap() = None;
+    set_exempt(false);
+}
+
+/// An unpredictable nonce.
+///
+/// getrandom, not a counter or a timestamp: a predictable nonce could be answered before the
+/// challenge was even sent. That is a thin threat here — only the client can reach this
+/// interface at all — but a guessable freshness token is not worth defending.
+fn random_i64() -> i64 {
+    let mut b = [0u8; 8];
+    // SAFETY: writing exactly 8 bytes into an 8-byte buffer.
+    unsafe {
+        libc::getrandom(b.as_mut_ptr() as *mut libc::c_void, b.len(), 0);
+    }
+    i64::from_ne_bytes(b)
+}
+
 /// Publish whether the lockdown exemption is currently earned.
 ///
 /// FAILS CLOSED IN BOTH DIRECTIONS, which is why the failure to CLEAR is the loud one. If
@@ -1052,6 +1096,14 @@ struct TarishService {
     /// Supersedes a pending auth-window expiry, so re-authenticating cannot be closed by
     /// the previous window's timer. Same pattern as visibility_generation.
     auth_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// The nonce of the challenge currently outstanding, and when it was sent.
+    ///
+    /// `None` means nothing is outstanding, so any keepUnlocked() is stale by definition.
+    /// Single-use: answering takes it, so a replayed nonce finds nothing to match.
+    challenge: Arc<Mutex<Option<(i64, std::time::Instant)>>>,
+    /// Set by a good answer, cleared when a challenge goes out. The keepalive thread reads
+    /// it to decide whether the last round was answered.
+    keepalive_ok: Arc<std::sync::atomic::AtomicBool>,
     /// Withdraws the exemption the instant the client's binder dies.
     ///
     /// Held here because libbinder unlinks a DeathRecipient when it is DROPPED, so a
@@ -1374,6 +1426,8 @@ impl TarishService {
             visibility_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             auth_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             death: Mutex::new(None),
+            challenge: Arc::new(Mutex::new(None)),
+            keepalive_ok: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             discoverable,
             active: Arc::new(AtomicBool::new(false)),
             // NOT -1: that now MEANS something. -1 is the client saying the Wi-Fi
@@ -1413,6 +1467,67 @@ impl TarishService {
             .map(|s| !s.trim().is_empty())
             .unwrap_or(false)
     }
+}
+
+impl TarishService {
+    /// Ask the client, over and over, whether the window should stay open.
+    ///
+    /// Runs for as long as THIS window is the current one; a newer setAuthenticated bumps
+    /// the generation and this thread retires. One thread per window, never two.
+    ///
+    /// The sequence per round is deliberate: clear the flag, post a fresh nonce, send the
+    /// oneway challenge, wait, then look. Clearing FIRST means a late answer to the previous
+    /// round cannot satisfy this one.
+    ///
+    /// A oneway callback, never a blocking call into the client. A synchronous call would
+    /// let a wedged app hang a daemon thread, and the whole point here is that a wedged app
+    /// is one of the cases this closes.
+    fn start_keepalive(&self, gen: u64) {
+        let generation = self.auth_generation.clone();
+        let callbacks = self.callbacks.clone();
+        let challenge = self.challenge.clone();
+        let ok = self.keepalive_ok.clone();
+        std::thread::spawn(move || {
+            loop {
+                if generation.load(Ordering::SeqCst) != gen {
+                    return;   // superseded, or the window was closed
+                }
+                let nonce = random_i64();
+                ok.store(false, Ordering::SeqCst);
+                *challenge.lock().unwrap() = Some((nonce, std::time::Instant::now()));
+
+                // Take a snapshot rather than holding the lock across the call: a oneway
+                // transaction is fast but not free, and blocking registerCallback behind it
+                // would be a needless coupling.
+                let targets: Vec<_> = callbacks.lock().unwrap().clone();
+                if targets.is_empty() {
+                    log::warn!("keep-unlocked: no client registered — withdrawing");
+                    shut(&generation, gen, &challenge);
+                    return;
+                }
+                for cb in &targets {
+                    let _ = cb.onKeepUnlockedChallenge(nonce);
+                }
+
+                std::thread::sleep(CHALLENGE_DEADLINE);
+                if generation.load(Ordering::SeqCst) != gen {
+                    return;
+                }
+                if !ok.load(Ordering::SeqCst) {
+                    log::warn!(
+                        "keep-unlocked unanswered within {}s — withdrawing the lockdown \
+                         exemption. The client is gone, wedged, backgrounded, or past its \
+                         own window.",
+                        CHALLENGE_DEADLINE.as_secs()
+                    );
+                    shut(&generation, gen, &challenge);
+                    return;
+                }
+                std::thread::sleep(CHALLENGE_EVERY.saturating_sub(CHALLENGE_DEADLINE));
+            }
+        });
+    }
+
 }
 
 impl Interface for TarishService {}
@@ -1520,6 +1635,7 @@ impl ITarishService for TarishService {
             let secs = (duration_seconds.max(0) as u64).clamp(1, MAX_WINDOW);
             set_exempt(true);
             log::info!("authenticated window OPEN for {secs}s — lockdown exemption permitted");
+            self.start_keepalive(gen);
             let generation = self.auth_generation.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_secs(secs));
@@ -1531,6 +1647,41 @@ impl ITarishService for TarishService {
         } else {
             set_exempt(false);
             log::info!("authenticated window CLOSED — lockdown exemption withdrawn");
+        }
+        Ok(())
+    }
+
+    /// Answer an outstanding keep-unlocked challenge.
+    ///
+    /// Takes the nonce rather than comparing it, so one challenge can be answered exactly
+    /// once. A replayed reply then finds nothing outstanding and is treated as no answer at
+    /// all — which is the same as silence, and silence closes the window.
+    ///
+    /// Deliberately cannot OPEN anything. Only setAuthenticated does that, and only after a
+    /// real authentication; this can keep an already-open window alive and do nothing else.
+    /// If the window is already shut, answering does not resurrect it.
+    fn keepUnlocked(&self, nonce: i64) -> BinderResult<()> {
+        let taken = self.challenge.lock().unwrap().take();
+        match taken {
+            Some((want, sent)) if want == nonce => {
+                // Late is the same as absent: the deadline belongs to the daemon, and an
+                // answer that arrives after it has already cost the window.
+                if sent.elapsed() > CHALLENGE_DEADLINE {
+                    log::warn!(
+                        "keep-unlocked answered {}ms late — too late to count",
+                        sent.elapsed().as_millis()
+                    );
+                } else {
+                    log::debug!("keep-unlocked confirmed");
+                    self.keepalive_ok.store(true, Ordering::SeqCst);
+                }
+            }
+            Some((want, _)) => {
+                // Wrong nonce with one outstanding: the challenge is consumed either way, so
+                // a flood of guesses cannot be used to keep answering until one lands.
+                log::warn!("keep-unlocked answered with the wrong nonce ({nonce} != {want})");
+            }
+            None => log::warn!("keep-unlocked answered with nothing outstanding — ignoring"),
         }
         Ok(())
     }

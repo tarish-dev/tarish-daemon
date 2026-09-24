@@ -421,4 +421,19 @@ interface ITarishService {
      * APPENDED LAST -- transaction codes are positional.
      */
     void setAuthenticated(boolean authenticated, int durationSeconds);
+
+    /**
+     * Answer a keep-unlocked challenge. The reply half of
+     * ITarishCallback.onKeepUnlockedChallenge.
+     *
+     * Only the nonce from the most recent outstanding challenge is accepted, exactly once.
+     * A stale, repeated, guessed or absent nonce is the same as no answer, and the exemption
+     * is withdrawn on the daemon's own deadline.
+     *
+     * Answering does NOT open a window — only setAuthenticated does, and only after a real
+     * authentication. This keeps an already-open one alive and can do nothing else.
+     *
+     * APPENDED LAST -- transaction codes are positional.
+     */
+    void keepUnlocked(long nonce);
 }

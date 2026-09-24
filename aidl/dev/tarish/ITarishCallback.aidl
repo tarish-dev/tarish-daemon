@@ -107,4 +107,32 @@ oneway interface ITarishCallback {
      * APPENDED LAST -- transaction codes are positional.
      */
     void onTransferPinDisplay(long transferId, String pin);
+
+    /**
+     * Prove the app is still unlocked and still wants the lockdown exemption.
+     *
+     * Sent repeatedly by the daemon for as long as the exemption is held. The client must
+     * answer with ITarishService.keepUnlocked(nonce) before the daemon's deadline, or the
+     * exemption is withdrawn.
+     *
+     * SILENCE IS THE ANSWER THAT CLOSES IT. There is no "lock now" call to forget, no
+     * teardown path to get wrong, and nothing to deliver from a process that is being
+     * killed: an app that is gone, wedged, backgrounded or past its own window simply stops
+     * replying and the hole shuts by itself. That is the whole point of the design — the
+     * exemption is held open by continuous effort rather than closed by a final act.
+     *
+     * DO NOT ANSWER REFLEXIVELY. Replying from a plain callback handler would prove only
+     * that the process exists. The reply must be gated on the client's own state: its
+     * authenticated window still open, and a person actually in front of it. See
+     * AuthWindow.isOpen() in the app.
+     *
+     * The nonce is single-use and unpredictable, and is only about FRESHNESS — it stops a
+     * stale reply counting for a later challenge. It is not an authenticity check and does
+     * not need to be: this callback goes to a binder only the client holds, and the reply
+     * arrives on a service reachable only from the client's own SELinux domain, keyed on
+     * package name AND platform signature. Nothing else on the device can answer at all.
+     *
+     * APPENDED LAST -- transaction codes are positional.
+     */
+    void onKeepUnlockedChallenge(long nonce);
 }
