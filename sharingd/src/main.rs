@@ -123,6 +123,15 @@ const WANT_PROP: &str = "tarish.awdl.wanted";
 /// The Wi-Fi frequency, published for tarishd so it can choose the opposite band.
 const STA_FREQ_PROP: &str = "tarish.awdl.sta_freq";
 
+/// Whether an authenticated window is open, published for tarishd.
+///
+/// tarishd moves its routing rule above or below Android's VPN kill-switch on this, and
+/// that priority is the entire privilege -- see tarishd's route.rs. Under the already
+/// labelled `tarish.awdl.` prefix, so it needs no new SELinux type: this daemon has
+/// set_prop on tarish_awdl_prop and tarishd has only get_prop, which is the direction
+/// required.
+const EXEMPT_PROP: &str = "tarish.awdl.exempt";
+
 /// Peers found by the discovery thread. Shared rather than owned by the service
 /// so discovery keeps running whether or not a client is bound — a device must
 /// stay discoverable with the app closed.
@@ -848,6 +857,32 @@ fn write_property(name: &str, value: &str) -> bool {
     unsafe { __system_property_set(n.as_ptr(), v.as_ptr()) == 0 }
 }
 
+/// Publish whether the lockdown exemption is currently earned.
+///
+/// FAILS CLOSED IN BOTH DIRECTIONS, which is why the failure to CLEAR is the loud one. If
+/// setting "1" fails the exemption simply never arrives and sharing is blocked under
+/// lockdown -- annoying, safe. If clearing "0" fails the exemption OUTLIVES the window,
+/// which is the one outcome this feature exists to prevent, so it is logged at error.
+///
+/// tarishd additionally treats anything that is not "1" as false, so a property that was
+/// never written at all is already the safe value.
+fn set_exempt(on: bool) {
+    let ok = write_property(EXEMPT_PROP, if on { "1" } else { "0" });
+    if !ok {
+        if on {
+            log::warn!(
+                "could not set {EXEMPT_PROP}=1 — the lockdown exemption will not be \
+                 granted, so sharing stays blocked while a kill-switch is active"
+            );
+        } else {
+            log::error!(
+                "COULD NOT CLEAR {EXEMPT_PROP} — the lockdown exemption may outlive its \
+                 window. Check set_prop(tarishsharingd, tarish_awdl_prop)"
+            );
+        }
+    }
+}
+
 /// Tell tarishd whether the AWDL radio is wanted.
 ///
 /// WHY A THREAD AND NOT A WRITE AT EACH CALL SITE
@@ -1014,6 +1049,9 @@ struct TarishService {
     /// Bumped by every setDiscoverable call so an older auto-off timer knows it has
     /// been superseded and must not switch visibility off under a newer request.
     visibility_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Supersedes a pending auth-window expiry, so re-authenticating cannot be closed by
+    /// the previous window's timer. Same pattern as visibility_generation.
+    auth_generation: Arc<std::sync::atomic::AtomicU64>,
     discoverable: Discoverable,
     /// Whether a client is in the foreground. Governs the radio, not visibility.
     active: Arc<AtomicBool>,
@@ -1329,6 +1367,7 @@ impl TarishService {
             refresh_now: Arc::new(AtomicBool::new(false)),
             reset_identity: Arc::new(AtomicBool::new(false)),
             visibility_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            auth_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             discoverable,
             active: Arc::new(AtomicBool::new(false)),
             // NOT -1: that now MEANS something. -1 is the client saying the Wi-Fi
@@ -1451,6 +1490,42 @@ impl ITarishService for TarishService {
         // stay resident.
         self.discoverable.store(discoverable, Ordering::SeqCst);
         log::info!("discoverable={discoverable} duration={duration_seconds}s");
+        Ok(())
+    }
+
+    /// Open or close the window during which the VPN lockdown exemption is permitted.
+    ///
+    /// All this does is publish a boolean that tarishd reads; tarishd moves its routing
+    /// rule above or below Android's kill-switch accordingly. See route.rs for why that
+    /// priority IS the privilege, and main.rs EXEMPT_PROP for why a property rather than
+    /// binder carries it into the process holding CAP_NET_ADMIN.
+    ///
+    /// CAPPED HERE, not trusted from the caller. A window is a window; a client asking for
+    /// a day is either confused or hostile and gets ten minutes either way.
+    ///
+    /// The generation counter is the same pattern setDiscoverable uses, and for the same
+    /// reason: re-authenticating must supersede the previous timer rather than race it, or
+    /// an earlier expiry closes a window a later authentication just opened.
+    fn setAuthenticated(&self, authenticated: bool, duration_seconds: i32) -> BinderResult<()> {
+        const MAX_WINDOW: u64 = 600;
+
+        let gen = self.auth_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        if authenticated {
+            let secs = (duration_seconds.max(0) as u64).clamp(1, MAX_WINDOW);
+            set_exempt(true);
+            log::info!("authenticated window OPEN for {secs}s — lockdown exemption permitted");
+            let generation = self.auth_generation.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(secs));
+                if generation.load(Ordering::SeqCst) == gen {
+                    set_exempt(false);
+                    log::info!("authenticated window expired after {secs}s — exemption withdrawn");
+                }
+            });
+        } else {
+            set_exempt(false);
+            log::info!("authenticated window CLOSED — lockdown exemption withdrawn");
+        }
         Ok(())
     }
 
@@ -2887,7 +2962,18 @@ fn main() {
     // Build marker. The AIDL surface has grown twice without the device appearing to
     // gain the new transactions, so the running code has to be identifiable from the log
     // rather than inferred from a file hash.
-    log::info!("starting (aidl: policy+devicename, 17 transactions)");
+    log::info!("starting (aidl: policy+devicename, 18 transactions)");
+
+    // START WITH THE EXEMPTION WITHDRAWN, ALWAYS.
+    //
+    // The authenticated window lives in a system property, which outlives this process. If
+    // this daemon is killed or panics while a window is open, that property keeps saying
+    // "1" and tarishd keeps its routing rule above the VPN kill-switch -- with nobody left
+    // who can close it. init restarts us (restart_period 10), so clearing it here is what
+    // turns a crash into a closed window instead of a permanent exemption.
+    //
+    // Cheap and unconditional: at startup there is by definition no authenticated user.
+    set_exempt(false);
 
     let peers: PeerTable = Arc::new(Mutex::new(Vec::new()));
 

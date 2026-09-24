@@ -392,4 +392,33 @@ interface ITarishService {
      * APPENDED LAST -- transaction codes are positional.
      */
     String[] getQuickShareLanPeers();
+
+    /**
+     * Report that a person has just authenticated to this device, opening a window during
+     * which the VPN lockdown exemption is permitted.
+     *
+     * WHAT THIS DOES AND DOES NOT BUY. It changes exactly one thing: the priority of the
+     * daemon's routing rule, from below Android's kill-switch to above it. It does not
+     * enable sharing, make the device discoverable, or grant any network reach beyond the
+     * link-local route that rule already points at. With no always-on VPN in lockdown mode
+     * it changes nothing observable at all.
+     *
+     * The CALLER does the authenticating -- BiometricPrompt or the device credential -- for
+     * the same reason the app owns BLE and Wi-Fi Direct: it is framework API a native
+     * service cannot reach. That makes this a report, not a proof, and the trust boundary
+     * is the caller's identity: the service is reachable only from our own app's SELinux
+     * domain, keyed on package name AND platform signature (see sepolicy/tarish_app.te).
+     *
+     * durationSeconds is capped by the daemon (ten minutes). Passing false, or letting the
+     * window lapse, demotes the rule back below the kill-switch.
+     *
+     * THREE INDEPENDENT THINGS CLOSE THE WINDOW, because the property outlives the process
+     * that set it: the caller closing it, the daemon's own capped timer, and the daemon
+     * clearing it unconditionally at startup -- so a crash mid-window becomes a closed
+     * window once init restarts us, rather than an exemption nobody is left to withdraw.
+     * The daemon does NOT watch for this client's death; the cap is what bounds that case.
+     *
+     * APPENDED LAST -- transaction codes are positional.
+     */
+    void setAuthenticated(boolean authenticated, int durationSeconds);
 }
