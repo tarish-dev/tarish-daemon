@@ -2753,6 +2753,7 @@ fn start_quickshare_discovery(
     lan: QsLanPeers,
     port: Arc<std::sync::atomic::AtomicU16>,
     ident: Arc<quickshare::discovery::QsIdentity>,
+    discoverable: Discoverable,
 ) {
     std::thread::spawn(move || {
         const IFACE: &str = "wlan0";
@@ -2782,8 +2783,27 @@ fn start_quickshare_discovery(
             let mut since_announce = Duration::from_secs(99);
             let mut since_query = Duration::from_secs(99);
             loop {
+                // THE VISIBILITY WINDOW GATES THIS TOO.
+                //
+                // It did not, and that made the window a half-measure: turning visibility
+                // off, or letting the 10 minutes lapse, stopped AirDrop answering /Discover
+                // and /Ask while Quick Share carried on advertising this device by name to
+                // every peer on the LAN. A control that covers one of two protocols is worse
+                // than none, because the UI says you are not visible and you are.
+                //
+                // Tearing the responder DOWN rather than just skipping the announce is the
+                // point: it stops answering queries as well as volunteering announcements.
+                // Dropping it sends the mDNS goodbye its Drop impl owes the network, so
+                // peers forget us promptly instead of holding a stale entry for the record
+                // TTL -- which, measured against a real Mac, is 4500 seconds.
+                let visible = discoverable.load(Ordering::SeqCst);
+                if !visible && responder.is_some() {
+                    log::info!("quickshare: no longer advertising (not discoverable)");
+                    responder = None;
+                }
+
                 let bound = port.load(Ordering::SeqCst);
-                if responder.is_none() && bound != 0 {
+                if visible && responder.is_none() && bound != 0 {
                     match quickshare::discovery::QsResponder::new(IFACE, &ident, bound) {
                         Ok(r) => {
                             log::info!(
@@ -2914,6 +2934,10 @@ fn main() {
     // there is somewhere to report them -- so the handle has to be taken while it can be.
     let qs_lan = service.qs_lan.clone();
     let qs_ident = service.qs_ident.clone();
+    // Same reason as the two above: taken while the service is still reachable, because the
+    // Quick Share discovery thread needs the visibility flag and is started after the
+    // service has moved into the binder.
+    let qs_discoverable = service.discoverable.clone();
     // The port the Quick Share listener actually bound, for the responder to advertise.
     // Zero until it is up, which is how the responder knows not to announce yet.
     let qs_port = Arc::new(std::sync::atomic::AtomicU16::new(0));
@@ -2934,7 +2958,7 @@ fn main() {
     // Quick Share identity, logged once. Discovery is not wired yet; this proves the
     // derivation on real hardware rather than only in reasoning.
     log::info!("quickshare: {}", quickshare::describe_identity(&device_name()));
-    start_quickshare_discovery(qs_lan, qs_port, qs_ident);
+    start_quickshare_discovery(qs_lan, qs_port, qs_ident, qs_discoverable);
 
     // One thread is plenty for a skeleton; the transfer work will want more.
     binder::ProcessState::join_thread_pool();

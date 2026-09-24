@@ -392,6 +392,18 @@ pub struct QsResponder {
     port: u16,
 }
 
+/// Withdraw on the way out, however the responder is dropped.
+///
+/// On Drop rather than only at the call site, because there are several ways this object
+/// goes away -- the visibility window closing, wlan0 losing its address, the browse loop
+/// rebuilding -- and every one of them owes the network a goodbye. Relying on each caller
+/// to remember is how one path ends up leaving the device listed.
+impl Drop for QsResponder {
+    fn drop(&mut self) {
+        self.stop_advertising();
+    }
+}
+
 impl QsResponder {
     pub fn new(iface: &str, ident: &QsIdentity, port: u16) -> io::Result<Self> {
         let ifindex = crate::mdns::ifindex_of(iface)?;
@@ -439,6 +451,11 @@ impl QsResponder {
 
     /// The four records, as answers. Shared by the unsolicited announcement and by replies.
     fn answers(&self) -> Vec<Vec<u8>> {
+        self.answers_with_ttl(TTL_SECS)
+    }
+
+    /// The same records at an arbitrary TTL. Zero makes them a withdrawal.
+    fn answers_with_ttl(&self, ttl: u32) -> Vec<Vec<u8>> {
         let mut txt = Vec::new();
         let entry = format!(
             "{}={}",
@@ -458,14 +475,33 @@ impl QsResponder {
             dns::record(
                 quickshare::endpoint::SERVICE_TYPE,
                 dns::TYPE_PTR,
-                TTL_SECS,
+                ttl,
                 &dns::encode_name(&self.instance),
                 false,
             ),
-            dns::record(&self.instance, dns::TYPE_SRV, TTL_SECS, &srv, true),
-            dns::record(&self.instance, dns::TYPE_TXT, TTL_SECS, &txt, true),
-            dns::record(&self.host, dns::TYPE_A, TTL_SECS, &self.addr.octets(), true),
+            dns::record(&self.instance, dns::TYPE_SRV, ttl, &srv, true),
+            dns::record(&self.instance, dns::TYPE_TXT, ttl, &txt, true),
+            dns::record(&self.host, dns::TYPE_A, ttl, &self.addr.octets(), true),
         ]
+    }
+
+    /// Withdraw: the same records at TTL 0, which is the RFC 6762 s10.1 goodbye.
+    ///
+    /// GOING QUIET IS NOT THE SAME AS LEAVING, and here the gap is enormous. These records
+    /// carry TTL_SECS, and a real peer's are 4500 -- measured off a Mac on the wire. A
+    /// receiver that simply stops announcing stays on every peer's list until that expires,
+    /// so someone can pick this device out of a share sheet, long after it stopped
+    /// listening, and have the transfer fail.
+    ///
+    /// That is what makes the visibility window mean anything: being invisible has to be
+    /// something we SAY, not something the other side eventually infers. mdns.rs reached the
+    /// same conclusion for AirDrop, where the TTL is 120 -- here it is 37 times worse.
+    ///
+    /// Best effort. A goodbye that does not make it costs a stale entry, so it is not worth
+    /// failing a teardown over.
+    pub fn stop_advertising(&self) {
+        let pkt = dns::response(&self.answers_with_ttl(0));
+        let _ = self.tx.send_to(&pkt, SocketAddrV4::new(MDNS_V4, MDNS_PORT));
     }
 
     /// Say we are here, unprompted. Sent on start-up and periodically.
