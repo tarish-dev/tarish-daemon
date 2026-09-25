@@ -24,7 +24,8 @@ fn usage() -> ! {
     eprintln!(
         "tarishctl — drive the Tarish daemon (userdebug only)
 
-  peers                       list discovered peers: id protocol name
+  peers                       list discovered peers: id protocol state name
+                              (state 0 = receptive, 1 = screen off / AirDrop off)
   name [<new>]                get or set this device's name
   discoverable <on|off> [sec] advertise, or stop
   send <peer-id> <file>...    send over whatever transport suits the peer
@@ -75,9 +76,11 @@ fn run() -> Result<(), String> {
     match args[0].as_str() {
         "peers" => {
             for p in svc.getPeers().map_err(|e| e.to_string())? {
-                // protocol is the number the AIDL uses; the harness matches on it rather
-                // than on a name that might be translated or reworded.
-                println!("{} {} {}", p.id, p.protocol, p.name);
+                // protocol and state are the numbers the AIDL uses; the harness matches
+                // on them rather than on a name that might be translated or reworded.
+                // The name comes LAST because it can contain spaces -- gos-e2e.sh
+                // rebuilds it from field 4 onwards, so a new column goes before it.
+                println!("{} {} {} {}", p.id, p.protocol, p.state, p.name);
             }
         }
         "qs-peers" => {

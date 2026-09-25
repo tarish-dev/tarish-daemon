@@ -53,4 +53,22 @@ parcelable TarishPeer {
      * side by side, with both off Wi-Fi.
      */
     int psm;
+
+    /**
+     * Whether the peer will take a transfer right now -- one of ITarishService.STATE_*.
+     *
+     * STATE_SCREEN_OFF means the device is still on the link and still answering, but its
+     * owner locked it or switched AirDrop off. Both look identical on the air and both
+     * refuse an offer, so the app shows the same thing stock does: the tile stays for a
+     * few seconds labelled "screen off", then goes. It comes back the moment the device
+     * is receptive again, without waiting for rediscovery.
+     *
+     * Read off the peer's BLE state message, not off mDNS -- iOS withdraws nothing over
+     * mDNS when it locks, which is why this field exists. Always STATE_RECEPTIVE for
+     * Quick Share peers: a Quick Share device that stops being receptive stops
+     * advertising, and simply drops out of the list.
+     *
+     * APPENDED LAST -- parcelable fields are positional too.
+     */
+    int state;
 }

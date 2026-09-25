@@ -146,6 +146,14 @@ interface ITarishService {
     const int MODE_SEND = 2;
     const int MODE_BOTH = 3;
 
+    /** TarishPeer.state: the peer will take a transfer now. */
+    const int STATE_RECEPTIVE = 0;
+    /**
+     * TarishPeer.state: present on the link but not receptive -- screen locked, or
+     * AirDrop switched off. The same thing on the air, and the same thing for a sender.
+     */
+    const int STATE_SCREEN_OFF = 1;
+
     /**
      * Install the policy this device is to enforce.
      *
@@ -457,4 +465,30 @@ interface ITarishService {
      * APPENDED LAST -- transaction codes are positional.
      */
     boolean isLockdownActive();
+
+    /**
+     * Report an Apple Continuity advertisement the app saw: the manufacturer data under
+     * company id 0x004C, as scanned, with the address it came from and its RSSI.
+     *
+     * THIS IS HOW A PEER THAT LEFT GETS REMOVED IN SECONDS RATHER THAN AN HOUR. iOS
+     * advertises AirDrop over mDNS with a 4500 s TTL and withdraws nothing when the
+     * screen locks, AirDrop is switched off, or the phone walks away. The signal for all
+     * three is on BLE: the Nearby Info message carries a bit that is set exactly while
+     * the device will take an AirDrop, and a device that is gone stops advertising. Both
+     * were measured on two iPhones; the table is in libtarish_protocol's `apple` module.
+     *
+     * THE APP OWNS THE RADIO; THE DAEMON OWNS THE DECODER -- the same split as
+     * reportBlePeer, and the same reason. The app forwards the bytes; the daemon reads
+     * the bit, counts the devices, and reacts: it probes every AirDrop peer at once (a
+     * unicast mDNS question each), labels peers STATE_SCREEN_OFF when the count says
+     * none is receptive, and drops a peer that stops answering.
+     *
+     * Forward a sighting when the address is new, when its bytes change, and otherwise
+     * about once a second per address as a keep-alive; the daemon treats an address it
+     * has not heard for a couple of seconds as gone. A random address rotates on every
+     * state change, so it is a dedupe key within a session, never an identity.
+     *
+     * APPENDED LAST -- transaction codes are positional.
+     */
+    void reportAppleAdvertisement(String address, int rssi, in byte[] manufacturerData);
 }

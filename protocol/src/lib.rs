@@ -28,6 +28,7 @@
 //! | what may happen when | `fsm` | **done** |
 //! | moving onto a faster medium | `upgrade` | **done** |
 //! | the BLE wake-up pulse and endpoint advertisement | `ble` | **done** |
+//! | Apple's BLE state message: will that iPhone take an AirDrop now | `apple` | **done**, measured on two iPhones |
 //! | service identity and the addresses from it | `service` | **done** |
 //! | the whole stack, two peers | `end_to_end` | **done**, one share start to finish |
 //!
@@ -51,6 +52,7 @@
 #[cfg(test)]
 mod end_to_end;
 
+pub mod apple;
 pub mod ble;
 pub mod channel;
 pub mod d2d;

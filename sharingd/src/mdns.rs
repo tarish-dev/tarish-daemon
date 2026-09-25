@@ -53,7 +53,28 @@ pub struct Peer {
     ///
     /// The peer's own TTL is the right clock, so this holds it.
     pub expires_at: Instant,
+    /// Questions this peer owes an answer to: unicast probes aimed at it, and multicast
+    /// QU queries every responder must answer. Zeroed by any record it sends.
+    ///
+    /// THE TTL IS NOT A LIVENESS SIGNAL, and this is what replaces it for that job. iOS
+    /// advertises AirDrop with a 4500 s TTL and sends a goodbye only on a graceful
+    /// withdrawal; screen off, AirDrop off and walking away send nothing. So a peer that
+    /// left stays valid by its own clock for seventy-five minutes, and the person taps a
+    /// device that cannot answer. `LOST_UNANSWERED` of these in a row, with nothing heard
+    /// for `LOST_AFTER`, is "gone" -- a few seconds, not an hour.
+    pub unanswered: u32,
+    /// When BLE said this peer stopped being receptive -- screen locked or AirDrop
+    /// switched off, which look the same on the air. None while receptive, or while
+    /// there is no BLE evidence either way. See `Browser::mark_unreceptive`.
+    pub unreceptive_since: Option<Instant>,
 }
+
+/// Unanswered questions before a peer is presumed gone. Three, because a single frame
+/// can miss an AWDL availability window, and two in a row is still a bad moment.
+const LOST_UNANSWERED: u32 = 3;
+/// And nothing heard from it for at least this long. Probes run a second apart after a
+/// BLE event, so this is the floor on how fast a departed peer can be dropped.
+const LOST_AFTER: Duration = Duration::from_secs(4);
 
 impl Peer {
     /// Apple's instance names are 12 hex characters, which is an identifier and
@@ -391,7 +412,71 @@ impl Browser {
         let pkt = dns::query_with(AIRDROP_SERVICE, unicast);
         let dst = SocketAddrV6::new(MDNS_GROUP, MDNS_PORT, 0, self.ifindex);
         self.sock.send_to(&pkt, dst)?;
+        // A QU question must be answered by every responder that has the record, so
+        // each known peer now owes one. A QM question is suppressible and counts for
+        // nothing: silence after it is the expected case, not evidence.
+        if unicast {
+            for p in self.peers.values_mut() {
+                p.unanswered = p.unanswered.saturating_add(1);
+            }
+        }
         Ok(())
+    }
+
+    /// Ask every peer we hold an address for, directly, whether it is still there.
+    ///
+    /// A unicast QU query to the peer's own link-local address on :5353 (RFC 6762 §5.5).
+    /// The answer comes back unicast to this socket and is absorbed like any other
+    /// record, which zeroes `unanswered`; no answer leaves the count where the question
+    /// put it. This is the whole liveness mechanism -- a peer is kept by answering, not by
+    /// the TTL it advertised.
+    ///
+    /// Returns how many peers were asked.
+    pub fn probe(&mut self) -> usize {
+        let pkt = dns::query_with(AIRDROP_SERVICE, true);
+        let ifindex = self.ifindex;
+        let mut asked = 0;
+        for p in self.peers.values_mut() {
+            let Some(addr) = p.addr else { continue };
+            let dst = SocketAddrV6::new(addr, MDNS_PORT, 0, ifindex);
+            match self.sock.send_to(&pkt, dst) {
+                Ok(_) => {
+                    p.unanswered = p.unanswered.saturating_add(1);
+                    asked += 1;
+                }
+                Err(e) => log::debug!("probe of {} failed: {e}", short(&p.instance)),
+            }
+        }
+        asked
+    }
+
+    /// Record what BLE says about the peers as a population.
+    ///
+    /// `true` means every listed peer is unreceptive right now: the advertisement count
+    /// covers them all and none carries the receptive bit. `false` means either that
+    /// something is receptive or that there is no evidence, and in both cases the label
+    /// comes off -- a label that cannot be attributed is worse than none.
+    ///
+    /// A POPULATION, NOT A NAME. A BLE address is random and rotates, so it cannot be tied
+    /// to an mDNS instance. With one iPhone in range this is exact; with two, one of which
+    /// locks, the count says "one of them" and this says nothing. The daemon's probes then
+    /// find the one that stops answering, if it does.
+    pub fn mark_unreceptive(&mut self, unreceptive: bool) {
+        let now = Instant::now();
+        for p in self.peers.values_mut() {
+            if unreceptive {
+                if p.unreceptive_since.is_none() {
+                    log::info!("peer {} is no longer receptive (screen off or AirDrop off)", short(&p.instance));
+                    p.unreceptive_since = Some(now);
+                }
+            } else if p.unreceptive_since.take().is_some() {
+                log::info!("peer {} is receptive again", short(&p.instance));
+            }
+        }
+    }
+
+    pub fn peer_count(&self) -> usize {
+        self.peers.len()
     }
 
     /// Restart the QU burst — call when a browse begins, so the first queries of a new
@@ -467,10 +552,23 @@ impl Browser {
                                 addr: None,
                                 last_seen: Instant::now(),
                                 expires_at: Instant::now() + Self::ttl_of(rec),
+                                unanswered: 0,
+                                unreceptive_since: None,
                             }
                         });
                         e.last_seen = Instant::now();
+                        e.unanswered = 0;
                         e.expires_at = Instant::now() + Self::ttl_of(rec);
+                    }
+                }
+                // TXT carries only `flags`, which we do not use -- but it arrives in every
+                // answer to a probe, so it counts as the peer being heard.
+                dns::TYPE_TXT => {
+                    if let Some(p) = self.peers.get_mut(&rec.name) {
+                        p.last_seen = Instant::now();
+                        p.unanswered = 0;
+                        let t = Instant::now() + Self::ttl_of(rec);
+                        p.expires_at = if rec.ttl == 0 { t } else { p.expires_at.max(t) };
                     }
                 }
                 dns::TYPE_SRV => {
@@ -483,6 +581,7 @@ impl Browser {
                             p.port = port;
                             p.host = host;
                             p.last_seen = Instant::now();
+                            p.unanswered = 0;
                             // `max` everywhere EXCEPT a withdrawal: a goodbye must shorten
                             // the lease, which is the one thing `max` cannot do.
                             let t = Instant::now() + Self::ttl_of(rec);
@@ -509,6 +608,7 @@ impl Browser {
                         if !p.host.is_empty() && p.host == rec.name {
                             p.addr = Some(addr);
                             p.last_seen = Instant::now();
+                            p.unanswered = 0;
                             let t = Instant::now() + Self::ttl_of(rec);
                             p.expires_at = if rec.ttl == 0 { t } else { p.expires_at.max(t) };
                         }
@@ -563,7 +663,18 @@ fn ttl_of(rec: &dns::Record) -> Duration {
     pub fn expire(&mut self, min_grace: Duration) {
         let now = Instant::now();
         self.peers.retain(|name, p| {
-            let keep = now < p.expires_at || now.duration_since(p.last_seen) < min_grace;
+            let silent = now.duration_since(p.last_seen);
+            // Asked repeatedly, heard nothing: gone, whatever its TTL says. This is the
+            // rule that actually removes a departed iPhone; the TTL rule below is the
+            // backstop for a peer we never managed to probe (no address yet).
+            if p.unanswered >= LOST_UNANSWERED && silent >= LOST_AFTER {
+                log::info!(
+                    "peer lost: {} — {} queries unanswered, nothing heard for {:.1}s",
+                    short(name), p.unanswered, silent.as_secs_f32()
+                );
+                return false;
+            }
+            let keep = now < p.expires_at || silent < min_grace;
             if !keep {
                 log::info!("peer lost: {}", short(name));
             }

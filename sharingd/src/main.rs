@@ -1104,6 +1104,9 @@ struct TarishService {
     names: PeerNames,
     query_now: QueryNow,
     refresh_now: QueryNow,
+    /// Set by reportAppleAdvertisement when a device stops being receptive; the browser
+    /// loop consumes it and probes every AirDrop peer at once. Same shape as query_now.
+    probe_now: QueryNow,
     /// Set by resetIdentity(); the browser loop consumes it to withdraw the old
     /// AirDrop identity, mint a fresh one, and re-advertise. Same signalling shape
     /// as refresh_now -- a binder thread sets it, the loop swaps it.
@@ -1142,6 +1145,9 @@ struct TarishService {
     /// discovery mechanisms, two tables -- merged only at getPeers, where each row
     /// carries the protocol that found it.
     ble_peers: Arc<Mutex<std::collections::HashMap<String, BlePeer>>>,
+    /// The Apple devices the app hears on BLE and their receptive state. Read by the
+    /// discovery loop, which turns a change in the population into probes and labels.
+    apple: AppleNearbyTable,
     /// Quick Share peers reachable over the LAN, published by the mDNS browser.
     qs_lan: QsLanPeers,
     /// Who we say we are when receiving. Shared with the mDNS responder so both wires
@@ -1180,6 +1186,61 @@ struct BlePeer {
 /// it would sit in the list forever and the first send to it would fail with no
 /// explanation.
 const BLE_PEER_TTL: Duration = Duration::from_secs(20);
+
+/// One Apple device's BLE state message, by the random address it advertises from.
+struct AppleAdvertiser {
+    rssi: i32,
+    info: tarish_protocol::apple::NearbyInfo,
+    last_seen: std::time::Instant,
+}
+
+/// What BLE says about the Apple devices around us: how many there are, and how many
+/// would take an AirDrop right now. Fed by reportAppleAdvertisement; the decoder and the
+/// measurement behind the receptive bit are in libtarish_protocol's `apple` module.
+#[derive(Default)]
+struct AppleNearby {
+    by_address: std::collections::HashMap<String, AppleAdvertiser>,
+    /// When the app last reported anything at all. Silence here means the app is not
+    /// scanning -- closed, or Bluetooth off -- which is "no evidence", not "nobody".
+    last_report: Option<std::time::Instant>,
+}
+
+/// The population BLE sees at one moment.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct ApplePopulation {
+    /// Whether the app has reported recently enough for the counts to mean anything.
+    live: bool,
+    /// Apple devices heard within `APPLE_SILENT_AFTER`.
+    present: usize,
+    /// Of those, the ones carrying the receptive bit.
+    receptive: usize,
+}
+
+/// An address not heard for this long is gone. The app refreshes each live address
+/// about once a second, so this is two missed keep-alives. It also bounds how long an
+/// address that rotated away at a lock keeps counting as receptive.
+const APPLE_SILENT_AFTER: Duration = Duration::from_secs(2);
+/// No report at all for this long means the scanner is not running. The counts are then
+/// no evidence, and every label comes off.
+const APPLE_LIVE_WINDOW: Duration = Duration::from_secs(4);
+
+impl AppleNearby {
+    fn population(&mut self) -> ApplePopulation {
+        let now = std::time::Instant::now();
+        self.by_address.retain(|_, a| now.duration_since(a.last_seen) < APPLE_SILENT_AFTER);
+        ApplePopulation {
+            live: self.last_report.map_or(false, |t| now.duration_since(t) < APPLE_LIVE_WINDOW),
+            present: self.by_address.len(),
+            receptive: self.by_address.values().filter(|a| a.info.receptive()).count(),
+        }
+    }
+}
+
+type AppleNearbyTable = Arc<Mutex<AppleNearby>>;
+
+fn receptive_word(receptive: bool) -> &'static str {
+    if receptive { "receptive" } else { "not receptive" }
+}
 
 /// What we tell a peer we could upgrade to, when the socket arrived over Bluetooth.
 ///
@@ -1422,6 +1483,19 @@ fn denied_policy() -> TarishPolicy {
 const PROTOCOL_AIRDROP: i32 = 0;
 const PROTOCOL_QUICKSHARE: i32 = 1;
 
+/// TarishPeer.state -- see the AIDL.
+const STATE_RECEPTIVE: i32 = 0;
+const STATE_SCREEN_OFF: i32 = 1;
+
+/// A peer labelled "screen off" for this long is taken off the list, as stock does. It
+/// stays in the browser's table and keeps being probed, so it is back the instant BLE
+/// says it is receptive again -- no rediscovery, no waiting for an announcement.
+const SCREEN_OFF_HIDE_AFTER: Duration = Duration::from_secs(6);
+
+fn screen_off_hidden(p: &mdns::Peer) -> bool {
+    p.unreceptive_since.map_or(false, |t| t.elapsed() >= SCREEN_OFF_HIDE_AFTER)
+}
+
 const MODE_OFF: i32 = 0;
 const MODE_RECEIVE: i32 = 1;
 const MODE_SEND: i32 = 2;
@@ -1443,6 +1517,7 @@ impl TarishService {
             names: Arc::new(Mutex::new(std::collections::HashMap::new())),
             query_now: Arc::new(AtomicBool::new(false)),
             refresh_now: Arc::new(AtomicBool::new(false)),
+            probe_now: Arc::new(AtomicBool::new(false)),
             reset_identity: Arc::new(AtomicBool::new(false)),
             visibility_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             auth_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1461,6 +1536,7 @@ impl TarishService {
             sta_freq: Arc::new(std::sync::atomic::AtomicI32::new(i32::MIN)),
             peers,
             ble_peers: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            apple: Arc::new(Mutex::new(AppleNearby::default())),
             qs_lan: Arc::new(Mutex::new(Vec::new())),
             qs_ident: Arc::new(quickshare::discovery::QsIdentity::new(&device_name())),
             policy: Arc::new(Mutex::new(denied_policy())),
@@ -2010,6 +2086,61 @@ impl ITarishService for TarishService {
         Ok(())
     }
 
+    fn reportAppleAdvertisement(&self, address: &str, rssi: i32, data: &[u8]) -> BinderResult<()> {
+        use tarish_protocol::apple;
+        let now = std::time::Instant::now();
+        let mut table = self.apple.lock().map_err(|_| Status::from(StatusCode::UNKNOWN_ERROR))?;
+        table.last_report = Some(now);
+        let Some(info) = apple::nearby_info(data) else {
+            // A sender beacon (a share sheet is open) or a type we do not read. The
+            // former is worth a debug line: its contact hashes are stable across address
+            // rotations, the one thing that could tie an address to a device one day.
+            for m in apple::parse(data) {
+                if let apple::Message::AirDrop(b) = m {
+                    log::debug!(
+                        "apple airdrop beacon from {address} rssi={rssi} v{} hashes={:02x?}",
+                        b.version, b.hashes
+                    );
+                }
+            }
+            return Ok(());
+        };
+        let mut lost_receptive = false;
+        match table.by_address.get_mut(address) {
+            Some(a) => {
+                if a.info != info {
+                    log::info!(
+                        "apple nearby {address}: flags 0x{:02x} -> 0x{:02x} action=0x{:02x} rssi {} -> {rssi} ({} -> {})",
+                        a.info.flags, info.flags, info.action, a.rssi,
+                        receptive_word(a.info.receptive()), receptive_word(info.receptive())
+                    );
+                    lost_receptive = a.info.receptive() && !info.receptive();
+                }
+                a.info = info;
+                a.rssi = rssi;
+                a.last_seen = now;
+            }
+            None => {
+                log::info!(
+                    "apple nearby {address}: new, rssi={rssi} flags=0x{:02x} action=0x{:02x} ({})",
+                    info.flags, info.action, receptive_word(info.receptive())
+                );
+                table.by_address.insert(
+                    address.to_string(),
+                    AppleAdvertiser { rssi, info, last_seen: now },
+                );
+            }
+        }
+        drop(table);
+        // A device that just stopped being receptive is the event this path exists for.
+        // Probe now rather than on the next timer: the person is probably looking at the
+        // list, and the tile should change while they are.
+        if lost_receptive {
+            self.probe_now.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
     fn sendFilesOnSocket(
         &self,
         peer_id: &str,
@@ -2265,7 +2396,10 @@ impl ITarishService for TarishService {
         // address and port are still good.
         let mut newest: std::collections::HashMap<String, &mdns::Peer> =
             std::collections::HashMap::new();
-        for p in peers.iter() {
+        // A peer that has read as "screen off" for a few seconds is left out, as stock
+        // does. It is still in the browser's table, still probed, and reappears here the
+        // moment BLE says it is receptive again.
+        for p in peers.iter().filter(|p| !screen_off_hidden(p)) {
             let key = p
                 .addr
                 .and_then(|a| names.get(&a.to_string()).cloned())
@@ -2333,6 +2467,9 @@ impl ITarishService for TarishService {
                     bluetoothMac: p.mac.clone().unwrap_or_default(),
                     bleAddress: p.ble_address.clone(),
                     psm: p.psm as i32,
+                    // A Quick Share device that stops being receptive stops advertising
+                    // and falls out of the list by BLE_PEER_TTL; there is no second state.
+                    state: STATE_RECEPTIVE,
                 });
             }
         }
@@ -2365,6 +2502,7 @@ impl ITarishService for TarishService {
                 // Quick Share discovery runs on wlan0 and is not folded into this
                 // table yet; when it is, this is the field that keeps the two apart.
                 protocol: PROTOCOL_AIRDROP,
+                state: if p.unreceptive_since.is_some() { STATE_SCREEN_OFF } else { STATE_RECEPTIVE },
             })
             .chain(quickshare)
             .collect())
@@ -2641,6 +2779,15 @@ fn probe_name(names: PeerNames, instance: String, target: send::Target) {
     });
 }
 
+/// Unicast liveness probe cadence between BLE events. One small packet per peer; three
+/// unanswered drop it (mdns::LOST_UNANSWERED), so this also bounds how long a peer that
+/// left with no BLE signal at all stays listed.
+const PROBE_EVERY: Duration = Duration::from_secs(3);
+/// After a BLE event -- one fewer device receptive or present -- this many probes, this
+/// far apart, so the peer that stopped answering is gone within a few seconds.
+const PROBE_BURST: u32 = 3;
+const PROBE_BURST_EVERY: Duration = Duration::from_secs(1);
+
 fn start_discovery(
     peers: PeerTable,
     names: PeerNames,
@@ -2648,6 +2795,8 @@ fn start_discovery(
     query_now: QueryNow,
     refresh_now: QueryNow,
     reset_identity: QueryNow,
+    apple: AppleNearbyTable,
+    probe_now: QueryNow,
 ) {
         let ifc = iface();
     std::thread::spawn(move || {
@@ -2683,6 +2832,9 @@ fn start_discovery(
         let mut since_query = Duration::from_secs(99);
         let mut since_announce = Duration::ZERO;
         let mut was_advertising = false;
+        let mut since_probe = Duration::ZERO;
+        let mut burst_left = 0u32;
+        let mut last_pop = ApplePopulation::default();
         loop {
             // tarishd holds AWDL only while something wants it, so mosey0 genuinely
             // disappears and comes back with a new index. Two things follow.
@@ -2880,6 +3032,51 @@ fn start_discovery(
                     Err(e) => log::warn!("rebind failed ({e}) — will retry"),
                 }
             }
+
+            // LIVENESS, which the TTL is not -- see mdns::Peer::unanswered.
+            //
+            // BLE first. The app forwards every Apple device's state message, and a
+            // change in that population -- one fewer receptive, one fewer present -- is
+            // the moment a peer locked, switched AirDrop off, or left. React at once
+            // with a burst of probes a second apart, so a peer that stopped answering is
+            // dropped within a few seconds of the person's action. Between events a
+            // slower cadence keeps every peer honest.
+            let pop = apple.lock().map(|mut a| a.population()).unwrap_or_default();
+            if pop != last_pop {
+                if pop.live || last_pop.live {
+                    log::info!(
+                        "apple nearby: {} present, {} receptive ({}); {} AirDrop peer(s) listed",
+                        pop.present, pop.receptive,
+                        if pop.live { "live" } else { "no reports — app not scanning" },
+                        browser.peer_count()
+                    );
+                }
+                if pop.present < last_pop.present || pop.receptive < last_pop.receptive {
+                    burst_left = PROBE_BURST;
+                }
+                last_pop = pop;
+            }
+            if probe_now.swap(false, Ordering::SeqCst) {
+                burst_left = PROBE_BURST;
+            }
+            let probe_every = if burst_left > 0 { PROBE_BURST_EVERY } else { PROBE_EVERY };
+            if since_probe >= probe_every {
+                let asked = browser.probe();
+                if burst_left > 0 {
+                    burst_left -= 1;
+                    log::info!("probe burst: asked {asked} peer(s), {burst_left} to go");
+                }
+                since_probe = Duration::ZERO;
+            }
+            // The label. Only when the population covers every listed peer and none of
+            // it is receptive. Anything less is a guess about WHICH one, and a wrong
+            // label on a device that is fine is worse than none -- so with two iPhones
+            // listed and one locked, nothing is labelled and the probes decide.
+            let listed = browser.peer_count();
+            browser.mark_unreceptive(
+                pop.live && listed > 0 && pop.receptive == 0 && pop.present >= listed,
+            );
+
             browser.poll();
             // Long enough to ride out a rotation and a missed announcement, short
             // enough that a device which has gone away stops being offered. Ninety
@@ -2894,6 +3091,7 @@ fn start_discovery(
             std::thread::sleep(Duration::from_millis(500));
             since_query += Duration::from_millis(500);
             since_announce += Duration::from_millis(500);
+            since_probe += Duration::from_millis(500);
         }
     });
 }
@@ -3291,6 +3489,8 @@ fn main() {
         service.query_now.clone(),
         service.refresh_now.clone(),
         service.reset_identity.clone(),
+        service.apple.clone(),
+        service.probe_now.clone(),
     );
     // The HTTP server refuses transfers while invisible and announces finished ones,
     // so it needs both the flag and the callback list the service owns.

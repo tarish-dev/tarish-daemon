@@ -53,6 +53,29 @@ that path is now tlink's shim. The **app README's** "current AWDL layer = libmos
 - **Consent is enforced in the daemon**, not the UI: an offer must be *accepted* before any
   upload is allowed, so a compromised UI cannot bypass the receive prompt.
 
+## Peer liveness — probes and the BLE receptive bit, not the TTL
+
+iOS advertises `_airdrop._tcp` with a 4500 s TTL and withdraws nothing over mDNS when the
+phone locks, AirDrop is switched off, or it leaves. Two things replace the TTL as the
+liveness signal (2026-09-25):
+
+- **Unicast mDNS probes.** `tarishsharingd` sends every AirDrop peer a QU query at its own
+  link-local `:5353` every 3 s; three unanswered with nothing heard for 4 s drops the peer
+  (`sharingd/src/mdns.rs`, `Peer::unanswered`). A TCP connect is **not** a liveness probe —
+  a healthy iPhone refuses most of them.
+- **Apple's Nearby Info message (BLE type `0x10`).** Bit `0x40` of its flags byte is set exactly
+  while the device will take an AirDrop (on AND unlocked); measured on two iPhones, table and
+  provenance in `protocol/src/apple.rs`. The app scans for it and forwards the bytes
+  (`reportAppleAdvertisement`); the daemon counts devices present and receptive, fires a burst
+  of probes on any decrease, and labels every AirDrop peer `TarishPeer.state =
+  STATE_SCREEN_OFF` when the count covers all listed peers and none is receptive. After 6 s in
+  that state the peer is left out of `getPeers()`; it is back the moment the bit returns.
+
+The BLE address is random and rotates on every state change, so it is never mapped to an
+mDNS peer: the label is a statement about the population, exact with one iPhone in range and
+withheld when it would be a guess. Not yet measured: whether a locked iPhone keeps answering
+mDNS probes (which decides the two-iPhone case), and a Mac's flags.
+
 ## VPN kill-switch and the authenticated window — PARTIALLY SHIPPED
 
 Sharing works under an always-on VPN in lockdown mode, which stock Quick Share does not do.
