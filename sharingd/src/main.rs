@@ -1250,6 +1250,9 @@ const LABEL_DEBOUNCE_TICKS: u32 = 6;
 /// have rotated into it. Apple advertises several times a second; one second of silence
 /// from a live address is already unusual.
 const APPLE_ROTATION_GAP: Duration = Duration::from_secs(1);
+/// And the successor must be about as loud as its predecessor. Two adverts from one phone
+/// on a desk differ by a few dB; two phones a metre apart by more than this, usually.
+const APPLE_ROTATION_RSSI_DB: i32 = 10;
 /// Only devices at least this strong count. Measured in a home with nine Apple devices
 /// in range: the phones on the desk read -50 to -60 dBm, everything in other rooms -82
 /// to -96 and flickering in and out every few seconds. Counting those made the population
@@ -2168,12 +2171,23 @@ impl ITarishService for TarishService {
                 // covering the listed peer it just was.
                 let mut inherited = false;
                 if !info.receptive() && rssi >= APPLE_NEAR_DBM {
+                    // SAME DEVICE, OR NOTHING. The first version retired any quiet receptive
+                    // address when any unreceptive one appeared, and with two iPhones on the
+                    // desk that misfired five times in ten minutes (18:50 window): the locked
+                    // Air rotated its address while the receptive Mini was in one of its
+                    // ~13 s advertising silences, the rule retired the Mini's address as if
+                    // it had rotated into the Air's, and the Mini's tile read "screen off".
+                    // The action byte has been stable per device all day (Mini 0x1e, Air
+                    // 0x18), and a phone does not jump ten dB between two adverts; a
+                    // successor must match on both.
                     let quiet_receptive: Vec<String> = table
                         .by_address
                         .iter()
                         .filter(|(_, a)| {
                             a.info.receptive()
                                 && a.rssi >= APPLE_NEAR_DBM
+                                && a.info.action == info.action
+                                && (a.rssi - rssi).abs() <= APPLE_ROTATION_RSSI_DB
                                 && now.duration_since(a.last_seen) >= APPLE_ROTATION_GAP
                         })
                         .map(|(k, _)| k.clone())
