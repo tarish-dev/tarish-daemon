@@ -73,8 +73,35 @@ liveness signal (2026-09-25):
 
 The BLE address is random and rotates on every state change, so it is never mapped to an
 mDNS peer: the label is a statement about the population, exact with one iPhone in range and
-withheld when it would be a guess. Not yet measured: whether a locked iPhone keeps answering
-mDNS probes (which decides the two-iPhone case), and a Mac's flags.
+withheld when it would be a guess. A locked iPhone does stop answering mDNS (measured), so
+the probes can tell two iPhones apart; a Mac's flags are not measured.
+
+**What a day on hardware added (2026-09-25 afternoon), all measured, all in `sharingd/`:**
+
+- **Silence is not absence while BLE vouches.** An unlocked, receptive iPhone answers our
+  repeated browse question briefly and then not for minutes (and after a `tarishsharingd`
+  restart, not at all — every record we ever got came from the iPhone's own announcements).
+  So while the BLE scan accounts for every listed peer, nothing is removed for silence; the
+  probe rule and the 300 s TTL clamp both apply only after BLE has stopped vouching for a whole
+  minute. A goodbye (TTL 0) removes at once. The browse query itself runs on an RFC 6762
+  backoff (2 s while the list is empty, doubling to 30 s).
+- **Naming is retried.** `/Discover` is asked on a 3/10/20/40/60 s backoff with a 5 s connect
+  and 10 s handshake bound; one attempt per boot had left a discovered iPhone hidden for whole
+  windows. The app shows an unnamed AirDrop peer as "Apple device" until the name arrives.
+- **`STATE_NOT_ACCEPTING`.** iOS "Everyone" lasts ten minutes; afterwards the iPhone stays on
+  the link with the BLE bit still set (Contacts Only sets it too), and a send's TLS handshake
+  is simply left to die. `/Discover` succeeds only in Everyone, so named peers are re-asked every
+  60 s; two abandoned handshakes in a row (never a connect that got no SYN-ACK — that is the
+  link) put the tile on "not accepting"; one answer clears it. A send that dies the same way
+  sets it immediately.
+- **The label is debounced (3 s), an address is held 20 s, and a rotation successor must be the
+  same device** (same action byte, RSSI within 10 dB): iPhones rotate their BLE address every
+  10–30 s with ~13 s of silence around each, and a neighbouring locked iPhone's rotation used to
+  retire the receptive one's address.
+
+The identity-less sender's hard ceiling is Apple's: an iPhone can be reached only inside its
+ten-minute Everyone window. Everything above is about telling the truth on the tile within it
+and after it.
 
 ## VPN kill-switch and the authenticated window — PARTIALLY SHIPPED
 
