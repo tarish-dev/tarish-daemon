@@ -730,8 +730,9 @@ fn ttl_of(rec: &dns::Record) -> Duration {
     /// an absurdly short TTL.
     pub fn expire(&mut self, min_grace: Duration) {
         let now = Instant::now();
+        // The gate has been open -- BLE not accounting for the listed peers -- for a whole
+        // LOST_AFTER. Both silence rules below require it; a goodbye does not.
         let ripe = self.probe_eviction && self.eviction_ripe(now);
-        let vouched = !self.probe_eviction;   // BLE accounts for every listed peer
         self.peers.retain(|name, p| {
             let silent = now.duration_since(p.last_seen);
             // Asked repeatedly, heard nothing: gone, whatever its TTL says -- unless BLE
@@ -756,8 +757,12 @@ fn ttl_of(rec: &dns::Record) -> Duration {
             // of ours. It dropped a present, receptive, BLE-vouched iPhone at 17:07:52 on
             // 2026-09-25, exactly 300 s after its last record. So it is gated the same way
             // as the probe rule: while BLE accounts for every listed peer, silence proves
-            // nothing and nothing is removed for it.
-            if vouched {
+            // nothing and nothing is removed for it -- and, like the probe rule, only a
+            // gate that has been open for a whole LOST_AFTER counts. Gating on the
+            // instantaneous flag was not enough: at 18:04:28 a single missed BLE tick
+            // opened the gate onto a peer that had been quiet for 308 s, and the lease
+            // rule removed it on the spot. The app's scan has such gaps every minute.
+            if !ripe {
                 return true;
             }
             let keep = now < p.expires_at || silent < min_grace;
