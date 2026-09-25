@@ -246,13 +246,24 @@ pub fn send(
 
 // ------------------------------------------------------------------ plumbing ---
 
+/// How long a SYN to a link-local peer may go unanswered. Five seconds is generous for a
+/// device one radio hop away; the kernel's default is over two minutes of retries, and that
+/// is what a /Discover probe sat in on 2026-09-25 (17:01:19 -> "Connection timed out" at
+/// 17:03:35) while the peer stayed hidden as unnamed. Task #51 asked for this bound.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// And the TLS handshake. It used to run under IO_TIMEOUT (30 s), which is sized for a bulk
+/// read, not for two round trips: a handshake the peer will not finish should fail in
+/// seconds so the caller can try again.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 fn connect(target: &Target) -> io::Result<SslStream<TcpStream>> {
     // A link-local address is meaningless without its interface, so the scope id is
     // part of the address rather than an optional extra.
     let sock = SocketAddrV6::new(target.addr, target.port, 0, target.scope);
-    let tcp = TcpStream::connect(sock)?;
-    tcp.set_read_timeout(Some(IO_TIMEOUT))?;
-    tcp.set_write_timeout(Some(IO_TIMEOUT))?;
+    let tcp = TcpStream::connect_timeout(&sock.into(), CONNECT_TIMEOUT)?;
+    // Short while the handshake runs; widened to the bulk value once it is done.
+    tcp.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    tcp.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
 
     let mut b = SslConnector::builder(SslMethod::tls())
         .map_err(|e| io::Error::other(format!("TLS setup: {e}")))?;
@@ -270,9 +281,12 @@ fn connect(target: &Target) -> io::Result<SslStream<TcpStream>> {
         .use_server_name_indication(false)
         .verify_hostname(false);
 
-    config
+    let tls = config
         .connect("tarish", tcp)
-        .map_err(|e| io::Error::other(format!("TLS handshake: {e}")))
+        .map_err(|e| io::Error::other(format!("TLS handshake: {e}")))?;
+    tls.get_ref().set_read_timeout(Some(IO_TIMEOUT))?;
+    tls.get_ref().set_write_timeout(Some(IO_TIMEOUT))?;
+    Ok(tls)
 }
 
 fn request<S: Write>(tls: &mut S, path: &str, body: &[u8], keep_alive: bool) -> io::Result<()> {

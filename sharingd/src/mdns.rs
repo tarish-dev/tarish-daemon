@@ -67,6 +67,9 @@ pub struct Peer {
     /// switched off, which look the same on the air. None while receptive, or while
     /// there is no BLE evidence either way. See `Browser::mark_unreceptive`.
     pub unreceptive_since: Option<Instant>,
+    /// The peer said goodbye (a record with TTL 0). That is the one signal that removes a
+    /// peer whatever BLE says: it is the device's own word, not our inference.
+    pub withdrawn: bool,
 }
 
 /// Unanswered questions before a peer is presumed gone. Three, because a single frame
@@ -612,11 +615,15 @@ impl Browser {
                                 expires_at: Instant::now() + Self::ttl_of(rec),
                                 unanswered: 0,
                                 unreceptive_since: None,
+                                withdrawn: false,
                             }
                         });
                         e.last_seen = Instant::now();
                         e.unanswered = 0;
                         e.expires_at = Instant::now() + Self::ttl_of(rec);
+                        if rec.ttl == 0 {
+                            e.withdrawn = true;
+                        }
                     }
                 }
                 // TXT carries only `flags`, which we do not use -- but it arrives in every
@@ -644,6 +651,9 @@ impl Browser {
                             // the lease, which is the one thing `max` cannot do.
                             let t = Instant::now() + Self::ttl_of(rec);
                             p.expires_at = if rec.ttl == 0 { t } else { p.expires_at.max(t) };
+                            if rec.ttl == 0 {
+                                p.withdrawn = true;
+                            }
                         }
                     }
                 }
@@ -721,6 +731,7 @@ fn ttl_of(rec: &dns::Record) -> Duration {
     pub fn expire(&mut self, min_grace: Duration) {
         let now = Instant::now();
         let ripe = self.probe_eviction && self.eviction_ripe(now);
+        let vouched = !self.probe_eviction;   // BLE accounts for every listed peer
         self.peers.retain(|name, p| {
             let silent = now.duration_since(p.last_seen);
             // Asked repeatedly, heard nothing: gone, whatever its TTL says -- unless BLE
@@ -735,9 +746,23 @@ fn ttl_of(rec: &dns::Record) -> Duration {
                 );
                 return false;
             }
+            // The device's own goodbye removes it, whatever BLE says.
+            if p.withdrawn && now >= p.expires_at {
+                log::info!("peer lost: {} — it said goodbye", short(name));
+                return false;
+            }
+            // The TTL clock, CLAMPED TO 300 s BY ttl_of -- so this is not "the peer's own
+            // lease" for an iPhone advertising 4500 s, it is a five-minute silence timer
+            // of ours. It dropped a present, receptive, BLE-vouched iPhone at 17:07:52 on
+            // 2026-09-25, exactly 300 s after its last record. So it is gated the same way
+            // as the probe rule: while BLE accounts for every listed peer, silence proves
+            // nothing and nothing is removed for it.
+            if vouched {
+                return true;
+            }
             let keep = now < p.expires_at || silent < min_grace;
             if !keep {
-                log::info!("peer lost: {}", short(name));
+                log::info!("peer lost: {} — lease ran out, {:.0}s silent", short(name), silent.as_secs_f32());
             }
             keep
         });

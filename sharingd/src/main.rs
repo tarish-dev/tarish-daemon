@@ -28,7 +28,7 @@ mod plist;
 use binder::{BinderFeatures, DeathRecipient, IBinder, Interface, Result as BinderResult, Status, StatusCode, Strong};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use dev_tarish::aidl::dev::tarish::{
     TarishPeer::TarishPeer,
     TarishGroup::TarishGroup,
@@ -2850,6 +2850,20 @@ const PROBE_BURST_EVERY: Duration = Duration::from_secs(2);
 const QUERY_MIN: Duration = Duration::from_secs(2);
 const QUERY_MAX: Duration = Duration::from_secs(30);
 
+/// /Discover attempts for a peer that stays unnamed, and the spacing between them: soon at
+/// first (the peer usually just needs a moment after joining), then a minute apart. Ten
+/// attempts is about eight minutes, most of an Everyone window.
+const PROBE_NAME_MAX: u32 = 10;
+fn probe_name_backoff(attempts: u32) -> Duration {
+    Duration::from_secs(match attempts {
+        1 => 3,
+        2 => 10,
+        3 => 20,
+        4 => 40,
+        _ => 60,
+    })
+}
+
 fn start_discovery(
     peers: PeerTable,
     names: PeerNames,
@@ -2875,9 +2889,19 @@ fn start_discovery(
             }
         };
 
-        // Asked once per peer per boot. Without this the loop would re-probe every
-        // peer on every pass, which is a TLS connection each time.
-        let mut probed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // /Discover attempts per instance: how many, and when the last one started.
+        //
+        // THIS USED TO BE ONCE PER PEER PER BOOT, AND THAT HID PEERS FOR WHOLE SESSIONS.
+        // The app does not list a peer until /Discover has named it. On 2026-09-25 two
+        // instances of the same iPhone were discovered, probed once each -- one connect
+        // hung for 2 min 16 s and timed out, one TLS handshake stalled -- and were never
+        // asked again, so a device that was in this table for its entire ten-minute
+        // Everyone window was "not discoverable" on screen. A healthy iPhone refuses or
+        // stalls a good share of connects (task #46), so one attempt is not a policy. Now:
+        // retry on a backoff (PROBE_NAME_BACKOFF) while the peer stays unnamed, a bounded
+        // number of times; the probe itself is bounded by send::connect's timeouts.
+        let mut probed: std::collections::HashMap<String, (u32, Instant)> =
+            std::collections::HashMap::new();
         // Which instance of the interface we are bound to. The table id IS the index,
         // and tarishd recreates mosey0 with a new one every time it re-acquires the
         // radio, so this is the identity that matters -- not the name.
@@ -2976,13 +3000,30 @@ fn start_discovery(
             // opens a TLS connection and holding the table through that would stall
             // every getPeers call for the duration.
             let mut to_probe = Vec::new();
-            if let Ok(mut table) = peers.lock() {
+            if let (Ok(mut table), Ok(known)) = (peers.lock(), names.lock()) {
+                let now = Instant::now();
                 for p in table.iter_mut() {
-                    if p.port != 0 && !probed.contains(&p.instance) {
-                        if let Some(addr) = p.addr {
-                            probed.insert(p.instance.clone());
-                            to_probe.push((p.instance.clone(), addr, p.port));
+                    let Some(addr) = p.addr else { continue };
+                    if p.port == 0 || known.contains_key(&addr.to_string()) {
+                        continue;   // not reachable yet, or already named
+                    }
+                    let (attempts, due) = match probed.get(&p.instance) {
+                        None => (0, true),
+                        Some(&(attempts, last)) => (
+                            attempts,
+                            attempts < PROBE_NAME_MAX
+                                && now.duration_since(last) >= probe_name_backoff(attempts),
+                        ),
+                    };
+                    if due {
+                        if attempts > 0 {
+                            log::info!(
+                                "peer {} still unnamed — /Discover attempt {}",
+                                p.short_id(), attempts + 1
+                            );
                         }
+                        probed.insert(p.instance.clone(), (attempts + 1, now));
+                        to_probe.push((p.instance.clone(), addr, p.port));
                     }
                 }
             }
