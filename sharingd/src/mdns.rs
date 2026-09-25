@@ -72,9 +72,19 @@ pub struct Peer {
 /// Unanswered questions before a peer is presumed gone. Three, because a single frame
 /// can miss an AWDL availability window, and two in a row is still a bad moment.
 const LOST_UNANSWERED: u32 = 3;
-/// And nothing heard from it for at least this long. Probes run a second apart after a
-/// BLE event, so this is the floor on how fast a departed peer can be dropped.
-const LOST_AFTER: Duration = Duration::from_secs(4);
+/// And nothing heard from it for at least this long.
+///
+/// TWENTY SECONDS, NOT FOUR, AND THAT IS MEASURED. The first version used 4 s and evicted
+/// a present iPhone: it answered at :52.4 and :55.5, then said nothing for 14 s while we
+/// asked nine times, then answered again at :09.8 -- and we had dropped it at :00.1 as
+/// "5 queries unanswered, nothing heard for 4.6s". Apple's responder does not answer every
+/// repeated question, and whether it answers unicast probes at all on AWDL is not yet
+/// settled (the answers we do get arrive with the multicast ones). So silence for a few
+/// seconds is normal here and proves nothing. This bound is only for "gone" -- Bluetooth
+/// off, walked away -- and 20 s is still 225 times better than the 75-minute TTL. The
+/// "screen off within a few seconds" the person sees comes from the BLE label and the
+/// hide timer in getPeers, not from this.
+const LOST_AFTER: Duration = Duration::from_secs(20);
 
 impl Peer {
     /// Apple's instance names are 12 hex characters, which is an identifier and

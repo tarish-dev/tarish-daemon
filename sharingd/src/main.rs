@@ -1223,15 +1223,23 @@ const APPLE_SILENT_AFTER: Duration = Duration::from_secs(2);
 /// No report at all for this long means the scanner is not running. The counts are then
 /// no evidence, and every label comes off.
 const APPLE_LIVE_WINDOW: Duration = Duration::from_secs(4);
+/// Only devices at least this strong count. Measured in a home with nine Apple devices
+/// in range: the phones on the desk read -50 to -60 dBm, everything in other rooms -82
+/// to -96 and flickering in and out every few seconds. Counting those made the population
+/// change constantly and could hold "receptive" at one while the phone on the desk
+/// locked. A real peer that is this faint is simply not counted -- and by the
+/// `present >= listed` rule that means it is never labelled, only probed. Safe direction.
+const APPLE_NEAR_DBM: i32 = -80;
 
 impl AppleNearby {
     fn population(&mut self) -> ApplePopulation {
         let now = std::time::Instant::now();
         self.by_address.retain(|_, a| now.duration_since(a.last_seen) < APPLE_SILENT_AFTER);
+        let near = self.by_address.values().filter(|a| a.rssi >= APPLE_NEAR_DBM);
         ApplePopulation {
             live: self.last_report.map_or(false, |t| now.duration_since(t) < APPLE_LIVE_WINDOW),
-            present: self.by_address.len(),
-            receptive: self.by_address.values().filter(|a| a.info.receptive()).count(),
+            present: near.clone().count(),
+            receptive: near.filter(|a| a.info.receptive()).count(),
         }
     }
 }
@@ -2121,10 +2129,19 @@ impl ITarishService for TarishService {
                 a.last_seen = now;
             }
             None => {
-                log::info!(
-                    "apple nearby {address}: new, rssi={rssi} flags=0x{:02x} action=0x{:02x} ({})",
-                    info.flags, info.action, receptive_word(info.receptive())
-                );
+                // A far device rotating its address is a new line every few seconds and
+                // says nothing about the peers on the desk; keep those at debug.
+                if rssi >= APPLE_NEAR_DBM {
+                    log::info!(
+                        "apple nearby {address}: new, rssi={rssi} flags=0x{:02x} action=0x{:02x} ({})",
+                        info.flags, info.action, receptive_word(info.receptive())
+                    );
+                } else {
+                    log::debug!(
+                        "apple nearby {address}: new (far), rssi={rssi} flags=0x{:02x} action=0x{:02x}",
+                        info.flags, info.action
+                    );
+                }
                 table.by_address.insert(
                     address.to_string(),
                     AppleAdvertiser { rssi, info, last_seen: now },
@@ -2779,14 +2796,15 @@ fn probe_name(names: PeerNames, instance: String, target: send::Target) {
     });
 }
 
-/// Unicast liveness probe cadence between BLE events. One small packet per peer; three
-/// unanswered drop it (mdns::LOST_UNANSWERED), so this also bounds how long a peer that
-/// left with no BLE signal at all stays listed.
-const PROBE_EVERY: Duration = Duration::from_secs(3);
-/// After a BLE event -- one fewer device receptive or present -- this many probes, this
-/// far apart, so the peer that stopped answering is gone within a few seconds.
+/// Unicast liveness probe cadence between BLE events. One small packet per peer. Together
+/// with mdns::LOST_AFTER this bounds how long a peer that left with no BLE signal at all
+/// stays listed: three unanswered and twenty seconds of silence.
+const PROBE_EVERY: Duration = Duration::from_secs(5);
+/// After a BLE event -- one fewer device receptive -- this many probes, this far apart.
+/// Not one a second: an iPhone does not answer every repeated question (see LOST_AFTER),
+/// so faster asking only inflates the count without learning anything.
 const PROBE_BURST: u32 = 3;
-const PROBE_BURST_EVERY: Duration = Duration::from_secs(1);
+const PROBE_BURST_EVERY: Duration = Duration::from_secs(2);
 
 fn start_discovery(
     peers: PeerTable,
@@ -3051,12 +3069,16 @@ fn start_discovery(
                         browser.peer_count()
                     );
                 }
-                if pop.present < last_pop.present || pop.receptive < last_pop.receptive {
+                // One fewer RECEPTIVE device is the event: a lock, AirDrop off, or a
+                // receptive phone gone. The present count alone is not -- far devices at
+                // the edge of range flicker in and out constantly, and bursting on that
+                // kept the probes at one a second for as long as the app was open.
+                if pop.receptive < last_pop.receptive && burst_left == 0 {
                     burst_left = PROBE_BURST;
                 }
                 last_pop = pop;
             }
-            if probe_now.swap(false, Ordering::SeqCst) {
+            if probe_now.swap(false, Ordering::SeqCst) && burst_left == 0 {
                 burst_left = PROBE_BURST;
             }
             let probe_every = if burst_left > 0 { PROBE_BURST_EVERY } else { PROBE_EVERY };
