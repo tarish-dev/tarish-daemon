@@ -2941,8 +2941,11 @@ fn probe_name(names: PeerNames, accepting: AcceptState, instance: String, target
                 // Answered: it will talk to us.
                 Ok(_) => entry.stalls = 0,
                 // Accepted the connection and let the handshake die: the Contacts Only
-                // signature (send::connect maps it to TimedOut). Count it.
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                // signature, by the message send::connect gives it. NOT every timeout: a
+                // connect that gets no SYN-ACK at all is the link (a re-election at
+                // 19:17:56 left our frames in the wrong slots for thirty seconds and three
+                // naming attempts timed out that way), and says nothing about acceptance.
+                Err(e) if e.to_string().contains("would not complete the handshake") => {
                     entry.stalls = entry.stalls.saturating_add(1);
                     if entry.stalls == ACCEPT_STALLS_TO_LABEL {
                         log::info!("peer {instance} is not accepting from this device ({} stalled handshakes)", entry.stalls);
