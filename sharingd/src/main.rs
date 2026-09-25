@@ -1192,6 +1192,14 @@ struct AppleAdvertiser {
     rssi: i32,
     info: tarish_protocol::apple::NearbyInfo,
     last_seen: std::time::Instant,
+    /// This address, or the address it succeeded at a rotation, has carried the receptive
+    /// bit. Only such a device can be one of our listed AirDrop peers, so only such a
+    /// device counts towards "the population covers every listed peer". Measured
+    /// 2026-09-25 18:35-18:37: with the receptive iPhone silent across its address
+    /// rotations and a locked one advertising steadily, the count read "1 present,
+    /// 0 receptive" seven times in ninety seconds and the receptive phone's tile was
+    /// labelled with the locked phone's state.
+    was_receptive: bool,
 }
 
 /// What BLE says about the Apple devices around us: how many there are, and how many
@@ -1210,9 +1218,10 @@ struct AppleNearby {
 struct ApplePopulation {
     /// Whether the app has reported recently enough for the counts to mean anything.
     live: bool,
-    /// Apple devices heard within `APPLE_SILENT_AFTER`.
+    /// Apple devices heard within `APPLE_SILENT_AFTER` that are, or under this address
+    /// have been, receptive -- the ones that could be a listed AirDrop peer.
     present: usize,
-    /// Of those, the ones carrying the receptive bit.
+    /// Of those, the ones carrying the receptive bit right now.
     receptive: usize,
 }
 
@@ -1220,19 +1229,23 @@ struct ApplePopulation {
 /// about every 800 ms, so this is three missed keep-alives. It also bounds how long an
 /// address that rotated away at a lock keeps counting as receptive.
 ///
-/// Six seconds, and a rotation rule to make that cheap. At two, then three, a receptive
-/// iPhone on the desk aged out for one tick and its tile read "screen off" for a second.
-/// Measured 2026-09-25 16:14: the app's scan has gaps of four to six seconds -- a single
-/// missed tick flicked the population to "0 receptive", labelled the peer, opened the
-/// eviction gate and dropped it. So an address is held for six seconds. The cost would be
-/// a six-second lag at a lock, where the receptive address goes quiet -- except that a lock
-/// ROTATES the address, and the new one arrives with the bit clear within the same second;
-/// `reportAppleAdvertisement` treats a new unreceptive address as the successor of any
-/// receptive one that just went quiet and retires it at once. A scan gap has no successor.
-const APPLE_SILENT_AFTER: Duration = Duration::from_secs(6);
+/// Twenty seconds, and a rotation rule to make that cheap. At two, three and six, a
+/// receptive iPhone on the desk aged out and its tile read "screen off" -- for a second at
+/// first, then seven times in ninety seconds once the phone started rotating its address
+/// every 11-28 s with ~13 s of silence around each rotation (measured 18:35-18:37). So an
+/// address is held for twenty seconds. The cost would be a twenty-second lag at a lock,
+/// where the receptive address goes quiet -- except that a lock ROTATES the address, and
+/// the new one arrives with the bit clear within the same second; `reportAppleAdvertisement`
+/// treats a new unreceptive address as the successor of any receptive one that just went
+/// quiet and retires it at once. A silence has no successor. Bluetooth switched off in
+/// Settings is the one case that pays the twenty seconds, and the probes cover it anyway.
+const APPLE_SILENT_AFTER: Duration = Duration::from_secs(20);
 /// No report at all for this long means the scanner is not running. The counts are then
-/// no evidence, and every label comes off. Eight, for the same scan gaps.
-const APPLE_LIVE_WINDOW: Duration = Duration::from_secs(8);
+/// no evidence, and every label comes off.
+const APPLE_LIVE_WINDOW: Duration = Duration::from_secs(24);
+/// The population must read "none receptive" for this many 500 ms ticks before a label
+/// goes on. Three seconds absorbs the one- and two-second flickers that survive the hold.
+const LABEL_DEBOUNCE_TICKS: u32 = 6;
 /// A receptive address quiet for this long when an unreceptive one appears is taken to
 /// have rotated into it. Apple advertises several times a second; one second of silence
 /// from a live address is already unusual.
@@ -1249,7 +1262,10 @@ impl AppleNearby {
     fn population(&mut self) -> ApplePopulation {
         let now = std::time::Instant::now();
         self.by_address.retain(|_, a| now.duration_since(a.last_seen) < APPLE_SILENT_AFTER);
-        let near = self.by_address.values().filter(|a| a.rssi >= APPLE_NEAR_DBM);
+        let near = self
+            .by_address
+            .values()
+            .filter(|a| a.rssi >= APPLE_NEAR_DBM && (a.was_receptive || a.info.receptive()));
         ApplePopulation {
             live: self.last_report.map_or(false, |t| now.duration_since(t) < APPLE_LIVE_WINDOW),
             present: near.clone().count(),
@@ -2141,12 +2157,16 @@ impl ITarishService for TarishService {
                 a.info = info;
                 a.rssi = rssi;
                 a.last_seen = now;
+                a.was_receptive |= info.receptive();
             }
             None => {
                 // A NEW address with the bit clear right after a receptive one went quiet
                 // is that device having locked or switched AirDrop off: the address rotates
                 // on every state change (measured on both phones). Retire the predecessor
-                // now rather than six seconds from now, so the label lands in a second.
+                // now rather than twenty seconds from now, so the label lands in a second
+                // -- and let the successor inherit "was receptive", so it still counts as
+                // covering the listed peer it just was.
+                let mut inherited = false;
                 if !info.receptive() && rssi >= APPLE_NEAR_DBM {
                     let quiet_receptive: Vec<String> = table
                         .by_address
@@ -2162,6 +2182,7 @@ impl ITarishService for TarishService {
                         log::info!("apple nearby {old}: quiet {:.1}s as {address} appears unreceptive — rotated, retired",
                             now.duration_since(table.by_address[&old].last_seen).as_secs_f32());
                         table.by_address.remove(&old);
+                        inherited = true;
                     }
                 }
                 // A far device rotating its address is a new line every few seconds and
@@ -2179,7 +2200,12 @@ impl ITarishService for TarishService {
                 }
                 table.by_address.insert(
                     address.to_string(),
-                    AppleAdvertiser { rssi, info, last_seen: now },
+                    AppleAdvertiser {
+                        rssi,
+                        info,
+                        last_seen: now,
+                        was_receptive: info.receptive() || inherited,
+                    },
                 );
             }
         }
@@ -2923,6 +2949,7 @@ fn start_discovery(
         let mut last_pop = ApplePopulation::default();
         let mut query_every = QUERY_MIN;
         let mut last_listed = 0usize;
+        let mut unreceptive_ticks = 0u32;
         loop {
             // tarishd holds AWDL only while something wants it, so mosey0 genuinely
             // disappears and comes back with a new index. Two things follow.
@@ -3193,9 +3220,12 @@ fn start_discovery(
             // label on a device that is fine is worse than none -- so with two iPhones
             // listed and one locked, nothing is labelled and the probes decide.
             let listed = browser.peer_count();
-            browser.mark_unreceptive(
-                pop.live && listed > 0 && pop.receptive == 0 && pop.present >= listed,
-            );
+            let unreceptive_now =
+                pop.live && listed > 0 && pop.receptive == 0 && pop.present >= listed;
+            // Debounced: the reading has to hold for LABEL_DEBOUNCE_TICKS before the tile
+            // changes, and one receptive reading clears it at once.
+            unreceptive_ticks = if unreceptive_now { unreceptive_ticks + 1 } else { 0 };
+            browser.mark_unreceptive(unreceptive_ticks >= LABEL_DEBOUNCE_TICKS);
             // Silence to probes removes a peer only when BLE does not account for it:
             // fewer receptive devices heard than peers listed, or no BLE reports at all.
             browser.set_probe_eviction(!(pop.live && pop.receptive >= listed));
