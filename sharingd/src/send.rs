@@ -281,9 +281,26 @@ fn connect(target: &Target) -> io::Result<SslStream<TcpStream>> {
         .use_server_name_indication(false)
         .verify_hostname(false);
 
-    let tls = config
-        .connect("tarish", tcp)
-        .map_err(|e| io::Error::other(format!("TLS handshake: {e}")))?;
+    let tls = config.connect("tarish", tcp).map_err(|e| {
+        let text = e.to_string();
+        // A peer that accepts the TCP connection and then says nothing for the whole
+        // handshake bound is an iPhone in CONTACTS ONLY. Measured 2026-09-25 17:41: the
+        // Mini's "Everyone for 10 Minutes" had ended four minutes earlier, it stayed on
+        // the link and BLE still called it receptive, the connect succeeded, and the
+        // handshake read timed out ("a nonblocking read call would have blocked"). iOS
+        // does not send a TLS alert to a sender it will not talk to; it lets the
+        // handshake die. Say so, because "TLS handshake failed" reads as our bug.
+        if text.contains("would have blocked") || text.contains("timed out") {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the device accepted the connection but would not complete the handshake — \
+                 it is probably set to Contacts Only (an \"Everyone for 10 Minutes\" window \
+                 has ended); ask them to open it again",
+            )
+        } else {
+            io::Error::other(format!("TLS handshake: {text}"))
+        }
+    })?;
     tls.get_ref().set_read_timeout(Some(IO_TIMEOUT))?;
     tls.get_ref().set_write_timeout(Some(IO_TIMEOUT))?;
     Ok(tls)
