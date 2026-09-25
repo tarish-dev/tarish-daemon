@@ -74,7 +74,10 @@ pub struct Item {
 /// necessarily unreachable -- it may simply not be discoverable to us -- so the caller
 /// decides what to do rather than this treating it as fatal.
 pub fn discover(target: &Target) -> io::Result<Option<String>> {
-    let mut tls = connect(target)?;
+    // No abort handle: /Discover is a single bounded round trip, not something a person
+    // ever sits watching and cancels.
+    let noop = |_: Option<&TcpStream>| {};
+    let mut tls = connect(target, &noop)?;
     // Everyone mode: an empty body. A sender in contacts mode would put its
     // SenderRecordData here, which is exactly the thing we cannot produce.
     let body = plist::dict(&[]);
@@ -99,13 +102,16 @@ pub fn send(
     sender_model: &str,
     mut progress: impl FnMut(u64, u64),
     cancelled: impl Fn() -> bool,
+    // Called with the live socket once there is one, so a cancel can shut it down and
+    // unblock whatever syscall this thread is parked in. See `ArmAbort`.
+    arm: ArmAbort<'_>,
 ) -> io::Result<()> {
     if items.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "nothing to send"));
     }
     let total: u64 = items.iter().map(|i| i.size).sum();
 
-    let mut tls = connect(target)?;
+    let mut tls = connect(target, arm)?;
 
     // --- /Ask -------------------------------------------------------------
     let ask = ask_body(&items, sender_name, sender_model);
@@ -256,7 +262,29 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// seconds so the caller can try again.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn connect(target: &Target) -> io::Result<SslStream<TcpStream>> {
+/// Publish the live socket so a cancel can interrupt a thread wedged inside it.
+///
+/// A CANCEL FLAG IS NOT ENOUGH, AND THIS IS THE PROOF. `cancelled()` is polled on every read
+/// of the source archive, which makes Cancel feel instant on a healthy link because a read
+/// follows every write within milliseconds. It does nothing at all when the WRITE is the slow
+/// part: the thread is inside one `write_all` to the peer and will not reach another read
+/// until that returns. `SO_SNDTIMEO` does not save it either — the timer only fires when NO
+/// bytes move, and a link that is merely crawling keeps resetting it.
+///
+/// Measured 2026-09-25, our own two devices over AWDL at ~0.8 KB/s (BUILD-NOTES 72):
+///
+/// ```text
+/// sender    00:10:21  peer accepted, sending 1 item(s), 20971520 bytes
+/// sender    00:10:40  cancelTransfer(1)         <- arrives, then nothing, ever
+/// receiver  00:10:41  /Upload failed: cancelled by the user   <- 1.9 s, clean
+/// ```
+///
+/// The receiver is reading, so its flag lands at once. The sender wrote nothing to the log
+/// again. So cancellation has to reach the file descriptor, not just a boolean: shutting the
+/// socket down makes the blocked call return whatever syscall it is parked in.
+pub type ArmAbort<'a> = &'a (dyn Fn(Option<&TcpStream>) + Send + Sync);
+
+fn connect(target: &Target, arm: ArmAbort<'_>) -> io::Result<SslStream<TcpStream>> {
     // A link-local address is meaningless without its interface, so the scope id is
     // part of the address rather than an optional extra.
     let sock = SocketAddrV6::new(target.addr, target.port, 0, target.scope);
@@ -303,6 +331,9 @@ fn connect(target: &Target) -> io::Result<SslStream<TcpStream>> {
     })?;
     tls.get_ref().set_read_timeout(Some(IO_TIMEOUT))?;
     tls.get_ref().set_write_timeout(Some(IO_TIMEOUT))?;
+    // Armed AFTER the handshake, because that is the first moment there is a connection worth
+    // interrupting, and disarmed by the caller on the way out.
+    arm(Some(tls.get_ref()));
     Ok(tls)
 }
 

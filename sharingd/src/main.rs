@@ -239,6 +239,12 @@ pub(crate) struct TransferState {
     /// cancel arriving late for a finished transfer cannot stop the next one.
     current: std::sync::atomic::AtomicI64,
     cancelled: std::sync::atomic::AtomicI64,
+    /// The live send socket and the transfer it belongs to, so `cancel` can shut it down.
+    ///
+    /// A flag alone cannot stop a thread that is already inside a blocking write; see
+    /// `send::ArmAbort` for the measurement that showed the sender ignoring Cancel for good
+    /// while the receiver honoured it in 1.9 s. One slot, because one transfer runs at a time.
+    abort: Mutex<Option<(i64, std::net::TcpStream)>>,
     next: std::sync::atomic::AtomicI64,
     /// The real confirmation PIN for the transfer being set up, and the transfer it
     /// belongs to. Never leaves this process.
@@ -515,6 +521,35 @@ impl TransferState {
     /// was showing the previous transfer must not kill the current one.
     pub(crate) fn cancel(&self, id: i64) {
         self.cancelled.store(id, Ordering::SeqCst);
+        // AND INTERRUPT THE SOCKET. The flag is what a cooperating loop reads; this is what
+        // reaches a thread that is not looping because it is inside one long write. Shutting
+        // the descriptor down makes that call return at once, and the error surfaces as the
+        // cancellation it is because `cancelled()` is checked on the way out.
+        if let Ok(mut a) = self.abort.lock() {
+            if a.as_ref().map(|(i, _)| *i == id).unwrap_or(false) {
+                if let Some((_, sock)) = a.take() {
+                    // Best effort by design: an already-closed socket is the normal race here,
+                    // not a fault, and failing to shut one down must never fail the cancel.
+                    let _ = sock.shutdown(std::net::Shutdown::Both);
+                    log::info!("cancel {id}: shut the send socket down to unblock the writer");
+                }
+            }
+        }
+    }
+
+    /// Publish (or clear) the socket a cancel should interrupt. See `abort`.
+    pub(crate) fn arm_abort(&self, id: i64, sock: Option<&std::net::TcpStream>) {
+        let Ok(mut a) = self.abort.lock() else { return };
+        match sock {
+            // try_clone so the transfer keeps sole ownership of its own handle; both refer to
+            // the same descriptor, which is the point -- a shutdown on either affects both.
+            Some(s) => *a = s.try_clone().ok().map(|c| (id, c)),
+            None => {
+                if a.as_ref().map(|(i, _)| *i == id).unwrap_or(false) {
+                    *a = None;
+                }
+            }
+        }
     }
 
     pub(crate) fn is_cancelled(&self, id: i64) -> bool {
@@ -2742,7 +2777,16 @@ impl ITarishService for TarishService {
                     }
                 },
                 || transfers.is_cancelled(id),
+                // Hand the live socket to the registry so a cancel can shut it down. Without
+                // this the flag above is only read between writes, and a write that crawls
+                // never gets between anything -- see send::ArmAbort.
+                &{
+                    let transfers = transfers.clone();
+                    move |sock: Option<&std::net::TcpStream>| transfers.arm_abort(id, sock)
+                },
             );
+            // However it ended, nothing should hold a descriptor for it any more.
+            transfers.arm_abort(id, None);
             match result {
                 Ok(()) => {
                     log::info!("send {id} complete");
