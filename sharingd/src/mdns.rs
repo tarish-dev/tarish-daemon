@@ -81,10 +81,18 @@ const LOST_UNANSWERED: u32 = 3;
 /// repeated question, and whether it answers unicast probes at all on AWDL is not yet
 /// settled (the answers we do get arrive with the multicast ones). So silence for a few
 /// seconds is normal here and proves nothing. This bound is only for "gone" -- Bluetooth
-/// off, walked away -- and 20 s is still 225 times better than the 75-minute TTL. The
+/// off, walked away -- and even a minute is 75 times better than the 75-minute TTL. The
 /// "screen off within a few seconds" the person sees comes from the BLE label and the
 /// hide timer in getPeers, not from this.
-const LOST_AFTER: Duration = Duration::from_secs(20);
+///
+/// SIXTY, NOT TWENTY -- second measurement, same day. An unlocked, receptive iPhone on
+/// the desk answered a probe at :05.3 and then nothing for the next 20 s while asked
+/// fifteen times; the 20 s rule dropped it at :41.06, which happened to coincide with
+/// the operator switching its Bluetooth off, so the outcome looked right and the timer
+/// had actually fired. A live idle iPhone is routinely silent for 20 s here. Sixty is a
+/// bound on "gone" with no BLE evidence at all; with BLE running, the label hides the
+/// peer in six seconds and this only clears the table later.
+const LOST_AFTER: Duration = Duration::from_secs(60);
 
 impl Peer {
     /// Apple's instance names are 12 hex characters, which is an identifier and

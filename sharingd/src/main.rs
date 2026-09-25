@@ -1217,9 +1217,14 @@ struct ApplePopulation {
 }
 
 /// An address not heard for this long is gone. The app refreshes each live address
-/// about once a second, so this is two missed keep-alives. It also bounds how long an
+/// about every 800 ms, so this is three missed keep-alives. It also bounds how long an
 /// address that rotated away at a lock keeps counting as receptive.
-const APPLE_SILENT_AFTER: Duration = Duration::from_secs(2);
+///
+/// Three seconds, not two: at two, a receptive iPhone on the desk aged out for one tick
+/// (scan jitter on top of the keep-alive), the count read "0 receptive" and its tile was
+/// labelled "screen off" for one second before the next report put it back. A label that
+/// flickers is worse than one that arrives a second later.
+const APPLE_SILENT_AFTER: Duration = Duration::from_secs(3);
 /// No report at all for this long means the scanner is not running. The counts are then
 /// no evidence, and every label comes off.
 const APPLE_LIVE_WINDOW: Duration = Duration::from_secs(4);
