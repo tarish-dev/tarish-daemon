@@ -119,6 +119,8 @@ pub struct Browser {
     /// Whether we hold port 5353. A responder MUST: a peer sends its query to
     /// :5353 and will not see an answer from anywhere else.
     can_respond: bool,
+    /// See `set_probe_eviction`. Starts on: with no BLE evidence, probes are all we have.
+    probe_eviction: bool,
 }
 
 impl Browser {
@@ -155,6 +157,7 @@ impl Browser {
             advertising: false,
             queries_sent: 0,
             can_respond,
+            probe_eviction: true,
         })
     }
 
@@ -497,6 +500,30 @@ impl Browser {
         self.peers.len()
     }
 
+    /// Whether silence to our probes may remove a peer at all.
+    ///
+    /// WHEN BLE CAN SEE, BLE DECIDES. Measured 2026-09-25: an iPhone on the desk, unlocked,
+    /// receptive by its own BLE state message, in the AWDL cluster as our master with a
+    /// 3 us clock, answered our questions once and then not for over a minute -- and the
+    /// 60 s rule dropped it, then rediscovered it two minutes later. Apple's responder does
+    /// not answer repeated identical questions from the same host for long; silence is its
+    /// normal state. So while the app's BLE scan reports at least as many receptive Apple
+    /// devices as we list, no peer is evicted for silence. When BLE sees fewer receptive
+    /// devices than we list, the silent ones are exactly the candidates (a locked iPhone
+    /// stops answering -- measured too), and when there is no BLE evidence at all, the
+    /// probes are the only liveness signal left and the 60 s rule applies.
+    pub fn set_probe_eviction(&mut self, enabled: bool) {
+        if self.probe_eviction != enabled {
+            log::info!(
+                "probe eviction {} ({})",
+                if enabled { "on" } else { "off" },
+                if enabled { "BLE sees fewer receptive devices than peers listed, or no BLE" }
+                else { "BLE accounts for every listed peer" }
+            );
+        }
+        self.probe_eviction = enabled;
+    }
+
     /// Restart the QU burst — call when a browse begins, so the first queries of a new
     /// session are the ones that cannot be suppressed.
     pub fn restart_query_burst(&mut self) {
@@ -682,10 +709,11 @@ fn ttl_of(rec: &dns::Record) -> Duration {
         let now = Instant::now();
         self.peers.retain(|name, p| {
             let silent = now.duration_since(p.last_seen);
-            // Asked repeatedly, heard nothing: gone, whatever its TTL says. This is the
-            // rule that actually removes a departed iPhone; the TTL rule below is the
-            // backstop for a peer we never managed to probe (no address yet).
-            if p.unanswered >= LOST_UNANSWERED && silent >= LOST_AFTER {
+            // Asked repeatedly, heard nothing: gone, whatever its TTL says -- unless BLE
+            // vouches for every listed peer (see set_probe_eviction). This is the rule
+            // that removes a departed iPhone when BLE cannot see; the TTL rule below is
+            // the backstop for a peer we never managed to probe (no address yet).
+            if self.probe_eviction && p.unanswered >= LOST_UNANSWERED && silent >= LOST_AFTER {
                 log::info!(
                     "peer lost: {} — {} queries unanswered, nothing heard for {:.1}s",
                     short(name), p.unanswered, silent.as_secs_f32()

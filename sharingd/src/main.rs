@@ -2404,9 +2404,14 @@ impl ITarishService for TarishService {
     }
 
     fn getPeers(&self) -> BinderResult<Vec<TarishPeer>> {
-        // Someone is looking, so make discovery work rather than serving whatever the
-        // last ten-second sweep happened to leave behind.
-        self.query_now.store(true, Ordering::SeqCst);
+        // Someone is looking. Ask at once only while there is nothing to show. With peers
+        // listed, the discovery loop's own backoff keeps asking (RFC 6762 §5.2) -- this
+        // used to force a query on EVERY poll, one every 1.5 s for as long as the picker
+        // was open, which is the kind of chatter a responder learns to ignore and is not
+        // what a client polling a list means by "still looking".
+        if self.peers.lock().map(|p| p.is_empty()).unwrap_or(true) {
+            self.query_now.store(true, Ordering::SeqCst);
+        }
         let peers = self.peers.lock().map_err(|_| Status::from(StatusCode::UNKNOWN_ERROR))?;
         let names = self.names.lock().map_err(|_| Status::from(StatusCode::UNKNOWN_ERROR))?;
         // One entry per DEVICE, not per mDNS instance.
@@ -2810,6 +2815,10 @@ const PROBE_EVERY: Duration = Duration::from_secs(5);
 /// so faster asking only inflates the count without learning anything.
 const PROBE_BURST: u32 = 3;
 const PROBE_BURST_EVERY: Duration = Duration::from_secs(2);
+/// Browse-query backoff bounds. 2 s while a client is looking at an empty list; doubling
+/// to 30 s once peers are listed and nothing changes. See the loop for why not faster.
+const QUERY_MIN: Duration = Duration::from_secs(2);
+const QUERY_MAX: Duration = Duration::from_secs(30);
 
 fn start_discovery(
     peers: PeerTable,
@@ -2858,6 +2867,8 @@ fn start_discovery(
         let mut since_probe = Duration::ZERO;
         let mut burst_left = 0u32;
         let mut last_pop = ApplePopulation::default();
+        let mut query_every = QUERY_MIN;
+        let mut last_listed = 0usize;
         loop {
             // tarishd holds AWDL only while something wants it, so mosey0 genuinely
             // disappears and comes back with a new index. Two things follow.
@@ -3011,9 +3022,19 @@ fn start_discovery(
                 log::info!("refresh: peer table cleared, re-browsing from scratch");
             }
 
-            // Re-query periodically; peers answer, and new ones announce anyway.
-            // Query on our own timer, or immediately when a client is looking.
+            // Re-query on a backoff, RFC 6762 §5.2 shape: the interval doubles while
+            // nothing changes, and resets when a client starts looking, when the table
+            // changes, or on an explicit refresh. It used to be every 4 s -- and every
+            // 1.5 s in practice, because getPeers forced one per poll -- for as long as
+            // the picker was open. Measured 2026-09-25: an iPhone answered such a stream
+            // for ten seconds and then not for over a minute. A responder that is asked
+            // the same thing forever stops answering; asking less is how to be answered.
             let asked = query_now.swap(false, Ordering::SeqCst);
+            let listed_now = browser.peer_count();
+            if asked || listed_now != last_listed {
+                query_every = QUERY_MIN;
+            }
+            last_listed = listed_now;
             // A client just opened the picker: restart the QU burst, so the first queries of
             // this browse are ones a peer cannot suppress. Without it we inherit the QM
             // cadence of whatever was running before and can sit silent next to a peer that
@@ -3022,7 +3043,7 @@ fn start_discovery(
             if asked {
                 browser.restart_query_burst();
             }
-            if asked || since_query >= Duration::from_secs(4) {
+            if since_query >= query_every {
                 match browser.query() {
                     Ok(()) => failures = 0,
                     Err(e) => {
@@ -3031,6 +3052,7 @@ fn start_discovery(
                     }
                 }
                 since_query = Duration::ZERO;
+                query_every = (query_every * 2).min(QUERY_MAX);
             }
 
             // Rebind when the interface goes out from under us.
@@ -3103,6 +3125,9 @@ fn start_discovery(
             browser.mark_unreceptive(
                 pop.live && listed > 0 && pop.receptive == 0 && pop.present >= listed,
             );
+            // Silence to probes removes a peer only when BLE does not account for it:
+            // fewer receptive devices heard than peers listed, or no BLE reports at all.
+            browser.set_probe_eviction(!(pop.live && pop.receptive >= listed));
 
             browser.poll();
             // Long enough to ride out a rotation and a missed announcement, short
