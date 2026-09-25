@@ -121,6 +121,8 @@ pub struct Browser {
     can_respond: bool,
     /// See `set_probe_eviction`. Starts on: with no BLE evidence, probes are all we have.
     probe_eviction: bool,
+    /// When the gate last opened; eviction needs it open for a whole `LOST_AFTER`.
+    eviction_since: Option<Instant>,
 }
 
 impl Browser {
@@ -158,6 +160,7 @@ impl Browser {
             queries_sent: 0,
             can_respond,
             probe_eviction: true,
+            eviction_since: Some(Instant::now()),
         })
     }
 
@@ -520,8 +523,18 @@ impl Browser {
                 if enabled { "BLE sees fewer receptive devices than peers listed, or no BLE" }
                 else { "BLE accounts for every listed peer" }
             );
+            // The clock starts when the gate opens, not before. The first version evicted
+            // a present iPhone half a second after a single missed BLE report: the gate
+            // flicked open, and 193 s of perfectly normal mDNS silence was already on the
+            // counter. Silence only counts from the moment BLE stopped vouching.
+            self.eviction_since = if enabled { Some(Instant::now()) } else { None };
         }
         self.probe_eviction = enabled;
+    }
+
+    /// Has BLE stopped vouching for the listed peers for at least `LOST_AFTER`?
+    fn eviction_ripe(&self, now: Instant) -> bool {
+        self.eviction_since.map_or(false, |t| now.duration_since(t) >= LOST_AFTER)
     }
 
     /// Restart the QU burst — call when a browse begins, so the first queries of a new
@@ -707,13 +720,15 @@ fn ttl_of(rec: &dns::Record) -> Duration {
     /// an absurdly short TTL.
     pub fn expire(&mut self, min_grace: Duration) {
         let now = Instant::now();
+        let ripe = self.probe_eviction && self.eviction_ripe(now);
         self.peers.retain(|name, p| {
             let silent = now.duration_since(p.last_seen);
             // Asked repeatedly, heard nothing: gone, whatever its TTL says -- unless BLE
-            // vouches for every listed peer (see set_probe_eviction). This is the rule
-            // that removes a departed iPhone when BLE cannot see; the TTL rule below is
-            // the backstop for a peer we never managed to probe (no address yet).
-            if self.probe_eviction && p.unanswered >= LOST_UNANSWERED && silent >= LOST_AFTER {
+            // vouches for every listed peer, or only stopped vouching a moment ago (see
+            // set_probe_eviction). This is the rule that removes a departed iPhone when
+            // BLE cannot see; the TTL rule below is the backstop for a peer we never
+            // managed to probe (no address yet).
+            if ripe && p.unanswered >= LOST_UNANSWERED && silent >= LOST_AFTER {
                 log::info!(
                     "peer lost: {} — {} queries unanswered, nothing heard for {:.1}s",
                     short(name), p.unanswered, silent.as_secs_f32()

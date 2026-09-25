@@ -1220,14 +1220,23 @@ struct ApplePopulation {
 /// about every 800 ms, so this is three missed keep-alives. It also bounds how long an
 /// address that rotated away at a lock keeps counting as receptive.
 ///
-/// Three seconds, not two: at two, a receptive iPhone on the desk aged out for one tick
-/// (scan jitter on top of the keep-alive), the count read "0 receptive" and its tile was
-/// labelled "screen off" for one second before the next report put it back. A label that
-/// flickers is worse than one that arrives a second later.
-const APPLE_SILENT_AFTER: Duration = Duration::from_secs(3);
+/// Six seconds, and a rotation rule to make that cheap. At two, then three, a receptive
+/// iPhone on the desk aged out for one tick and its tile read "screen off" for a second.
+/// Measured 2026-09-25 16:14: the app's scan has gaps of four to six seconds -- a single
+/// missed tick flicked the population to "0 receptive", labelled the peer, opened the
+/// eviction gate and dropped it. So an address is held for six seconds. The cost would be
+/// a six-second lag at a lock, where the receptive address goes quiet -- except that a lock
+/// ROTATES the address, and the new one arrives with the bit clear within the same second;
+/// `reportAppleAdvertisement` treats a new unreceptive address as the successor of any
+/// receptive one that just went quiet and retires it at once. A scan gap has no successor.
+const APPLE_SILENT_AFTER: Duration = Duration::from_secs(6);
 /// No report at all for this long means the scanner is not running. The counts are then
-/// no evidence, and every label comes off.
-const APPLE_LIVE_WINDOW: Duration = Duration::from_secs(4);
+/// no evidence, and every label comes off. Eight, for the same scan gaps.
+const APPLE_LIVE_WINDOW: Duration = Duration::from_secs(8);
+/// A receptive address quiet for this long when an unreceptive one appears is taken to
+/// have rotated into it. Apple advertises several times a second; one second of silence
+/// from a live address is already unusual.
+const APPLE_ROTATION_GAP: Duration = Duration::from_secs(1);
 /// Only devices at least this strong count. Measured in a home with nine Apple devices
 /// in range: the phones on the desk read -50 to -60 dBm, everything in other rooms -82
 /// to -96 and flickering in and out every few seconds. Counting those made the population
@@ -2134,6 +2143,27 @@ impl ITarishService for TarishService {
                 a.last_seen = now;
             }
             None => {
+                // A NEW address with the bit clear right after a receptive one went quiet
+                // is that device having locked or switched AirDrop off: the address rotates
+                // on every state change (measured on both phones). Retire the predecessor
+                // now rather than six seconds from now, so the label lands in a second.
+                if !info.receptive() && rssi >= APPLE_NEAR_DBM {
+                    let quiet_receptive: Vec<String> = table
+                        .by_address
+                        .iter()
+                        .filter(|(_, a)| {
+                            a.info.receptive()
+                                && a.rssi >= APPLE_NEAR_DBM
+                                && now.duration_since(a.last_seen) >= APPLE_ROTATION_GAP
+                        })
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    for old in quiet_receptive {
+                        log::info!("apple nearby {old}: quiet {:.1}s as {address} appears unreceptive — rotated, retired",
+                            now.duration_since(table.by_address[&old].last_seen).as_secs_f32());
+                        table.by_address.remove(&old);
+                    }
+                }
                 // A far device rotating its address is a new line every few seconds and
                 // says nothing about the peers on the desk; keep those at debug.
                 if rssi >= APPLE_NEAR_DBM {
