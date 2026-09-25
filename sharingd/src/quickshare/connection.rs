@@ -124,14 +124,31 @@ fn notify<F>(callbacks: &Callbacks, f: F)
 where
     F: Fn(&binder::Strong<dyn crate::ITarishCallback>) -> binder::Result<()>,
 {
-    let Ok(cbs) = callbacks.lock() else {
+    let Ok(mut cbs) = callbacks.lock() else {
         warn!("quickshare: callback list poisoned");
         return;
     };
-    for cb in cbs.iter() {
-        if let Err(e) = f(cb) {
+    // DEAD_OBJECT UNREGISTERS; EVERYTHING ELSE DOES NOT. A client that is merely busy, or
+    // that threw, keeps its callback -- the next event may well reach it. A dead one never
+    // will, and progress fires per chunk, so keeping it means a failed transaction for every
+    // chunk of every remaining file. Measured 2026-09-25 on a 20 MB off-network receive: 82
+    // DEAD_OBJECT transactions in 1.3 s against an app that had already gone. The AirDrop
+    // server side has always done this (httpd.rs); this path had not.
+    let before = cbs.len();
+    cbs.retain(|cb| match f(cb) {
+        Ok(()) => true,
+        Err(e) if e.transaction_error() == binder::StatusCode::DEAD_OBJECT => false,
+        Err(e) => {
             debug!("quickshare: callback failed: {e:?}");
+            true
         }
+    });
+    if cbs.len() != before {
+        info!(
+            "quickshare: dropped {} dead callback(s); {} left",
+            before - cbs.len(),
+            cbs.len()
+        );
     }
 }
 
