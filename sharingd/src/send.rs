@@ -137,6 +137,21 @@ pub fn send(
         }
     }
     let (status, _) = read_response(&mut tls)?;
+    if status == 0 {
+        // NOT A DECLINE. Status 0 means no status line came back at all: the peer closed the
+        // connection without answering. Seen on blazer 2026-09-25 — /Discover answered 200 with
+        // a full body, then /Ask was closed 0.8s later with zero bytes — and it was reported to
+        // the operator as "the peer declined (0)". Nobody had declined anything; no prompt was
+        // ever shown. iOS does this when it is not in a receptive state (its "Everyone" window
+        // has lapsed, or the receiver is otherwise not accepting offers), so the honest message
+        // is about the peer's state, not the person's choice. It is also NOT PermissionDenied,
+        // so the caller must not map it to STATUS_DECLINED.
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "the peer closed the connection without answering the offer — no prompt was shown; \
+             check that AirDrop on that device is set to Everyone and it is awake",
+        ));
+    }
     if status != 200 {
         // 401 is the peer declining, which is a normal outcome and not a fault.
         return Err(io::Error::new(
