@@ -766,6 +766,8 @@ fn main() {
     // once, at boot, keeping its capabilities for its whole life; only the session
     // comes and goes. See WANT_PROP.
     let mut link: Option<Link> = None;
+    // When the blind-session watchdog last restarted the link; see BLIND_RESTART_COOLDOWN.
+    let mut last_blind_restart: Option<std::time::Instant> = None;
     let mut last_want: Option<bool> = None;
     let mut retry_at = std::time::Instant::now();
     let mut last_error = String::new();
