@@ -697,6 +697,22 @@ impl Link {
     }
 }
 
+impl Link {
+    /// Seconds the shim reports the session blind (master adopted, clock unusable); None
+    /// when the loaded library does not export `mosey_health` (Google's libmosey, an
+    /// older pin).
+    fn blind_secs(&self) -> Option<u32> {
+        self._session.blind_secs()
+    }
+}
+
+/// How long the session may be blind before it is restarted, and how often that may
+/// happen. A minute is well past the ~0.5 s a healthy re-sync takes and short enough that
+/// a person waiting on the Send screen still sees the list fill; the cooldown keeps a link
+/// that cannot sync from being torn down every minute forever.
+const BLIND_RESTART_AFTER_SECS: u32 = 60;
+const BLIND_RESTART_COOLDOWN: Duration = Duration::from_secs(180);
+
 impl Drop for Link {
     fn drop(&mut self) {
         // Take the rule out first, while the interface is still there. The routes
@@ -884,6 +900,26 @@ fn main() {
                     "AWDL link died underneath us — wondertap0 is down or gone, most likely a \
                      Wi-Fi association change reloading the driver. Releasing and re-acquiring."
                 );
+                link = None;
+            }
+            // THE LINK IS UP AND WE ARE BLIND ON IT. The shim says a master is adopted and
+            // the cluster clock has not been usable for a minute: every data frame we send
+            // goes out in slots nobody listens in, so mDNS gets no answers and discovery is
+            // dead while every layer looks healthy (BUILD-NOTES 70, task #48). Measured
+            // 2026-09-25: five minutes blind, then a manual restart synced in two seconds. A
+            // fresh session re-elects, and it also has a fresh link-local address, which is
+            // what makes Apple's responders answer our browse again (task #59). Rate-limited,
+            // because a restart is exactly the kind of thing that can loop.
+            (true, true)
+                if link.as_ref().and_then(|l| l.blind_secs()).unwrap_or(0) >= BLIND_RESTART_AFTER_SECS
+                    && last_blind_restart.map_or(true, |t| t.elapsed() >= BLIND_RESTART_COOLDOWN) =>
+            {
+                log::warn!(
+                    "AWDL clock unusable for {} s with a master adopted — restarting the session \
+                     to re-elect and re-sync (task #48)",
+                    link.as_ref().and_then(|l| l.blind_secs()).unwrap_or(0)
+                );
+                last_blind_restart = Some(std::time::Instant::now());
                 link = None;
             }
             _ => {}

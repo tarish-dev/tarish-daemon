@@ -65,8 +65,14 @@ pub enum OpMode {
 pub struct Session {
     handle: *mut c_void,
     stop: Option<Stop>,
+    /// `uint32_t mosey_health(void)`: seconds the session has been blind (a master
+    /// adopted, no usable cluster clock). Our shim's addition, like `mosey_version`; absent
+    /// from Google's libmosey and from older pins, so optional.
+    health: Option<Health>,
     _lib: *mut c_void,
 }
+
+type Health = unsafe extern "C" fn() -> u32;
 
 // SAFETY: the handle is only ever touched from the thread that made it, or on
 // shutdown. tarishd creates, holds and drops a Session entirely on its main thread --
@@ -107,7 +113,7 @@ impl Session {
 
         // SAFETY: lib is a live handle from dlopen; the names are the exact
         // exported symbols documented in docs/MOSEY-FFI.md.
-        let (start5, stop) = unsafe {
+        let (start5, stop, health) = unsafe {
             let name = CString::new("mosey_start_5").unwrap();
             let p = dlsym(lib, name.as_ptr());
             if p.is_null() {
@@ -125,7 +131,18 @@ impl Session {
             } else {
                 Some(std::mem::transmute(p))
             };
-            (start5, stop)
+
+            // Optional: only our shim exports it. Its absence is logged once here, so a
+            // daemon that never restarts a blind session says why in its first lines.
+            let name = CString::new("mosey_health").unwrap();
+            let p = dlsym(lib, name.as_ptr());
+            let health: Option<Health> = if p.is_null() {
+                log::info!("{loaded} exports no mosey_health — blind-session restarts unavailable");
+                None
+            } else {
+                Some(std::mem::transmute(p))
+            };
+            (start5, stop, health)
         };
 
         let cc = CString::new(country).map_err(|e| e.to_string())?;
@@ -152,7 +169,13 @@ impl Session {
             );
         }
 
-        Ok(Session { handle, stop, _lib: lib })
+        Ok(Session { handle, stop, health, _lib: lib })
+    }
+
+    /// Seconds the shim reports the session blind; None if the library cannot say.
+    pub fn blind_secs(&self) -> Option<u32> {
+        // SAFETY: a function pointer resolved from the live library; takes no arguments.
+        self.health.map(|f| unsafe { f() })
     }
 
     fn open_lib() -> Result<(*mut c_void, String), String> {
