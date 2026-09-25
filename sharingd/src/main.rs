@@ -1102,6 +1102,8 @@ struct TarishService {
     callbacks: Callbacks,
     transfers: Transfers,
     names: PeerNames,
+    /// See `AcceptState`.
+    accepting: AcceptState,
     query_now: QueryNow,
     refresh_now: QueryNow,
     /// Set by reportAppleAdvertisement when a device stops being receptive; the browser
@@ -1527,6 +1529,34 @@ const PROTOCOL_QUICKSHARE: i32 = 1;
 /// TarishPeer.state -- see the AIDL.
 const STATE_RECEPTIVE: i32 = 0;
 const STATE_SCREEN_OFF: i32 = 1;
+const STATE_NOT_ACCEPTING: i32 = 2;
+
+/// Whether a NAMED AirDrop peer will take a transfer from us, learned by asking.
+///
+/// An iPhone whose "Everyone for 10 Minutes" has ended stays on the link with BLE still
+/// saying "receiving on" (Contacts Only sets the same bit) and nothing over mDNS changes
+/// -- measured 2026-09-25 17:41 and 19:02, the operator looking at a tile that would not
+/// take a file. The one thing that does change is that /Discover stops being answered:
+/// inside a window it names the peer; outside it the connect is accepted and the TLS
+/// handshake is left to die. So a named peer is re-asked on a slow cadence, and after
+/// `ACCEPT_STALLS_TO_LABEL` stalls in a row its tile says "not accepting". One answer
+/// clears it. Keyed by link-local address like `names`, for the same rotation reason.
+type AcceptState = Arc<Mutex<std::collections::HashMap<String, Accepting>>>;
+
+#[derive(Clone, Copy)]
+struct Accepting {
+    /// Consecutive /Discover attempts the peer accepted and then let die.
+    stalls: u32,
+    /// When the last attempt started; the cadence and a guard against piling up.
+    last: Instant,
+}
+
+/// One bounded TLS connect per listed iPhone per minute. A healthy iPhone tolerates it --
+/// the send path opens the same connection -- and it is the only live "will accept us".
+const ACCEPT_PROBE_EVERY: Duration = Duration::from_secs(60);
+/// Two stalls, because one can be the listener simply not being up at that instant
+/// (task #46: a healthy iPhone refuses or stalls a good share of connects).
+const ACCEPT_STALLS_TO_LABEL: u32 = 2;
 
 /// A peer labelled "screen off" for this long is taken off the list, as stock does. It
 /// stays in the browser's table and keeps being probed, so it is back the instant BLE
@@ -1556,6 +1586,7 @@ impl TarishService {
             callbacks: Arc::new(Mutex::new(Vec::new())),
             transfers: Arc::new(TransferState::default()),
             names: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            accepting: Arc::new(Mutex::new(std::collections::HashMap::new())),
             query_now: Arc::new(AtomicBool::new(false)),
             refresh_now: Arc::new(AtomicBool::new(false)),
             probe_now: Arc::new(AtomicBool::new(false)),
@@ -2484,6 +2515,7 @@ impl ITarishService for TarishService {
         }
         let peers = self.peers.lock().map_err(|_| Status::from(StatusCode::UNKNOWN_ERROR))?;
         let names = self.names.lock().map_err(|_| Status::from(StatusCode::UNKNOWN_ERROR))?;
+        let accepting = self.accepting.lock().map_err(|_| Status::from(StatusCode::UNKNOWN_ERROR))?;
         // One entry per DEVICE, not per mDNS instance.
         //
         // Apple rotates its instance name, and for a few seconds after a rotation both
@@ -2599,7 +2631,17 @@ impl ITarishService for TarishService {
                 // Quick Share discovery runs on wlan0 and is not folded into this
                 // table yet; when it is, this is the field that keeps the two apart.
                 protocol: PROTOCOL_AIRDROP,
-                state: if p.unreceptive_since.is_some() { STATE_SCREEN_OFF } else { STATE_RECEPTIVE },
+                state: if p.unreceptive_since.is_some() {
+                    STATE_SCREEN_OFF
+                } else if p
+                    .addr
+                    .and_then(|a| accepting.get(&a.to_string()))
+                    .map_or(false, |a| a.stalls >= ACCEPT_STALLS_TO_LABEL)
+                {
+                    STATE_NOT_ACCEPTING
+                } else {
+                    STATE_RECEPTIVE
+                },
             })
             .chain(quickshare)
             .collect())
@@ -2660,6 +2702,7 @@ impl ITarishService for TarishService {
         let peers_for_send = self.peers.clone();
         let peer_instance = peer_id.to_string();
         let callbacks = self.callbacks.clone();
+        let accepting = self.accepting.clone();
         let name = device_name();
         let model = device_model();
 
@@ -2707,6 +2750,18 @@ impl ITarishService for TarishService {
                 }
                 Err(e) => {
                     log::warn!("send {id} failed: {e}");
+                    // A handshake the peer accepted and let die is the Contacts Only
+                    // signature (send::connect). Put it on the tile now, not a minute from
+                    // now when the accept probe would find the same thing.
+                    if e.to_string().contains("would not complete the handshake") {
+                        if let Ok(mut acc) = accepting.lock() {
+                            let a = acc
+                                .entry(target.addr.to_string())
+                                .or_insert(Accepting { stalls: 0, last: Instant::now() });
+                            a.stalls = a.stalls.max(ACCEPT_STALLS_TO_LABEL);
+                            a.last = Instant::now();
+                        }
+                    }
                     // A refusal is not a fault, and a client should be able to say so.
                     // PermissionDenied is what send() returns when /Ask answers with a
                     // non-200: the person on the other device pressed Decline.
@@ -2862,17 +2917,41 @@ impl ITarishService for TarishService {
 /// AirDrop carries no name in mDNS, so this is the only way to show a person something
 /// they recognise instead of twelve hex characters. Failures are expected and quiet: a
 /// peer that is not discoverable to us simply will not answer, which is not a fault.
-fn probe_name(names: PeerNames, instance: String, target: send::Target) {
+/// Ask a peer /Discover, off the discovery thread. Names it on success; and records, for
+/// a peer we already know by name, whether it still answers us at all (see `AcceptState`).
+fn probe_name(names: PeerNames, accepting: AcceptState, instance: String, target: send::Target) {
     let key = target.addr.to_string();
-    std::thread::spawn(move || match send::discover(&target) {
-        Ok(Some(name)) => {
-            log::info!("peer {instance} at {key} is {name:?}");
-            if let Ok(mut cache) = names.lock() {
-                cache.insert(key, name);
+    std::thread::spawn(move || {
+        let outcome = send::discover(&target);
+        let now = Instant::now();
+        match &outcome {
+            Ok(Some(name)) => {
+                log::info!("peer {instance} at {key} is {name:?}");
+                if let Ok(mut cache) = names.lock() {
+                    cache.insert(key.clone(), name.clone());
+                }
+            }
+            Ok(None) => log::debug!("peer {instance} did not give a name"),
+            Err(e) => log::debug!("peer {instance} /Discover failed: {e}"),
+        }
+        if let Ok(mut acc) = accepting.lock() {
+            let entry = acc.entry(key).or_insert(Accepting { stalls: 0, last: now });
+            entry.last = now;
+            match outcome {
+                // Answered: it will talk to us.
+                Ok(_) => entry.stalls = 0,
+                // Accepted the connection and let the handshake die: the Contacts Only
+                // signature (send::connect maps it to TimedOut). Count it.
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    entry.stalls = entry.stalls.saturating_add(1);
+                    if entry.stalls == ACCEPT_STALLS_TO_LABEL {
+                        log::info!("peer {instance} is not accepting from this device ({} stalled handshakes)", entry.stalls);
+                    }
+                }
+                // Refused, unreachable, reset: says nothing about acceptance (task #46).
+                Err(_) => {}
             }
         }
-        Ok(None) => log::debug!("peer {instance} did not give a name"),
-        Err(e) => log::debug!("peer {instance} /Discover failed: {e}"),
     });
 }
 
@@ -2913,6 +2992,7 @@ fn start_discovery(
     reset_identity: QueryNow,
     apple: AppleNearbyTable,
     probe_now: QueryNow,
+    accepting: AcceptState,
 ) {
         let ifc = iface();
     std::thread::spawn(move || {
@@ -3045,8 +3125,28 @@ fn start_discovery(
                 let now = Instant::now();
                 for p in table.iter_mut() {
                     let Some(addr) = p.addr else { continue };
-                    if p.port == 0 || known.contains_key(&addr.to_string()) {
-                        continue;   // not reachable yet, or already named
+                    if p.port == 0 {
+                        continue;   // not reachable yet
+                    }
+                    // Already named: re-ask on the slow cadence to learn whether it still
+                    // accepts us (AcceptState). Its own scheduling, not the naming backoff.
+                    // The start time is stamped here so the next tick does not schedule the
+                    // same peer again before the thread has run; the thread restamps it.
+                    if known.contains_key(&addr.to_string()) {
+                        let key = addr.to_string();
+                        let due = accepting.lock().map_or(false, |mut acc| {
+                            let a = acc.entry(key).or_insert(Accepting { stalls: 0, last: now - ACCEPT_PROBE_EVERY });
+                            if now.duration_since(a.last) >= ACCEPT_PROBE_EVERY {
+                                a.last = now;
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        if due {
+                            to_probe.push((p.instance.clone(), addr, p.port));
+                        }
+                        continue;
                     }
                     let (attempts, due) = match probed.get(&p.instance) {
                         None => (0, true),
@@ -3070,7 +3170,7 @@ fn start_discovery(
             }
             for (instance, addr, port) in to_probe {
                 if let Ok(scope) = mdns::ifindex_of(ifc) {
-                    probe_name(names.clone(), instance, send::Target { addr, port, scope });
+                    probe_name(names.clone(), accepting.clone(), instance, send::Target { addr, port, scope });
                 }
             }
 
@@ -3658,6 +3758,7 @@ fn main() {
         service.reset_identity.clone(),
         service.apple.clone(),
         service.probe_now.clone(),
+        service.accepting.clone(),
     );
     // The HTTP server refuses transfers while invisible and announces finished ones,
     // so it needs both the flag and the callback list the service owns.

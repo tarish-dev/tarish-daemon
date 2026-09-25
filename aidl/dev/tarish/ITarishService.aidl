@@ -153,6 +153,14 @@ interface ITarishService {
      * AirDrop switched off. The same thing on the air, and the same thing for a sender.
      */
     const int STATE_SCREEN_OFF = 1;
+    /**
+     * TarishPeer.state: on the link, screen on, but it will not take a transfer from THIS
+     * device -- an iPhone whose "Everyone for 10 Minutes" has ended and is back to Contacts
+     * Only. Nothing on BLE or mDNS distinguishes that from Everyone; the daemon learns it
+     * by asking (/Discover succeeds only in Everyone) and by a send whose handshake the
+     * peer lets die. The remedy is on the other device: open Everyone again.
+     */
+    const int STATE_NOT_ACCEPTING = 2;
 
     /**
      * Install the policy this device is to enforce.
