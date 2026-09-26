@@ -726,36 +726,15 @@ where
     // most ~1% steps (and always the final one), matching the send path.
     let mut reported_bytes: u64 = 0;
     let mut transfer_id: i64 = 0;
-    // WHERE THE RECEIVE LOOP'S TIME ACTUALLY GOES.
-    //
-    // This loop does 47 MB/s over the LAN and 800 KB/s over Wi-Fi Direct with the same buffer,
-    // the same decoder and the same disk. 800 KB/s at the measured 16 ms round trip is ~12.8 KB
-    // per RTT, which is one 16 KiB read per round trip — a lockstep, not a bandwidth limit. Four
-    // theories have already died guessing at which step waits, so the loop now reports it:
-    // microseconds inside the socket read, the decrypt, the reassembler, and the file write,
-    // with the frame count. Whichever dominates is the answer; if none does, the wait is
-    // somewhere this does not cover and that is worth knowing too.
-    let (mut us_read, mut us_decrypt, mut us_assemble, mut us_write) = (0u128, 0u128, 0u128, 0u128);
-    // The first pass measured those four and they came to 83 ms for 512 KB — 6 MB/s of capability
-    // in a transfer running at 797 KB/s. So the time is NOT in reading, decrypting, reassembling
-    // or writing, and the useful number is the one that says so: wall clock against the sum of
-    // the parts. Whatever is left over is the bug's hiding place. These two are the leading
-    // suspects for it — the progress callback is a binder round trip into an app that has been
-    // seen to die mid-transfer, and the response write is the only other thing on the hot path.
-    let (mut us_notify, mut us_respond) = (0u128, 0u128);
-    // Round three. The bulk phase is 25 s and the loop goes round SEVEN times in it — frames are
-    // ~3 MB each — while every timer so far sums to 75 ms. So ~3.5 s per iteration is in one of
-    // the two calls still untimed: parsing the frame, or draining the effect queue at the top of
-    // the loop. These two close the gap; whichever holds the time is the answer.
-    let (mut us_parse, mut us_effects) = (0u128, 0u128);
-    let mut worst_iter_us = 0u128;
-    let wall = std::time::Instant::now();
-    let mut frames_in: u64 = 0;
-    let mut last_timing = std::time::Instant::now();
+    // The per-step timers that lived here are gone. They did their job: they ruled out the read,
+    // the decrypt, the reassembler and the write in turn, and the ~16 s they could not account
+    // for is what pointed at the handover. That is fixed (BUILD-NOTES 78, 79) and the loop now
+    // runs at 6 MB/s over Wi-Fi Direct, so the instrumentation is only log noise. If the
+    // question ever comes back, sample the thread's stacks with `debuggerd -b` instead -- it
+    // found this in one run, where three rounds of timers had not.
 
     let mut pending = fsm.start();
     loop {
-        let t_eff = std::time::Instant::now();
         // Perform whatever the machine asked for before reading again.
         //
         // Taken out first rather than drained in place: handling an effect can produce
@@ -893,7 +872,6 @@ where
             }
         }
 
-        us_effects += t_eff.elapsed().as_micros();
         if host.cancelled() {
             pending.extend(fsm.on(Event::UserCancelled));
             continue;
@@ -908,26 +886,14 @@ where
         let plain = match deferred.pop_front() {
             Some(p) => p,
             None => {
-                let t_read = std::time::Instant::now();
                 let wire = input.next()?;
-                us_read += t_read.elapsed().as_micros();
-                frames_in += 1;
-                let t_dec = std::time::Instant::now();
-                let out = channel.decrypt(&wire).map_err(chan)?;
-                us_decrypt += t_dec.elapsed().as_micros();
-                out
+                channel.decrypt(&wire).map_err(chan)?
             }
         };
-        let t_p = std::time::Instant::now();
         let parsed = frames::parse(&plain).map_err(bad)?;
-        let d_parse = t_p.elapsed().as_micros();
-        us_parse += d_parse;
-        if d_parse > worst_iter_us { worst_iter_us = d_parse; }
         match parsed {
             OfflineFrame::PayloadTransfer(pt) => {
-                let t_asm = std::time::Instant::now();
                 let asm = assembler.accept(&pt).map_err(|e| bad(e.to_string()))?;
-                us_assemble += t_asm.elapsed().as_micros();
                 match asm {
                     PayloadEvent::Bytes { data, .. } => {
                         let frame = sharing::parse(&data)
@@ -961,34 +927,13 @@ where
                                 sinks.get_mut(&id).expect("just inserted")
                             }
                         };
-                        let t_w = std::time::Instant::now();
                         sink.write_all(&data)?;
-                        us_write += t_w.elapsed().as_micros();
                         done_bytes += data.len() as u64;
                         // Report on ~1% steps, on the first chunk, and always on the last one
                         // of a payload. A step of 0 (unknown total) falls back to every 512 KiB.
                         let step = (total_bytes / 100).max(512 * 1024);
-                        if last_timing.elapsed() >= Duration::from_secs(2) {
-                            last_timing = std::time::Instant::now();
-                            let acc = us_read + us_decrypt + us_assemble + us_write
-                                + us_notify + us_respond + us_parse + us_effects;
-                            let w = wall.elapsed().as_micros();
-                            info!(
-                                "quickshare: rx cost — wall {} ms for {} bytes in {} frames | \
-                                 read {} decrypt {} assemble {} write {} notify {} respond {} \
-                                 parse {} effects {} worst-parse {} \
-                                 | UNACCOUNTED {} ms ({}%)",
-                                w / 1000, done_bytes, frames_in,
-                                us_read / 1000, us_decrypt / 1000, us_assemble / 1000,
-                                us_write / 1000, us_notify / 1000, us_respond / 1000,
-                                us_parse / 1000, us_effects / 1000, worst_iter_us / 1000,
-                                w.saturating_sub(acc) / 1000,
-                                if w > 0 { 100 * w.saturating_sub(acc) / w } else { 0 }
-                            );
-                        }
                         if last || reported_bytes == 0 || done_bytes - reported_bytes >= step {
                             reported_bytes = done_bytes;
-                            let t_n = std::time::Instant::now();
                             host.progress(done_bytes, total_bytes);
                             notify(callbacks, |cb| {
                                 cb.onTransferProgress(
@@ -997,7 +942,6 @@ where
                                     total_bytes as i64,
                                 )
                             });
-                            us_notify += t_n.elapsed().as_micros();
                         }
 
                         if last {
@@ -1079,11 +1023,7 @@ where
             OfflineFrame::KeepAlive { ack: false, seq_num } => {
                 // Answer, or the peer decides we are gone and drops a live transfer.
                 let ka = frames::keep_alive(true, seq_num);
-                {
-                    let t_r = std::time::Instant::now();
-                    write_frame(&mut out, &channel.encrypt(&ka).map_err(chan)?)?;
-                    us_respond += t_r.elapsed().as_micros();
-                }
+                write_frame(&mut out, &channel.encrypt(&ka).map_err(chan)?)?;
             }
             OfflineFrame::KeepAlive { .. } => {}
             OfflineFrame::Disconnection { request_safe, .. } => {
