@@ -297,6 +297,88 @@ impl<S: ReadReady> Frames<S> {
 /// ago. Generous, because the alternative to waiting is a transfer that crawls.
 const JOIN_WAIT: Duration = Duration::from_secs(25);
 
+/// How long to let the client spend standing up a group before giving up on it.
+///
+/// Arming the radio is itself a sequence of bounded waits -- releasing an AirDrop hold, then
+/// the p2p slot -- and forming the group after that takes 4-8s on real hardware. This is the
+/// ceiling on the whole of it, not a pause: nothing sleeps for this long on success.
+const GROUP_WAIT: Duration = Duration::from_secs(30);
+
+/// The most a handover may buffer off the old socket before it stops draining it.
+///
+/// A ceiling is not optional. These are frames from a peer whose transfer has not completed
+/// and may never, so an unbounded queue here is a memory bomb with a remote trigger. Past the
+/// cap the drain stops and TCP goes back to doing the pushing back, which is the old
+/// behaviour and merely slow.
+const HANDOVER_DEFER_CAP: usize = 8 * 1024 * 1024;
+
+/// Wait for `ready()` **while keeping the old socket draining**.
+///
+/// Every wait inside a handover runs on the one thread that is also the reader of a live
+/// transfer, and standing still on it does not pause the sender -- it fills the socket, then
+/// the receive window, and the transfer stops dead until the handover returns. That is not a
+/// theory: 180 sampled stacks put this thread inside the handover for 38 s, with 1.49 MB
+/// sitting unread, the sender holding 5.67 MB it could not place, one retransmit, and a
+/// congestion window of 1043 -- a wide-open link and a reader that had gone away.
+///
+/// Frames read here go to `deferred`, which the main loop replays after the switch, so
+/// nothing is lost and order is kept. Upgrade frames are the exception and are dropped: the
+/// peer is already mid-handover with us, and feeding a second request back to the main loop
+/// is how one stall becomes a cycle of them.
+///
+/// Returns whether `ready()` came true before the deadline.
+fn drain_old(
+    input: &mut Frames<Reader>,
+    channel: &mut SecureChannel,
+    deferred: &mut std::collections::VecDeque<Vec<u8>>,
+    held: &mut usize,
+    deadline: std::time::Instant,
+    mut ready: impl FnMut() -> bool,
+) -> io::Result<bool> {
+    // Set once the old transport stops giving us frames. Not fatal here and not a reason to
+    // abandon the handover: the new socket may still be coming up, and the caller decides.
+    let mut spent = false;
+    loop {
+        if ready() {
+            return Ok(true);
+        }
+        let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            return Ok(ready());
+        };
+        // Short slices, so `ready()` is polled often and the socket is drained in between.
+        let slice = left.min(Duration::from_millis(100));
+        if spent || *held >= HANDOVER_DEFER_CAP {
+            // Nothing left to read, or deliberately no longer reading. This is a poll
+            // interval and nothing else -- there is no wait here that success has to sit
+            // through.
+            std::thread::sleep(slice);
+            continue;
+        }
+        match input.next_within(slice) {
+            Ok(Some(wire)) => {
+                let plain = channel.decrypt(&wire).map_err(chan)?;
+                if frames::upgrade_body(&plain).is_some() {
+                    debug!("quickshare: an upgrade frame arrived mid-handover; dropped");
+                    continue;
+                }
+                *held += plain.len();
+                deferred.push_back(plain);
+                if *held >= HANDOVER_DEFER_CAP {
+                    warn!(
+                        "quickshare: {held} B buffered during the handover; \
+                         pausing the drain and letting TCP push back"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                debug!("quickshare: the old transport went quiet mid-handover ({e})");
+                spent = true;
+            }
+        }
+    }
+}
+
 /// The host side of a bandwidth upgrade: stand up a group, offer it, take the sender onto it.
 ///
 /// The mirror of `adopt()` on the send side, and the same four-frame handover seen from the
@@ -309,7 +391,7 @@ const JOIN_WAIT: Duration = Duration::from_secs(25);
 ///
 /// `Ok(false)` means we stayed put, which is never fatal: an upgrade is an optimisation and
 /// treating its failure as a connection failure turns a slow transfer into no transfer.
-fn offer_group<H: Host>(
+fn offer_group<H: Host + Sync>(
     host: &H,
     input: &mut Frames<Reader>,
     out: &mut Writer,
@@ -330,7 +412,23 @@ fn offer_group<H: Host>(
     };
     let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
 
-    let Some(group) = host.host_group() else {
+    // STANDING UP THE GROUP MUST NOT STOP THE READING. `host_group` arms the radio, which
+    // means releasing an AirDrop hold and then the p2p slot, and it is seconds of waiting
+    // even when everything works. Run it beside the reader rather than in front of it.
+    let mut held = 0usize;
+    let group = std::thread::scope(|s| -> io::Result<Option<WifiGroup>> {
+        let worker = s.spawn(|| host.host_group());
+        drain_old(
+            input,
+            channel,
+            deferred,
+            &mut held,
+            std::time::Instant::now() + GROUP_WAIT,
+            || worker.is_finished(),
+        )?;
+        Ok(worker.join().unwrap_or(None))
+    })?;
+    let Some(group) = group else {
         debug!("quickshare: the client would not host a group");
         let no = upgrade::failure();
         write_frame(out, &channel.encrypt(&no).map_err(chan)?)?;
@@ -359,20 +457,39 @@ fn offer_group<H: Host>(
     };
     write_frame(out, &channel.encrypt(&upgrade::path_available(&path)).map_err(chan)?)?;
 
-    // The sender now has to associate with a network that did not exist a second ago.
+    // The sender now has to associate with a network that did not exist a second ago, and
+    // that is up to JOIN_WAIT of waiting. Non-blocking, and drained the whole time, for the
+    // same reason as the group above: the old socket is still carrying the transfer.
     listener
-        .set_nonblocking(false)
+        .set_nonblocking(true)
         .and_then(|_| listener.set_ttl(64))
         .ok();
-    let (sock, from) = match accept_within(&listener, JOIN_WAIT) {
-        Some(x) => x,
-        None => {
-            debug!("quickshare: the sender never joined; staying put");
-            let no = upgrade::failure();
-            write_frame(out, &channel.encrypt(&no).map_err(chan)?)?;
-            return Ok(false);
-        }
+    let mut joined: Option<(std::net::TcpStream, std::net::SocketAddr)> = None;
+    drain_old(
+        input,
+        channel,
+        deferred,
+        &mut held,
+        std::time::Instant::now() + JOIN_WAIT,
+        || match listener.accept() {
+            Ok(x) => {
+                joined = Some(x);
+                true
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => false,
+            // A listener that cannot accept will not start doing so. Stop waiting.
+            Err(_) => true,
+        },
+    )?;
+    let Some((sock, from)) = joined else {
+        debug!("quickshare: the sender never joined; staying put");
+        let no = upgrade::failure();
+        write_frame(out, &channel.encrypt(&no).map_err(chan)?)?;
+        return Ok(false);
     };
+    // Linux does not pass O_NONBLOCK from the listener to the accepted socket, but the rest
+    // of this function reads it as a blocking stream, so say so rather than depending on it.
+    let _ = sock.set_nonblocking(false);
     let _ = sock.set_nodelay(true);
     // Same reason as every other socket here: a peer that stops reading must cost this
     // transfer, not a thread that never returns.
@@ -441,34 +558,16 @@ fn offer_group<H: Host>(
         warn!("quickshare: no safe-to-close from the sender; switching over regardless");
     }
 
+    // Worth having in the log: it is the transfer that kept moving while the radio was
+    // being rearranged, and it used to be zero because nobody was reading.
+    info!(
+        "quickshare: handover complete; {held} B kept flowing during it \
+         ({} frames replayed)",
+        deferred.len()
+    );
     *input = new_in;
     *out = new_out;
     Ok(true)
-}
-
-/// Accept one connection, or give up. `set_read_timeout` does not apply to accept, so this
-/// polls the listener rather than blocking on it forever.
-fn accept_within(
-    listener: &std::net::TcpListener,
-    within: Duration,
-) -> Option<(std::net::TcpStream, std::net::SocketAddr)> {
-    let deadline = std::time::Instant::now() + within;
-    listener.set_nonblocking(true).ok()?;
-    while std::time::Instant::now() < deadline {
-        match listener.accept() {
-            Ok((s, a)) => {
-                let _ = s.set_nonblocking(false);
-                let _ = listener.set_nonblocking(false);
-                return Some((s, a));
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(_) => break,
-        }
-    }
-    let _ = listener.set_nonblocking(false);
-    None
 }
 
 /// Serve one connection. Returns the names written, or an error.
@@ -490,7 +589,9 @@ pub fn serve<H>(
     callbacks: &Callbacks,
 ) -> io::Result<ServeOutcome>
 where
-    H: Host,
+    // `Sync`, because the handover stands the group up on a scoped thread so the reader
+    // can keep draining the old socket while the radio is rearranged.
+    H: Host + Sync,
 {
     // Only worth upgrading FROM a slow transport. On a LAN socket we are already at tens of
     // megabytes and standing up a Wi-Fi Direct group would tear down a working link to get
@@ -896,13 +997,35 @@ where
                 // and it is the state that made this hard to debug from the other side.
                 match upgrade::parse(&body) {
                     Ok(upgrade::Frame::PathRequest { mediums }) => {
-                        if !mediums.contains(&upgrade::Medium::WifiDirect) {
+                        if upgraded {
+                            // ALREADY MOVED, SO DO NOT MOVE AGAIN. A second handover stands
+                            // up a second group and runs the whole four-frame exchange in
+                            // the middle of a transfer that is already running well. A
+                            // stock receiver declines a repeat for the same reason, and
+                            // says so: "ProcessBandwidthUpgradePathAvailableEvent ignored
+                            // by Advertiser".
+                            debug!("quickshare: already upgraded; ignoring a repeat request");
+                        } else if !bootstrap_is_slow {
+                            // The SENDER gates this on its side too, on the current medium
+                            // rather than the original one. Honour it here rather than
+                            // trusting the peer to have done so: standing up a Wi-Fi Direct
+                            // group in place of a working LAN socket is a downgrade no
+                            // matter who asked for it, and this branch is reachable from
+                            // any peer, not only from ours.
+                            debug!("quickshare: on {bootstrap:?} already; declining to upgrade");
+                            let no = upgrade::failure();
+                            write_frame(&mut out, &channel.encrypt(&no).map_err(chan)?)?;
+                        } else if !mediums.contains(&upgrade::Medium::WifiDirect) {
                             debug!("quickshare: sender asked for {mediums:?}, none of which we host");
                             let no = upgrade::failure();
                             write_frame(&mut out, &channel.encrypt(&no).map_err(chan)?)?;
                         } else {
                             match offer_group(host, &mut input, &mut out, &mut channel, &mut deferred)? {
-                                true => info!("quickshare: upgraded the inbound transfer to Wi-Fi Direct"),
+                                true => {
+                                    // Was missing, and that is what let a repeat through.
+                                    upgraded = true;
+                                    info!("quickshare: upgraded the inbound transfer to Wi-Fi Direct");
+                                }
                                 false => debug!("quickshare: staying on this transport"),
                             }
                         }
