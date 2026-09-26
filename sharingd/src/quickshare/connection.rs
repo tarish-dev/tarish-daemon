@@ -609,12 +609,19 @@ where
     // suspects for it — the progress callback is a binder round trip into an app that has been
     // seen to die mid-transfer, and the response write is the only other thing on the hot path.
     let (mut us_notify, mut us_respond) = (0u128, 0u128);
+    // Round three. The bulk phase is 25 s and the loop goes round SEVEN times in it — frames are
+    // ~3 MB each — while every timer so far sums to 75 ms. So ~3.5 s per iteration is in one of
+    // the two calls still untimed: parsing the frame, or draining the effect queue at the top of
+    // the loop. These two close the gap; whichever holds the time is the answer.
+    let (mut us_parse, mut us_effects) = (0u128, 0u128);
+    let mut worst_iter_us = 0u128;
     let wall = std::time::Instant::now();
     let mut frames_in: u64 = 0;
     let mut last_timing = std::time::Instant::now();
 
     let mut pending = fsm.start();
     loop {
+        let t_eff = std::time::Instant::now();
         // Perform whatever the machine asked for before reading again.
         //
         // Taken out first rather than drained in place: handling an effect can produce
@@ -751,6 +758,7 @@ where
             }
         }
 
+        us_effects += t_eff.elapsed().as_micros();
         if host.cancelled() {
             pending.extend(fsm.on(Event::UserCancelled));
             continue;
@@ -775,7 +783,12 @@ where
                 out
             }
         };
-        match frames::parse(&plain).map_err(bad)? {
+        let t_p = std::time::Instant::now();
+        let parsed = frames::parse(&plain).map_err(bad)?;
+        let d_parse = t_p.elapsed().as_micros();
+        us_parse += d_parse;
+        if d_parse > worst_iter_us { worst_iter_us = d_parse; }
+        match parsed {
             OfflineFrame::PayloadTransfer(pt) => {
                 let t_asm = std::time::Instant::now();
                 let asm = assembler.accept(&pt).map_err(|e| bad(e.to_string()))?;
@@ -823,15 +836,17 @@ where
                         if last_timing.elapsed() >= Duration::from_secs(2) {
                             last_timing = std::time::Instant::now();
                             let acc = us_read + us_decrypt + us_assemble + us_write
-                                + us_notify + us_respond;
+                                + us_notify + us_respond + us_parse + us_effects;
                             let w = wall.elapsed().as_micros();
                             info!(
                                 "quickshare: rx cost — wall {} ms for {} bytes in {} frames | \
                                  read {} decrypt {} assemble {} write {} notify {} respond {} \
+                                 parse {} effects {} worst-parse {} \
                                  | UNACCOUNTED {} ms ({}%)",
                                 w / 1000, done_bytes, frames_in,
                                 us_read / 1000, us_decrypt / 1000, us_assemble / 1000,
                                 us_write / 1000, us_notify / 1000, us_respond / 1000,
+                                us_parse / 1000, us_effects / 1000, worst_iter_us / 1000,
                                 w.saturating_sub(acc) / 1000,
                                 if w > 0 { 100 * w.saturating_sub(acc) / w } else { 0 }
                             );
