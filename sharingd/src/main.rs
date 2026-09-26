@@ -397,6 +397,38 @@ pub(crate) struct TransferState {
 /// stalled one is ever reclaimed.
 const STALE_TRANSFER: Duration = Duration::from_secs(180);
 
+/// Frees the transfer slot when the owning thread ends, HOWEVER it ends.
+///
+/// `finish()` is called from eighteen places and every one of them is a chance for an error
+/// path to slip past. Missing one does not fail that transfer -- it fails every LATER one,
+/// because the slot stays claimed and `try_begin` answers "busy with another transfer"
+/// until it goes stale. Observed 2026-09-26: the transfer thread was gone from the process
+/// entirely, the slot was still held, and nine consecutive sends were refused.
+///
+/// The staleness reclaim is the backstop and it works, but STALE_TRANSFER is **three
+/// minutes** -- deliberately, because a transfer waiting for a person to tap accept is
+/// quiet but alive, and a short window would reclaim it. So the backstop cannot be tightened
+/// and the leak has to be closed at the source instead.
+///
+/// Idempotent by construction: `finish()` compare-exchanges on the id, so an explicit call
+/// on the happy path makes this a no-op rather than a double release.
+pub(crate) struct SlotGuard {
+    transfers: Transfers,
+    id: i64,
+}
+
+impl SlotGuard {
+    pub(crate) fn new(transfers: &Transfers, id: i64) -> Self {
+        Self { transfers: Arc::clone(transfers), id }
+    }
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        self.transfers.finish(self.id);
+    }
+}
+
 impl TransferState {
     /// Claim the single transfer slot, EXCLUSIVELY. Returns the new transfer id, or `None` if
     /// a transfer is already in progress (either protocol) -- the caller must then refuse the
@@ -2552,6 +2584,8 @@ impl ITarishService for TarishService {
         let callbacks = self.callbacks.clone();
         let auto_accept = self.auto_accept.clone();
         std::thread::spawn(move || {
+            // Frees the slot however this thread ends. See SlotGuard.
+            let _slot = SlotGuard::new(&transfers, id);
             let host = QsHost {
                 id,
                 // The peer names itself in its ConnectionRequest, which serve() reads. There
@@ -2883,6 +2917,8 @@ impl ITarishService for TarishService {
         // Sending happens off the binder thread: a transfer runs for as long as it runs,
         // and holding a binder worker for that would block every other call into us.
         std::thread::spawn(move || {
+            // Frees the slot however this thread ends. See SlotGuard.
+            let _slot = SlotGuard::new(&transfers, id);
             let announce = |f: &dyn Fn(&Strong<dyn ITarishCallback>) -> binder::Result<()>| {
                 if let Ok(cbs) = callbacks.lock() {
                     for cb in cbs.iter() {
@@ -3799,6 +3835,8 @@ fn start_quickshare_discovery(
     discoverable: Discoverable,
 ) {
     std::thread::spawn(move || {
+        // Frees the slot however this thread ends. See SlotGuard.
+        let _slot = SlotGuard::new(&transfers, id);
         const IFACE: &str = "wlan0";
         // Instances already reported, so a peer is announced when it appears rather than
         // every half second for as long as it stays.
@@ -4101,6 +4139,8 @@ impl TarishService {
         let require_pin = self.require_pin.load(Ordering::SeqCst);
 
         std::thread::spawn(move || {
+            // Frees the slot however this thread ends. See SlotGuard.
+            let _slot = SlotGuard::new(&transfers, id);
             // Two handles on the same socket. `send` wants a reader and a writer, and a
             // socket is both -- but it must be ONE socket, not two, or the peer's replies
             // arrive on a descriptor nobody is reading.
@@ -4270,6 +4310,8 @@ impl TarishService {
         let require_pin = self.require_pin.load(Ordering::SeqCst);
 
         std::thread::spawn(move || {
+            // Frees the slot however this thread ends. See SlotGuard.
+            let _slot = SlotGuard::new(&transfers, id);
             let reader = match sock.try_clone() {
                 Ok(r) => r,
                 Err(e) => {
