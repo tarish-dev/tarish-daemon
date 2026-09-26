@@ -602,6 +602,14 @@ where
     // with the frame count. Whichever dominates is the answer; if none does, the wait is
     // somewhere this does not cover and that is worth knowing too.
     let (mut us_read, mut us_decrypt, mut us_assemble, mut us_write) = (0u128, 0u128, 0u128, 0u128);
+    // The first pass measured those four and they came to 83 ms for 512 KB — 6 MB/s of capability
+    // in a transfer running at 797 KB/s. So the time is NOT in reading, decrypting, reassembling
+    // or writing, and the useful number is the one that says so: wall clock against the sum of
+    // the parts. Whatever is left over is the bug's hiding place. These two are the leading
+    // suspects for it — the progress callback is a binder round trip into an app that has been
+    // seen to die mid-transfer, and the response write is the only other thing on the hot path.
+    let (mut us_notify, mut us_respond) = (0u128, 0u128);
+    let wall = std::time::Instant::now();
     let mut frames_in: u64 = 0;
     let mut last_timing = std::time::Instant::now();
 
@@ -814,15 +822,23 @@ where
                         let step = (total_bytes / 100).max(512 * 1024);
                         if last_timing.elapsed() >= Duration::from_secs(2) {
                             last_timing = std::time::Instant::now();
+                            let acc = us_read + us_decrypt + us_assemble + us_write
+                                + us_notify + us_respond;
+                            let w = wall.elapsed().as_micros();
                             info!(
-                                "quickshare: rx cost so far — {} frames, read {} ms, decrypt {} ms, \
-                                 assemble {} ms, write {} ms ({} bytes)",
-                                frames_in, us_read / 1000, us_decrypt / 1000,
-                                us_assemble / 1000, us_write / 1000, done_bytes
+                                "quickshare: rx cost — wall {} ms for {} bytes in {} frames | \
+                                 read {} decrypt {} assemble {} write {} notify {} respond {} \
+                                 | UNACCOUNTED {} ms ({}%)",
+                                w / 1000, done_bytes, frames_in,
+                                us_read / 1000, us_decrypt / 1000, us_assemble / 1000,
+                                us_write / 1000, us_notify / 1000, us_respond / 1000,
+                                w.saturating_sub(acc) / 1000,
+                                if w > 0 { 100 * w.saturating_sub(acc) / w } else { 0 }
                             );
                         }
                         if last || reported_bytes == 0 || done_bytes - reported_bytes >= step {
                             reported_bytes = done_bytes;
+                            let t_n = std::time::Instant::now();
                             host.progress(done_bytes, total_bytes);
                             notify(callbacks, |cb| {
                                 cb.onTransferProgress(
@@ -831,6 +847,7 @@ where
                                     total_bytes as i64,
                                 )
                             });
+                            us_notify += t_n.elapsed().as_micros();
                         }
 
                         if last {
@@ -882,7 +899,11 @@ where
             OfflineFrame::KeepAlive { ack: false, seq_num } => {
                 // Answer, or the peer decides we are gone and drops a live transfer.
                 let ka = frames::keep_alive(true, seq_num);
-                write_frame(&mut out, &channel.encrypt(&ka).map_err(chan)?)?;
+                {
+                    let t_r = std::time::Instant::now();
+                    write_frame(&mut out, &channel.encrypt(&ka).map_err(chan)?)?;
+                    us_respond += t_r.elapsed().as_micros();
+                }
             }
             OfflineFrame::KeepAlive { .. } => {}
             OfflineFrame::Disconnection { request_safe, .. } => {
