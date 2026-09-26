@@ -592,6 +592,18 @@ where
     // most ~1% steps (and always the final one), matching the send path.
     let mut reported_bytes: u64 = 0;
     let mut transfer_id: i64 = 0;
+    // WHERE THE RECEIVE LOOP'S TIME ACTUALLY GOES.
+    //
+    // This loop does 47 MB/s over the LAN and 800 KB/s over Wi-Fi Direct with the same buffer,
+    // the same decoder and the same disk. 800 KB/s at the measured 16 ms round trip is ~12.8 KB
+    // per RTT, which is one 16 KiB read per round trip — a lockstep, not a bandwidth limit. Four
+    // theories have already died guessing at which step waits, so the loop now reports it:
+    // microseconds inside the socket read, the decrypt, the reassembler, and the file write,
+    // with the frame count. Whichever dominates is the answer; if none does, the wait is
+    // somewhere this does not cover and that is worth knowing too.
+    let (mut us_read, mut us_decrypt, mut us_assemble, mut us_write) = (0u128, 0u128, 0u128, 0u128);
+    let mut frames_in: u64 = 0;
+    let mut last_timing = std::time::Instant::now();
 
     let mut pending = fsm.start();
     loop {
@@ -745,13 +757,22 @@ where
         let plain = match deferred.pop_front() {
             Some(p) => p,
             None => {
+                let t_read = std::time::Instant::now();
                 let wire = input.next()?;
-                channel.decrypt(&wire).map_err(chan)?
+                us_read += t_read.elapsed().as_micros();
+                frames_in += 1;
+                let t_dec = std::time::Instant::now();
+                let out = channel.decrypt(&wire).map_err(chan)?;
+                us_decrypt += t_dec.elapsed().as_micros();
+                out
             }
         };
         match frames::parse(&plain).map_err(bad)? {
             OfflineFrame::PayloadTransfer(pt) => {
-                match assembler.accept(&pt).map_err(|e| bad(e.to_string()))? {
+                let t_asm = std::time::Instant::now();
+                let asm = assembler.accept(&pt).map_err(|e| bad(e.to_string()))?;
+                us_assemble += t_asm.elapsed().as_micros();
+                match asm {
                     PayloadEvent::Bytes { data, .. } => {
                         let frame = sharing::parse(&data)
                             .map_err(|e| bad(format!("sharing frame: {e}")))?;
@@ -784,11 +805,22 @@ where
                                 sinks.get_mut(&id).expect("just inserted")
                             }
                         };
+                        let t_w = std::time::Instant::now();
                         sink.write_all(&data)?;
+                        us_write += t_w.elapsed().as_micros();
                         done_bytes += data.len() as u64;
                         // Report on ~1% steps, on the first chunk, and always on the last one
                         // of a payload. A step of 0 (unknown total) falls back to every 512 KiB.
                         let step = (total_bytes / 100).max(512 * 1024);
+                        if last_timing.elapsed() >= Duration::from_secs(2) {
+                            last_timing = std::time::Instant::now();
+                            info!(
+                                "quickshare: rx cost so far — {} frames, read {} ms, decrypt {} ms, \
+                                 assemble {} ms, write {} ms ({} bytes)",
+                                frames_in, us_read / 1000, us_decrypt / 1000,
+                                us_assemble / 1000, us_write / 1000, done_bytes
+                            );
+                        }
                         if last || reported_bytes == 0 || done_bytes - reported_bytes >= step {
                             reported_bytes = done_bytes;
                             host.progress(done_bytes, total_bytes);
