@@ -365,7 +365,7 @@ where
                     }));
                 }
                 Effect::Done => {
-                    finish_cleanly(&mut out, &mut channel, peer_safe_disconnect)?;
+                    finish_cleanly(&mut input, &mut out, &mut channel, peer_safe_disconnect)?;
                     // Done covers both "sent everything" and "they said no". Which one
                     // it was is the state, not the effect.
                     return Ok(fsm.state() == tarish_protocol::fsm::State::Done && total > 0);
@@ -634,7 +634,14 @@ fn random_i64() -> io::Result<i64> {
 ///
 /// Credit: Bada's `OutboundConnectionDriver.peerSafeToDisconnectVersion`, which names
 /// Windows Quick Share and the "Can't complete transfer" it produces.
+/// The longest a completed send waits for the peer to close its end before closing ours.
+///
+/// A CEILING, NOT A PAUSE: the wait ends the instant the peer lets go. It exists only for a
+/// peer that holds the socket open and says nothing.
+const LINGER_MAX: std::time::Duration = std::time::Duration::from_millis(1500);
+
 fn finish_cleanly<W: Write>(
+    input: &mut Frames<Reader>,
     out: &mut W,
     channel: &mut SecureChannel,
     peer_safe_disconnect: bool,
@@ -649,10 +656,31 @@ fn finish_cleanly<W: Write>(
     } else {
         debug!("quickshare: peer cannot be disconnected; letting it finish first");
     }
-    // Either way, do not pull the socket out from under a peer that is still reading.
-    // A sleep rather than a read: a read that waits for a peer which has simply stopped
-    // talking never returns, and that hang cost a transfer that had already succeeded.
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // WAIT FOR THE PEER TO LET GO, AND NOTHING LONGER.
+    //
+    // We must not pull the socket out from under a peer that is still reading, but the
+    // event that says it has stopped is the peer closing its end, and that is observable:
+    // the next read fails instead of returning a frame. Against a peer that behaves, this
+    // returns in milliseconds.
+    //
+    // It was a flat 1500 ms, justified on the grounds that "a read that waits for a peer
+    // which has simply stopped talking never returns". True of an unbounded read, and only
+    // of that -- a read with a deadline returns either way. So the reasoning did not hold,
+    // and every successful send paid a second and a half for it.
+    let deadline = std::time::Instant::now() + LINGER_MAX;
+    loop {
+        let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            debug!("quickshare: the peer still holds the socket after {LINGER_MAX:?}; closing");
+            break;
+        };
+        match input.next_within(left.min(std::time::Duration::from_millis(200))) {
+            // Closed. That is precisely the event we were waiting for.
+            Err(_) => break,
+            // A parting frame. Nothing to do with it, the transfer is over -- but the peer
+            // is evidently still on the socket, so let it finish.
+            Ok(Some(_)) | Ok(None) => {}
+        }
+    }
     Ok(())
 }
 

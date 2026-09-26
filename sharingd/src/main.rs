@@ -119,6 +119,13 @@ fn iface() -> &'static str {
 /// Its default when absent is ON, so a policy denial here degrades to the old
 /// battery cost rather than to a device that cannot share at all.
 const WANT_PROP: &str = "tarish.awdl.wanted";
+
+/// The longest we wait for the AWDL interface to disappear after asking tarishd to drop it.
+///
+/// A CEILING, NOT A PAUSE. The wait ends the moment the interface stops resolving, which on
+/// a device that answers promptly is tens of milliseconds. Nothing on the success path sits
+/// through this.
+const AWDL_TEARDOWN_WAIT: Duration = Duration::from_millis(2500);
 /// Published by tarishd: whether a VPN kill-switch is really in force. We cannot determine
 /// this ourselves -- no netlink_route_socket, by design -- so we relay tarishd's answer.
 const LOCKDOWN_PROP: &str = "tarish.awdl.lockdown";
@@ -479,11 +486,32 @@ impl TransferState {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        // Stage 2: let tarishd poll and tear the ART interface down. tarishd polls every
-        // 500 ms and mosey_stop's teardown is a couple of netlink round-trips; a second is
-        // comfortably enough and is only paid on the off-network path (vs a 150 KB/s
-        // Bluetooth fallback, which is what this avoids).
-        std::thread::sleep(Duration::from_millis(1000));
+        // Stage 2: WAIT FOR THE INTERFACE TO ACTUALLY GO, not for a guess at how long that
+        // takes. The thing that has to be true before a group can form is that the AWDL
+        // interface is down and the P2P slot is free, and that is directly observable: the
+        // interface stops resolving to an index. This used to be a flat one-second sleep
+        // sized against "tarishd polls every 500 ms", which is both slower than the common
+        // case and no guarantee in the slow one -- a fixed wait for a variable event is
+        // wrong in whichever direction it happens to be wrong that time.
+        let gone_by = std::time::Instant::now() + AWDL_TEARDOWN_WAIT;
+        loop {
+            if mdns::ifindex_of(iface()).is_err() {
+                log::debug!("quickshare: {} is down; the P2P slot is free", iface());
+                break;
+            }
+            if std::time::Instant::now() >= gone_by {
+                // Proceed anyway: the group attempt is the better failure. It either forms,
+                // or it does not and we fall back, which is what would have happened after
+                // the old sleep too -- only later.
+                log::info!(
+                    "quickshare: {} still up after {:?}; trying the group anyway",
+                    iface(),
+                    AWDL_TEARDOWN_WAIT
+                );
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
         true
     }
 

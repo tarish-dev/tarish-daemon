@@ -356,6 +356,13 @@ const EXEMPT_MAX: Duration = Duration::from_secs(660);
 /// of a core, and this is not measurable next to it.
 const POLL: Duration = Duration::from_millis(500);
 
+/// The longest we wait for the AWDL data interface to appear after the session comes up.
+///
+/// A CEILING, NOT A PAUSE. The wait ends the moment `if_nametoindex` resolves the name,
+/// which is the actual precondition for the route calls that follow. Nothing on the success
+/// path sits through this.
+const IFACE_APPEAR_WAIT: Duration = Duration::from_secs(3);
+
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
 extern "C" fn on_signal(_sig: libc::c_int) {
@@ -662,9 +669,33 @@ impl Link {
             channels[0],
         );
 
-        // The interface appears a moment after the call returns.
-        std::thread::sleep(Duration::from_secs(2));
+        // WAIT FOR THE INTERFACE, NOT FOR TWO SECONDS.
+        //
+        // It appears a moment after the call returns, and "a moment" is exactly what a
+        // fixed sleep cannot express: it was two seconds, paid in full on every AWDL
+        // bring-up even when the interface was ready immediately, and no guarantee at all
+        // on a device that took longer. `if_nametoindex` answers the actual question, so
+        // ask it -- this now returns as soon as the interface exists, and the ceiling only
+        // matters when something is wrong.
         let ifc = iface();
+        {
+            let cname = std::ffi::CString::new(ifc).unwrap_or_default();
+            let up_by = std::time::Instant::now() + IFACE_APPEAR_WAIT;
+            loop {
+                // SAFETY: a NUL-terminated name; returns 0 when there is no such interface.
+                if unsafe { libc::if_nametoindex(cname.as_ptr()) } != 0 {
+                    break;
+                }
+                if std::time::Instant::now() >= up_by {
+                    log::warn!(
+                        "{ifc} has not appeared after {IFACE_APPEAR_WAIT:?} — \
+                         carrying on, the route calls below will say why"
+                    );
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
         match route::add_link_local(ifc) {
             Ok(()) => log::info!(
                 "route: fe80::/64 dev {ifc} table {}",
