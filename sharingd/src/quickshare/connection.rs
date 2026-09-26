@@ -297,12 +297,18 @@ impl<S: ReadReady> Frames<S> {
 /// ago. Generous, because the alternative to waiting is a transfer that crawls.
 const JOIN_WAIT: Duration = Duration::from_secs(25);
 
-/// How long to let the client spend standing up a group before giving up on it.
+/// How long the handover keeps draining while the client stands a group up.
 ///
-/// Arming the radio is itself a sequence of bounded waits -- releasing an AirDrop hold, then
-/// the p2p slot -- and forming the group after that takes 4-8s on real hardware. This is the
-/// ceiling on the whole of it, not a pause: nothing sleeps for this long on success.
-const GROUP_WAIT: Duration = Duration::from_secs(30);
+/// **This must comfortably EXCEED the worker's own bound, and that is the whole point of
+/// the number.** `Host::host_group` is internally bounded -- arming the radio is at worst
+/// ~20 s (an AirDrop hold, then the p2p slot, then the interface going) and the group wait
+/// itself is 30 s on a condvar -- so it always terminates, and the scoped `join()` after
+/// this cannot hang. But if this ceiling were the SMALLER of the two, the drain would stop
+/// first and the join would then sit out the remainder with nobody reading the socket,
+/// which is a smaller copy of the bug this whole change exists to remove. So: larger,
+/// deliberately, with room to spare. It is a ceiling, not a pause -- the drain ends the
+/// instant the worker finishes, which is normally a few seconds.
+const GROUP_WAIT: Duration = Duration::from_secs(75);
 
 /// The most a handover may buffer off the old socket before it stops draining it.
 ///
