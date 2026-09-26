@@ -634,10 +634,12 @@ fn random_i64() -> io::Result<i64> {
 ///
 /// Credit: Bada's `OutboundConnectionDriver.peerSafeToDisconnectVersion`, which names
 /// Windows Quick Share and the "Can't complete transfer" it produces.
-/// The longest a completed send waits for the peer to close its end before closing ours.
+/// How long a completed send leaves the socket open before closing it.
 ///
-/// A CEILING, NOT A PAUSE: the wait ends the instant the peer lets go. It exists only for a
-/// peer that holds the socket open and says nothing.
+/// A GRACE PERIOD FOR SOMETHING UNOBSERVABLE, and deliberately a fixed one. What must not
+/// happen is closing under a peer that is still reading, and nothing on the wire says when a
+/// peer has finished reading -- a close only says it has finished WRITING. See the note in
+/// `finish_cleanly` for the evening this was learned the hard way.
 const LINGER_MAX: std::time::Duration = std::time::Duration::from_millis(1500);
 
 fn finish_cleanly<W: Write>(
@@ -656,31 +658,23 @@ fn finish_cleanly<W: Write>(
     } else {
         debug!("quickshare: peer cannot be disconnected; letting it finish first");
     }
-    // WAIT FOR THE PEER TO LET GO, AND NOTHING LONGER.
+    // A TIMED LINGER, AND IT HAS TO BE. Do not "improve" this into waiting for an event.
     //
-    // We must not pull the socket out from under a peer that is still reading, but the
-    // event that says it has stopped is the peer closing its end, and that is observable:
-    // the next read fails instead of returning a frame. Against a peer that behaves, this
-    // returns in milliseconds.
+    // The requirement is not to pull the socket out from under a peer that is still READING.
+    // There is no event for that. A peer closing its end tells us it has stopped SENDING,
+    // which is a different thing entirely -- TCP half-close exists precisely so a peer can
+    // say "nothing more from me" while it is still draining what we sent.
     //
-    // It was a flat 1500 ms, justified on the grounds that "a read that waits for a peer
-    // which has simply stopped talking never returns". True of an unbounded read, and only
-    // of that -- a read with a deadline returns either way. So the reasoning did not hold,
-    // and every successful send paid a second and a half for it.
-    let deadline = std::time::Instant::now() + LINGER_MAX;
-    loop {
-        let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
-            debug!("quickshare: the peer still holds the socket after {LINGER_MAX:?}; closing");
-            break;
-        };
-        match input.next_within(left.min(std::time::Duration::from_millis(200))) {
-            // Closed. That is precisely the event we were waiting for.
-            Err(_) => break,
-            // A parting frame. Nothing to do with it, the transfer is over -- but the peer
-            // is evidently still on the socket, so let it finish.
-            Ok(Some(_)) | Ok(None) => {}
-        }
-    }
+    // This was briefly changed to return as soon as the read failed, on the reasoning that
+    // the close was the event being waited for. It is not, and treating it as one closes the
+    // connection under a receiver that is still writing the file out: our side reports the
+    // transfer complete and the peer's never finishes. Reverted the same evening it shipped.
+    //
+    // So the fixed wait stands. It is not a guess at how long something takes -- it is a
+    // grace period for something that cannot be observed, which is the one case where a
+    // fixed wait is the right primitive rather than a lazy one.
+    std::thread::sleep(LINGER_MAX);
+    let _ = input;
     Ok(())
 }
 
