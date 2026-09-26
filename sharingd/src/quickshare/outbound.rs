@@ -122,6 +122,9 @@ where
     P: Progress,
 {
     let mut input = Frames::new(input);
+    // Set when a bandwidth upgrade moves us onto a real socket, so the end of the send can
+    // wait for that socket to drain before the transfer is called finished. See DRAIN_MAX.
+    let mut out_fd: Option<std::os::fd::RawFd> = None;
 
     // --- 1. announce ourselves, in plaintext ---------------------------------
     //
@@ -344,6 +347,7 @@ where
                             &mut channel,
                             progress,
                             &mut deferred,
+                            &mut out_fd,
                         )?;
                     }
                     info!("quickshare: peer accepted, sending");
@@ -365,7 +369,7 @@ where
                     }));
                 }
                 Effect::Done => {
-                    finish_cleanly(&mut input, &mut out, &mut channel, peer_safe_disconnect)?;
+                    finish_cleanly(&mut input, &mut out, &mut channel, peer_safe_disconnect, out_fd)?;
                     // Done covers both "sent everything" and "they said no". Which one
                     // it was is the state, not the effect.
                     return Ok(fsm.state() == tarish_protocol::fsm::State::Done && total > 0);
@@ -486,6 +490,7 @@ where
                     &mut channel,
                     progress,
                     &mut deferred,
+                    &mut out_fd,
                 )?;
                 // Whatever came of it, stop holding the payload for one.
                 upgrade_deadline = None;
@@ -634,6 +639,33 @@ fn random_i64() -> io::Result<i64> {
 ///
 /// Credit: Bada's `OutboundConnectionDriver.peerSafeToDisconnectVersion`, which names
 /// Windows Quick Share and the "Can't complete transfer" it produces.
+/// How long to wait for the socket's send queue to reach the peer before we let go.
+///
+/// A CEILING ON AN OBSERVABLE EVENT, unlike the linger below. `write_all` returning means
+/// the bytes are in the KERNEL's send buffer, not that the peer has them, and `TIOCOUTQ`
+/// reports exactly how many are still outstanding. Reaching zero is a real acknowledgement
+/// from the far end, so this ends the moment the transfer is genuinely on the peer.
+///
+/// Generous, because the alternative is what it was built to stop: 20 MB written in 12.9 s
+/// at 1589 KB/s leaves megabytes in flight, and anything shorter than they take to drain
+/// truncates the transfer.
+const DRAIN_MAX: Duration = Duration::from_secs(30);
+
+/// Bytes written to this socket that the peer has not acknowledged yet.
+///
+/// `None` if the socket cannot answer, which is treated as "nothing outstanding" rather
+/// than as a reason to wait -- a descriptor that will not report cannot be waited on.
+fn unacked(fd: std::os::fd::RawFd) -> Option<u32> {
+    let mut n: libc::c_int = 0;
+    // SAFETY: TIOCOUTQ writes a single c_int through the pointer, which is what is passed.
+    let rc = unsafe { libc::ioctl(fd, libc::TIOCOUTQ, &mut n) };
+    if rc == 0 && n >= 0 {
+        Some(n as u32)
+    } else {
+        None
+    }
+}
+
 /// How long a completed send leaves the socket open before closing it.
 ///
 /// A GRACE PERIOD FOR SOMETHING UNOBSERVABLE, and deliberately a fixed one. What must not
@@ -647,7 +679,44 @@ fn finish_cleanly<W: Write>(
     out: &mut W,
     channel: &mut SecureChannel,
     peer_safe_disconnect: bool,
+    out_fd: Option<std::os::fd::RawFd>,
 ) -> io::Result<()> {
+    // WAIT FOR THE BYTES TO REACH THE PEER BEFORE ANNOUNCING THE TRANSFER IS OVER.
+    //
+    // `write_all` returning says the payload is in the kernel's send buffer. It says
+    // nothing about the peer having it. Declaring completion there ends the transfer, and
+    // ending the transfer releases the AWDL hold, and releasing that hold brings AWDL back
+    // and takes the P2P slot out from under the Wi-Fi Direct group the data is still
+    // draining through. The remaining megabytes go nowhere.
+    //
+    // Measured 2026-09-26 against a stock Quick Share receiver:
+    //
+    //   22:46:18  sent 20971520 bytes in 12.9s, 1589 KB/s   <- our write_all returned
+    //   22:46:19  transfer complete; released the AWDL hold <- radio taken back
+    //   22:47:25  NearbySharing: "Time's up! Canceling ...
+    //             since we haven't seen a transfer update in a while."
+    //
+    // The peer sat sending keep-alives for a minute waiting for bytes that could no longer
+    // reach it, while our side reported success. TIOCOUTQ is the honest signal and this
+    // ends the moment it reaches zero.
+    if let Some(fd) = out_fd {
+        let by = std::time::Instant::now() + DRAIN_MAX;
+        loop {
+            match unacked(fd) {
+                Some(0) | None => break,
+                Some(left) => {
+                    if std::time::Instant::now() >= by {
+                        warn!(
+                            "quickshare: {left} B still unacknowledged after {DRAIN_MAX:?}; \
+                             closing anyway"
+                        );
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+    }
     if peer_safe_disconnect {
         write_frame(
             out,
@@ -767,6 +836,7 @@ fn wait_for_upgrade<P>(
     channel: &mut SecureChannel,
     progress: &P,
     deferred: &mut std::collections::VecDeque<Vec<u8>>,
+    out_fd: &mut Option<std::os::fd::RawFd>,
 ) -> io::Result<()>
 where
     P: Progress,
@@ -787,7 +857,7 @@ where
         let plain = channel.decrypt(&wire).map_err(chan)?;
         match frames::parse(&plain).map_err(bad)? {
             OfflineFrame::BandwidthUpgrade(body) => {
-                on_upgrade_frame(&body, endpoint_id, input, out, channel, progress, deferred)?;
+                on_upgrade_frame(&body, endpoint_id, input, out, channel, progress, deferred, out_fd)?;
                 return Ok(());
             }
             // Not ours. Hand the PLAINTEXT to the main loop -- decrypting it again there
@@ -815,13 +885,14 @@ fn on_upgrade_frame<P>(
     channel: &mut SecureChannel,
     progress: &P,
     deferred: &mut std::collections::VecDeque<Vec<u8>>,
+    out_fd: &mut Option<std::os::fd::RawFd>,
 ) -> io::Result<()>
 where
     P: Progress,
 {
     match upgrade::parse(body) {
         Ok(upgrade::Frame::PathAvailable(path)) => {
-            match adopt(&path, endpoint_id, input, out, channel, progress, deferred) {
+            match adopt(&path, endpoint_id, input, out, channel, progress, deferred, out_fd) {
                 Ok(true) => info!(
                     "quickshare: upgraded to {:?}; the rest goes over that",
                     path.medium
@@ -985,6 +1056,7 @@ fn adopt<P>(
     channel: &mut SecureChannel,
     progress: &P,
     deferred: &mut std::collections::VecDeque<Vec<u8>>,
+    out_fd: &mut Option<std::os::fd::RawFd>,
 ) -> io::Result<bool>
 where
     P: Progress,
@@ -1017,6 +1089,12 @@ where
     // bounding and leaves the socket blocking, which is what every read after the handover
     // wants.
 
+    // Kept so the end of the send can wait for this socket to drain -- see finish_cleanly.
+    // Valid for as long as the boxed halves below live, which is the rest of the transfer.
+    {
+        use std::os::fd::AsRawFd;
+        *out_fd = Some(sock.as_raw_fd());
+    }
     let mut new_out: Writer = Box::new(sock.try_clone()?);
     let mut new_in = Frames::new(Box::new(sock) as Reader);
 
