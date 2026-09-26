@@ -3835,8 +3835,6 @@ fn start_quickshare_discovery(
     discoverable: Discoverable,
 ) {
     std::thread::spawn(move || {
-        // Frees the slot however this thread ends. See SlotGuard.
-        let _slot = SlotGuard::new(&transfers, id);
         const IFACE: &str = "wlan0";
         // Instances already reported, so a peer is announced when it appears rather than
         // every half second for as long as it stays.
