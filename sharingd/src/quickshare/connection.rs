@@ -310,6 +310,17 @@ const JOIN_WAIT: Duration = Duration::from_secs(25);
 /// instant the worker finishes, which is normally a few seconds.
 const GROUP_WAIT: Duration = Duration::from_secs(75);
 
+/// How many bandwidth handovers one connection may attempt.
+///
+/// Two, so there is exactly ONE retry. The first attempt frequently loses the race for the
+/// P2P slot -- the client declines while the wonder driver still holds it -- and the second,
+/// once the radio has let go, succeeds. That retry used to happen by accident, because the
+/// peer's request sat unread in the socket during the failed attempt and was picked up
+/// afterwards; making the reader keep draining removed the accident, so the retry is now
+/// explicit. The cap is what stops a peer that asks repeatedly from buying a 25 s handover
+/// every time.
+const MAX_UPGRADE_ATTEMPTS: u8 = 2;
+
 /// The most a handover may buffer off the old socket before it stops draining it.
 ///
 /// A ceiling is not optional. These are frames from a peer whose transfer has not completed
@@ -363,10 +374,19 @@ fn drain_old(
         match input.next_within(slice) {
             Ok(Some(wire)) => {
                 let plain = channel.decrypt(&wire).map_err(chan)?;
-                if frames::upgrade_body(&plain).is_some() {
-                    debug!("quickshare: an upgrade frame arrived mid-handover; dropped");
-                    continue;
-                }
+                // DEFERRED LIKE EVERYTHING ELSE, NOT DROPPED -- AND THAT RETRY IS
+                // LOAD-BEARING.
+                //
+                // This dropped upgrade frames for one round, to stop a repeat request
+                // starting a second handover. It stopped the retry instead, and the retry
+                // was what made off-network transfers fast: the first attempt often loses
+                // the race for the P2P slot, the sender's request then surfaces from the
+                // socket afterwards, and the second attempt -- by which time the radio has
+                // actually let go -- succeeds. Dropping it made a first-attempt failure
+                // permanent and the transfer stayed on Bluetooth. Measured 2026-09-26.
+                //
+                // A cycle is prevented properly instead, by `upgraded` and by a hard cap on
+                // attempts in the caller, rather than by throwing the peer's request away.
                 *held += plain.len();
                 deferred.push_back(plain);
                 if *held >= HANDOVER_DEFER_CAP {
@@ -607,6 +627,13 @@ where
     let mut deferred: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
     // Whether the conversation has already moved to a faster socket.
     let mut upgraded = false;
+    // HOW MANY HANDOVERS HAVE BEEN TRIED, successful or not.
+    //
+    // The retry matters -- a first attempt often loses the race for the P2P slot and the
+    // second one, after the radio has actually let go, is the one that works. But a peer
+    // that asks forever must not get a 25 s handover each time, so this is where the cycle
+    // is stopped, rather than by discarding its requests.
+    let mut upgrade_attempts: u8 = 0;
 
     // --- 1. the connection request, in plaintext -----------------------------
     let first = input.next()?;
@@ -818,6 +845,7 @@ where
                     // response and will not stream until it arrives, so doing this first
                     // means the handover never races the payload.
                     if !upgraded && bootstrap_is_slow {
+                        upgrade_attempts += 1;
                         match offer_group(host, &mut input, &mut out, &mut channel, &mut deferred) {
                             Ok(true) => {
                                 upgraded = true;
@@ -1021,11 +1049,19 @@ where
                             debug!("quickshare: on {bootstrap:?} already; declining to upgrade");
                             let no = upgrade::failure();
                             write_frame(&mut out, &channel.encrypt(&no).map_err(chan)?)?;
+                        } else if upgrade_attempts >= MAX_UPGRADE_ATTEMPTS {
+                            debug!(
+                                "quickshare: {upgrade_attempts} handovers already tried; \
+                                 staying on this transport"
+                            );
+                            let no = upgrade::failure();
+                            write_frame(&mut out, &channel.encrypt(&no).map_err(chan)?)?;
                         } else if !mediums.contains(&upgrade::Medium::WifiDirect) {
                             debug!("quickshare: sender asked for {mediums:?}, none of which we host");
                             let no = upgrade::failure();
                             write_frame(&mut out, &channel.encrypt(&no).map_err(chan)?)?;
                         } else {
+                            upgrade_attempts += 1;
                             match offer_group(host, &mut input, &mut out, &mut channel, &mut deferred)? {
                                 true => {
                                     // Was missing, and that is what let a repeat through.

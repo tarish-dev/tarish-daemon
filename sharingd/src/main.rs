@@ -120,12 +120,30 @@ fn iface() -> &'static str {
 /// battery cost rather than to a device that cannot share at all.
 const WANT_PROP: &str = "tarish.awdl.wanted";
 
-/// The longest we wait for the AWDL interface to disappear after asking tarishd to drop it.
+/// The longest we wait for the P2P slot to come free after asking tarishd to drop the radio.
 ///
-/// A CEILING, NOT A PAUSE. The wait ends the moment the interface stops resolving, which on
-/// a device that answers promptly is tens of milliseconds. Nothing on the success path sits
-/// through this.
-const AWDL_TEARDOWN_WAIT: Duration = Duration::from_millis(2500);
+/// A CEILING, NOT A PAUSE. The wait ends the moment the slot is free. Nothing on the success
+/// path sits through this.
+const AWDL_TEARDOWN_WAIT: Duration = Duration::from_millis(4000);
+
+/// Is the Wi-Fi Direct P2P slot actually free?
+///
+/// **CHECK `wondertap0`, NOT `tlink0`.** tarishd's own module header says it outright:
+/// "tlink0 survives the teardown looking perfectly healthy -- it is the interface whose
+/// presence means least. wondertap0 is the one the driver owns." Gating on tlink0 here cost
+/// a measured regression on 2026-09-26: tlink0 went away 256 ms in, we declared the slot
+/// free and told the client to host, and the client then declined **fifty times over
+/// seventeen seconds** because the wonder driver still held it. By the time the group came
+/// up the sender's 12 s upgrade deadline had long passed, so it never joined and the
+/// transfer stayed on the Bluetooth bootstrap.
+///
+/// Absent is better than down: if the interface is gone, so is the driver's claim.
+fn p2p_slot_free() -> bool {
+    match std::fs::read_to_string("/sys/class/net/wondertap0/operstate") {
+        Ok(s) => s.trim() == "down",
+        Err(_) => true,
+    }
+}
 /// Published by tarishd: whether a VPN kill-switch is really in force. We cannot determine
 /// this ourselves -- no netlink_route_socket, by design -- so we relay tarishd's answer.
 const LOCKDOWN_PROP: &str = "tarish.awdl.lockdown";
@@ -495,8 +513,8 @@ impl TransferState {
         // wrong in whichever direction it happens to be wrong that time.
         let gone_by = std::time::Instant::now() + AWDL_TEARDOWN_WAIT;
         loop {
-            if mdns::ifindex_of(iface()).is_err() {
-                log::debug!("quickshare: {} is down; the P2P slot is free", iface());
+            if p2p_slot_free() {
+                log::debug!("quickshare: wondertap0 is down; the P2P slot is free");
                 break;
             }
             if std::time::Instant::now() >= gone_by {
@@ -504,9 +522,8 @@ impl TransferState {
                 // or it does not and we fall back, which is what would have happened after
                 // the old sleep too -- only later.
                 log::info!(
-                    "quickshare: {} still up after {:?}; trying the group anyway",
-                    iface(),
-                    AWDL_TEARDOWN_WAIT
+                    "quickshare: wondertap0 still up after {AWDL_TEARDOWN_WAIT:?}; \
+                     trying the group anyway"
                 );
                 break;
             }
@@ -2888,8 +2905,34 @@ impl ITarishService for TarishService {
     }
 
     fn cancelTransfer(&self, transfer_id: i64) -> BinderResult<()> {
-        log::info!("cancelTransfer({transfer_id})");
-        self.transfers.cancel(transfer_id);
+        // ZERO MEANS "WHATEVER IS RUNNING NOW", AND A CANCEL MUST NEVER BE A NO-OP.
+        //
+        // There is a real window in which the daemon has begun a transfer and the client
+        // does not yet hold its id: `try_begin` allocates the id and makes it current, then
+        // the send resolves the peer, connects, and waits on /Ask -- and only when
+        // `sendFiles` returns does the client learn the number. Tapping cancel in that
+        // window hit `activeTransfer == 0` in the app and did literally nothing. Measured
+        // 2026-09-26: "cancel: no transfer id yet (still connecting) — nothing to cancel",
+        // while the daemon was sitting in /Ask with a perfectly cancellable transfer.
+        //
+        // The id-based form stays the default, because a stale tap from a client still
+        // showing a finished transfer must not kill a newer one. Zero is not stale by
+        // construction: it is resolved here, now, against what is actually running.
+        let id = if transfer_id == 0 {
+            self.transfers.current()
+        } else {
+            transfer_id
+        };
+        if id == 0 {
+            log::info!("cancelTransfer(0): nothing is running");
+            return Ok(());
+        }
+        if transfer_id == 0 {
+            log::info!("cancelTransfer(0) -> cancelling the running transfer {id}");
+        } else {
+            log::info!("cancelTransfer({id})");
+        }
+        self.transfers.cancel(id);
         Ok(())
     }
 
