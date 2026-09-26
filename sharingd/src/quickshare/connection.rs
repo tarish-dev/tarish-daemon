@@ -423,6 +423,7 @@ fn offer_group<H: Host + Sync>(
     out: &mut Writer,
     channel: &mut SecureChannel,
     deferred: &mut std::collections::VecDeque<Vec<u8>>,
+    transfers: &Transfers,
 ) -> io::Result<bool> {
     // A LISTENER FIRST, so the offer can never name a port nothing is on. Bound to
     // 0.0.0.0 rather than to the group address: the p2p interface does not exist yet when
@@ -517,6 +518,14 @@ fn offer_group<H: Host + Sync>(
     // of this function reads it as a blocking stream, so say so rather than depending on it.
     let _ = sock.set_nonblocking(false);
     let _ = sock.set_nodelay(true);
+    // PUBLISH IT, so ending this transfer can wait for it to drain before the radio goes.
+    //
+    // From here the conversation lives on a Wi-Fi Direct group we are holding the AWDL
+    // radio away from, and `Transfers::finish` releases that hold. Without this the release
+    // happens while bytes are still in the socket -- which on a CANCEL means the frame
+    // telling the peer we cancelled is the one that gets dropped, and the peer waits out
+    // its own timeout instead. Also what a cancel shuts down when a writer is wedged.
+    transfers.arm_abort(host.id(), Some(&sock));
     // Same reason as every other socket here: a peer that stops reading must cost this
     // transfer, not a thread that never returns.
     let _ = sock.set_write_timeout(Some(Duration::from_secs(20)));
@@ -825,7 +834,7 @@ where
                     // means the handover never races the payload.
                     if !upgraded && bootstrap_is_slow {
                         upgrade_attempts += 1;
-                        match offer_group(host, &mut input, &mut out, &mut channel, &mut deferred) {
+                        match offer_group(host, &mut input, &mut out, &mut channel, &mut deferred, transfers) {
                             Ok(true) => {
                                 upgraded = true;
                                 info!("quickshare: upgraded the inbound transfer to Wi-Fi Direct");
@@ -1006,7 +1015,7 @@ where
                             write_frame(&mut out, &channel.encrypt(&no).map_err(chan)?)?;
                         } else {
                             upgrade_attempts += 1;
-                            match offer_group(host, &mut input, &mut out, &mut channel, &mut deferred)? {
+                            match offer_group(host, &mut input, &mut out, &mut channel, &mut deferred, transfers)? {
                                 true => {
                                     // Was missing, and that is what let a repeat through.
                                     upgraded = true;

@@ -245,6 +245,39 @@ const STATUS_FAILED: i32 = -1;
 const STATUS_DECLINED: i32 = -2;
 const STATUS_CANCELLED: i32 = -3; // must match TarishApp MainActivity.STATUS_CANCELLED
 
+/// How long a cancelled transfer gets to TELL THE PEER before the socket is forced down.
+///
+/// Cancelling used to shut the socket immediately. That is what stopped the peer ever being
+/// told: every loop here notices the flag and writes a cancel frame, and a socket that has
+/// already been shut down throws that frame away. The peer then sits on a connection nobody
+/// is feeding until its own timeout -- which on a stock Quick Share receiver is a full
+/// minute of keep-alives before it gives up.
+///
+/// The forceful shutdown still exists, because a writer wedged inside one long write cannot
+/// see a flag. It just happens second now, and only if the transfer really has not ended.
+const CANCEL_GRACE: Duration = Duration::from_secs(2);
+
+/// How long to let a finished transfer's socket drain before the radio is taken back.
+///
+/// Ending a transfer releases the AWDL hold, which brings AWDL back and takes the P2P slot
+/// out from under a Wi-Fi Direct group. Anything still in the socket at that moment is lost
+/// silently, and the peer -- which has no idea -- waits for bytes that can no longer reach
+/// it. Applies to a cancel exactly as much as to a completion: the cancel frame is the last
+/// thing the peer will ever hear from us, so it is the worst one to drop.
+const DRAIN_BEFORE_RELEASE: Duration = Duration::from_secs(10);
+
+/// Bytes written to `fd` that the peer has not acknowledged yet.
+fn unacked_on(fd: std::os::fd::RawFd) -> Option<u32> {
+    let mut n: libc::c_int = 0;
+    // SAFETY: TIOCOUTQ writes one c_int through the pointer, which is what is passed.
+    let rc = unsafe { libc::ioctl(fd, libc::TIOCOUTQ, &mut n) };
+    if rc == 0 && n >= 0 {
+        Some(n as u32)
+    } else {
+        None
+    }
+}
+
 /// The one transfer that can be in flight, and whether the user has cancelled it.
 ///
 /// Deliberately single-slot: AirDrop sends one archive per exchange, and a peer that
@@ -537,6 +570,11 @@ impl TransferState {
     }
 
     pub(crate) fn finish(&self, id: i64) {
+        // BEFORE ANYTHING ELSE. Releasing the AWDL hold below brings AWDL back and takes the
+        // P2P slot out from under a Wi-Fi Direct group, so whatever is still in the socket
+        // at that instant is lost -- including, on a cancel, the frame telling the peer we
+        // cancelled. Wait for the peer to actually have it. See DRAIN_BEFORE_RELEASE.
+        self.drain_armed(id);
         let _ = self.current.compare_exchange(id, 0, Ordering::SeqCst, Ordering::SeqCst);
         // If this was the AirDrop transfer holding the radio, release the priority claim so a
         // waiting Quick Share can now take it. compare_exchange so a still-live AirDrop
@@ -556,6 +594,9 @@ impl TransferState {
         if self.wifi_direct_active.swap(false, Ordering::SeqCst) {
             log::info!("quickshare: released the AWDL hold for Wi-Fi Direct — radio may return");
         }
+        // Drop our copy of the socket now the transfer is over, so a finished transfer does
+        // not keep a descriptor alive until the next one happens to replace it.
+        self.arm_abort(id, None);
         // Clear the activity clock so the now-free slot is not seen as a stale claim.
         if let Ok(mut t) = self.last_activity.lock() {
             *t = None;
@@ -564,19 +605,72 @@ impl TransferState {
 
     /// Cancel by id rather than "whatever is running": a stale tap from a client that
     /// was showing the previous transfer must not kill the current one.
-    pub(crate) fn cancel(&self, id: i64) {
+    pub(crate) fn cancel(self: &Arc<Self>, id: i64) {
         self.cancelled.store(id, Ordering::SeqCst);
-        // AND INTERRUPT THE SOCKET. The flag is what a cooperating loop reads; this is what
-        // reaches a thread that is not looping because it is inside one long write. Shutting
-        // the descriptor down makes that call return at once, and the error surfaces as the
-        // cancellation it is because `cancelled()` is checked on the way out.
-        if let Ok(mut a) = self.abort.lock() {
-            if a.as_ref().map(|(i, _)| *i == id).unwrap_or(false) {
-                if let Some((_, sock)) = a.take() {
-                    // Best effort by design: an already-closed socket is the normal race here,
-                    // not a fault, and failing to shut one down must never fail the cancel.
-                    let _ = sock.shutdown(std::net::Shutdown::Both);
-                    log::info!("cancel {id}: shut the send socket down to unblock the writer");
+        // GRACEFUL FIRST, FORCEFUL ONLY IF IT DOES NOT TAKE.
+        //
+        // This used to shut the socket down right here, and that is precisely what stopped
+        // the peer ever being told. Every transfer loop polls `cancelled()` and answers by
+        // writing a cancel frame; a socket already shut down throws that frame away, so the
+        // peer learns nothing and waits out its own timeout instead -- a full minute of
+        // keep-alives on a stock Quick Share receiver.
+        //
+        // So the flag goes up and the loop gets CANCEL_GRACE to say it. The shutdown is
+        // still needed for a writer wedged inside one long write, which cannot see a flag,
+        // but that is the uncommon case and it no longer costs the common one.
+        let me = Arc::clone(self);
+        std::thread::spawn(move || {
+            std::thread::sleep(CANCEL_GRACE);
+            // Ended on its own, which is the wanted outcome. Nothing to force.
+            if me.current.load(Ordering::SeqCst) != id {
+                return;
+            }
+            if let Ok(mut a) = me.abort.lock() {
+                if a.as_ref().map(|(i, _)| *i == id).unwrap_or(false) {
+                    if let Some((_, sock)) = a.take() {
+                        // Best effort: an already-closed socket is the normal race here,
+                        // not a fault, and it must never fail the cancel.
+                        let _ = sock.shutdown(std::net::Shutdown::Both);
+                        log::info!(
+                            "cancel {id}: still running after {CANCEL_GRACE:?} — \
+                             shutting the socket down to unblock the writer"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    /// Wait for what we have written to reach the peer, before anything tears the radio down.
+    ///
+    /// Bounded by [`DRAIN_BEFORE_RELEASE`] and silent when there is nothing armed, so a
+    /// transfer that never went off-network pays nothing.
+    fn drain_armed(&self, id: i64) {
+        // Cloned, not borrowed: a concurrent cancel may take the socket out of the slot
+        // while this runs, and an ioctl on a closed descriptor could land on a reused one.
+        let sock = match self.abort.lock() {
+            Ok(a) => a
+                .as_ref()
+                .filter(|(i, _)| *i == id)
+                .and_then(|(_, s)| s.try_clone().ok()),
+            Err(_) => None,
+        };
+        let Some(sock) = sock else { return };
+        use std::os::fd::AsRawFd;
+        let fd = sock.as_raw_fd();
+        let by = std::time::Instant::now() + DRAIN_BEFORE_RELEASE;
+        loop {
+            match unacked_on(fd) {
+                Some(0) | None => return,
+                Some(left) => {
+                    if std::time::Instant::now() >= by {
+                        log::warn!(
+                            "transfer {id}: {left} B never reached the peer after \
+                             {DRAIN_BEFORE_RELEASE:?}; releasing the radio anyway"
+                        );
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
                 }
             }
         }
